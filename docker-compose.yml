@@ -1,0 +1,8 @@
+services:
+  agent:
+    build: .
+    container_name: first_agent
+    command: ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

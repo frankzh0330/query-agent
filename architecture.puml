@@ -1,0 +1,86 @@
+@startuml
+title Query Agent - 顶层分层架构
+
+skinparam component {
+    BackgroundColor #FFFFFF
+    BorderColor #000000
+}
+
+' 客户端层
+package "Client Layer" {
+    component [User]
+}
+
+' API 层
+package "API Layer" {
+    component [FastAPI\napp.py] as API
+    component [Request/Response\nModels] as Models
+}
+
+' 服务层
+package "Service Layer" {
+    component [LLM Extractions\nllm_extractions.py] as LLM
+    component [Session Manager\nsession_manager.py] as Session
+}
+
+' 解析层
+package "Resolver Layer" {
+    component [Metric Resolver] as Metric
+    component [Event Resolver] as Event
+    component [GroupBy Resolver] as GroupBy
+    component [Time Resolver] as Time
+}
+
+' DSL 层
+package "DSL Layer" {
+    component [Semantic Models\nsemantic_models.py] as Semantic
+    component [DSL Renderer\nrenderer.py] as Renderer
+}
+
+' 配置层
+package "Config Layer" {
+    component [Catalog\nmetrics/events/dimensions] as Catalog
+}
+
+' 验证层
+package "Validation Layer" {
+    component [Region Validator] as Val1
+    component [Consistency Validator] as Val2
+}
+
+' 关系定义
+[User] --> API : HTTP POST /nl2dsl
+API --> Models : use
+API --> Session : manage session
+API --> LLM : Layer 1: Extract Entities
+
+LLM --> Metric : Layer 2: Resolve Metric
+LLM --> Event : Layer 2: Resolve Event
+LLM --> GroupBy : Layer 2: Resolve GroupBy
+LLM --> Time : Layer 2: Resolve Time
+
+Metric --> Catalog : lookup
+Event --> Catalog : lookup
+GroupBy --> Catalog : lookup
+
+Metric --> Semantic : Layer 3: Build DSL
+Event --> Semantic : Layer 3: Build DSL
+GroupBy --> Semantic : Layer 3: Build DSL
+Time --> Semantic : Layer 3: Build DSL
+
+Semantic --> Renderer : Layer 4: Render Exec DSL
+Renderer --> Val1 : validate
+Renderer --> Val2 : validate
+
+Session --> LLM : inject context
+
+note right of Semantic
+  Layer Architecture
+  ==================
+  Layer 1: LLM Entity Extraction
+  Layer 2: Entity Resolution
+  Layer 3: DSL Generation
+  Layer 4: DSL Rendering
+end note
+
+@enduml

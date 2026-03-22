@@ -1,0 +1,7 @@
+dimensions:
+  country:
+    aliases: ["country", "国家"]
+    property_type: "profile"
+    property_name: "country"
+    property_compose_type: "origin"
+

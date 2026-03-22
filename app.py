@@ -1,0 +1,189 @@
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+from common.types import MatcherType
+from dsl.renderer import render_exec_dsl
+from dsl.semantic_models import Event, GroupBy, Metric, SemanticDSL, TimeRange
+from dsl.validators import validate_region, validate_region_consistency
+from service.bearer_service import execute_query
+from service.llm_extractions import Extraction, ExtractionsJson, extract_llm
+
+app = FastAPI(title="query-agent: NL to Semantic DSL")
+logger = logging.getLogger(__name__)
+
+# ====================
+# 全局服务实例（由 WebSocket 启动时初始化）
+# ====================
+
+_matcher_service: Optional["MatcherService"] = None
+
+
+def set_matcher_service(service: "MatcherService") -> None:
+    """设置 matcher 服务（WebSocket 启动时调用）"""
+    global _matcher_service
+    _matcher_service = service
+    logger.info("MatcherService registered")
+
+
+def get_matcher_service() -> "MatcherService":
+    """获取 matcher 服务"""
+    if _matcher_service is None:
+        raise RuntimeError("MatcherService not initialized. Start WebSocket server first.")
+    return _matcher_service
+
+
+# ====================
+# 请求/响应模型
+# ====================
+
+class NL2DSLRequest(BaseModel):
+    text: str
+    project_id: int = Field(default=55)
+
+
+class NL2DSLResponse(BaseModel):
+    extraction_json: Dict[str, Any]
+    semantic: Dict[str, Any]
+    exec_dsl: Dict[str, Any]
+    explain: Dict[str, Any]
+
+
+class BearerQueryRequest(BaseModel):
+    exec_dsl: Dict[str, Any]
+
+
+class BearerQueryResponse(BaseModel):
+    result: Dict[str, Any]
+    success: bool
+    error: Optional[str] = None
+
+
+# ====================
+# HTTP API 端点
+# ====================
+
+@app.post("/nl2dsl", response_model=NL2DSLResponse)
+def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
+    """
+    NL 转 DSL 接口
+
+    可通过 HTTP 调用，也可由 WebSocket 内部调用
+    """
+    service = get_matcher_service()
+    catalog = service.catalog
+
+    timing = {}
+    total_start = time.time()
+
+    # Layer1: LLM 提取
+    use_dspy = os.getenv("USE_DSPY", "false").lower() == "true"
+
+    layer1_start = time.time()
+    if use_dspy:
+        # Lazy import dspy_extractions to avoid circular import when not used
+        from service.dspy_extractions import extract_dspy
+        extraction_dict = extract_dspy(req.text)
+        extraction_json = ExtractionsJson(
+            metric_extractions=[Extraction(**e) for e in extraction_dict["metric_extractions"]],
+            time_extractions=[Extraction(**e) for e in extraction_dict["time_extractions"]],
+            event_extractions=[Extraction(**e) for e in extraction_dict["event_extractions"]],
+            region_filter=extraction_dict["region_filter"],
+            group_by_extractions=[Extraction(**e) for e in extraction_dict["group_by_extractions"]],
+        )
+        logger.info(f"使用 DSPy 提取: {extraction_dict}")
+    else:
+        extraction_json = extract_llm(req.text)
+    timing["layer1_llm_extraction_s"] = round(time.time() - layer1_start, 3)
+
+    # Layer2: 使用 MatcherService 解析
+    layer2_start = time.time()
+    region_filter = extraction_json.region_filter if extraction_json.region_filter else ["ROW"]
+    region_explain = {"stage": "llm_direct", "region_filter": region_filter}
+
+    metric_id, metric_explain = service.resolve_from_extractions(
+        MatcherType.METRIC, extraction_json.metric_extractions, default="pv"
+    )
+    event_name, event_explain = service.resolve_from_extractions(
+        MatcherType.EVENT, extraction_json.event_extractions, default="app_launch"
+    )
+    group_by_dim, group_by_explain = service.resolve_from_extractions(
+        MatcherType.DIMENSION, extraction_json.group_by_extractions, default="country"
+    )
+    n_days, time_explain = service.resolve_time(extraction_json)
+    timing["layer2_resolution_s"] = round(time.time() - layer2_start, 3)
+
+    resolver_explain = {
+        "region": region_explain,
+        "metric": metric_explain,
+        "event": event_explain,
+        "group_by": group_by_explain,
+        "time": time_explain,
+    }
+    logger.info(
+        "nl2dsl resolved query=%r region_filter=%s metric=%s event=%s group_by=%s n_days=%s",
+        req.text,
+        region_filter,
+        metric_id,
+        event_name,
+        group_by_dim,
+        n_days,
+    )
+
+    # Layer3: 语义 DSL 构建
+    layer3_start = time.time()
+    semantic = SemanticDSL(
+        project_id=req.project_id,
+        region_filter=region_filter,
+        metric=Metric(metric_id=metric_id),
+        event=Event(event_name=event_name),
+        time_range=TimeRange(type="last_n_days", n=n_days),
+        group_by=[GroupBy(dimension_id=group_by_dim)],
+        filters=[],
+    )
+    timing["layer3_semantic_dsl_s"] = round(time.time() - layer3_start, 3)
+
+    # Layer4: DSL 渲染
+    layer4_start = time.time()
+    exec_dsl = render_exec_dsl(semantic, catalog)
+    timing["layer4_render_exec_dsl_s"] = round(time.time() - layer4_start, 3)
+
+    # Validate
+    validate_start = time.time()
+    validate_region(exec_dsl)
+    validate_region_consistency(semantic, exec_dsl)
+    timing["validation_s"] = round(time.time() - validate_start, 3)
+
+    timing["total_s"] = round(time.time() - total_start, 3)
+    logger.info(f"nl2dsl timing: {timing}")
+
+    return NL2DSLResponse(
+        extraction_json=extraction_json.model_dump(),
+        semantic=semantic.model_dump(),
+        exec_dsl=exec_dsl,
+        explain={
+            "resolver_explain": resolver_explain,
+            "timing": timing,
+        },
+    )
+
+
+@app.post("/query/bearer", response_model=BearerQueryResponse)
+async def query_bearer(req: BearerQueryRequest):
+    """
+    执行 Bearer 查询接口
+
+    可通过 HTTP 调用，也可由 WebSocket 内部调用
+    """
+    try:
+        result = await execute_query(req.exec_dsl)
+        return BearerQueryResponse(result=result, success=True)
+    except Exception as e:
+        logger.error(f"Bearer query failed: {e}")
+        return BearerQueryResponse(result={}, success=False, error=str(e))

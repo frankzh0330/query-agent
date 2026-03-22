@@ -1,0 +1,11 @@
+metrics:
+  pv:
+    aliases: ["PV", "pv", "浏览量", "访问量", "点击量"]
+    indicator_show_name: "Total number (PV)"
+    event_indicator: "events"
+
+  uv:
+    aliases: ["UV", "uv", "独立访客", "访客数", "用户数"]
+    indicator_show_name: "Unique visitors (UV)"
+    event_indicator: "events"
+

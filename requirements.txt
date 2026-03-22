@@ -1,0 +1,23 @@
+# Web Framework
+fastapi==0.115.6
+uvicorn[standard]==0.30.6
+httpx==0.28.1
+
+# Data Validation
+pydantic==2.8.2
+
+# Config
+PyYAML==6.0.2
+python-dotenv==1.2.1
+
+# LLM / AI (使用智谱AI)
+langchain==1.2.9
+langchain-core==1.2.12
+langchain-community==0.4.1
+
+# NLP
+jieba==0.42.1
+rapidfuzz==3.14.3
+
+# Scheduling
+apscheduler>=3.10.0
