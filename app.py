@@ -14,6 +14,7 @@ from dsl.semantic_models import Event, GroupBy, Metric, SemanticDSL, TimeRange
 from dsl.validators import validate_region, validate_region_consistency
 from service.bearer_service import execute_query
 from service.llm_extractions import Extraction, ExtractionsJson, extract_llm
+from service.session_manager import SessionManager
 
 app = FastAPI(title="query-agent: NL to Semantic DSL")
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 # ====================
 
 _matcher_service: Optional["MatcherService"] = None
+session_manager = SessionManager()
 
 
 def set_matcher_service(service: "MatcherService") -> None:
@@ -46,6 +48,8 @@ def get_matcher_service() -> "MatcherService":
 class NL2DSLRequest(BaseModel):
     text: str
     project_id: int = Field(default=55)
+    session_id: str | None = None  # 会话ID（可选）
+    user_id: str | None = None    # 用户ID（可选）
 
 
 class NL2DSLResponse(BaseModel):
@@ -53,6 +57,7 @@ class NL2DSLResponse(BaseModel):
     semantic: Dict[str, Any]
     exec_dsl: Dict[str, Any]
     explain: Dict[str, Any]
+    session_id: str | None = None  # 返回会话ID
 
 
 class BearerQueryRequest(BaseModel):
@@ -75,14 +80,21 @@ def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
     NL 转 DSL 接口
 
     可通过 HTTP 调用，也可由 WebSocket 内部调用
+    支持会话记忆：传入 session_id 可利用历史对话上下文
     """
     service = get_matcher_service()
     catalog = service.catalog
 
+    # 获取或创建会话
+    ctx = session_manager.create_or_get(req.session_id, req.user_id, req.project_id)
+
+    # 获取会话上下文（用于 LLM）
+    session_context = session_manager.get_context(ctx.session_id)
+
     timing = {}
     total_start = time.time()
 
-    # Layer1: LLM 提取
+    # Layer1: LLM 提取（带会话上下文）
     use_dspy = os.getenv("USE_DSPY", "false").lower() == "true"
 
     layer1_start = time.time()
@@ -99,7 +111,7 @@ def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
         )
         logger.info(f"使用 DSPy 提取: {extraction_dict}")
     else:
-        extraction_json = extract_llm(req.text)
+        extraction_json = extract_llm(req.text, session_context=session_context)
     timing["layer1_llm_extraction_s"] = round(time.time() - layer1_start, 3)
 
     # Layer2: 使用 MatcherService 解析
@@ -163,6 +175,30 @@ def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
     timing["total_s"] = round(time.time() - total_start, 3)
     logger.info(f"nl2dsl timing: {timing}")
 
+    # 记录用户消息到会话
+    session_manager.add_message(
+        ctx.session_id,
+        "user",
+        req.text,
+        metadata={
+            "region_filter": region_filter,
+            "metric_id": metric_id,
+            "event_name": event_name,
+        }
+    )
+
+    # 更新已解析实体记忆
+    entities_to_update = {}
+    if extraction_json.region_filter:
+        entities_to_update["region"] = extraction_json.region_filter[0] if extraction_json.region_filter else None
+    if metric_id:
+        entities_to_update["metric"] = metric_id
+    if event_name:
+        entities_to_update["event"] = event_name
+
+    if entities_to_update:
+        session_manager.update_entities(ctx.session_id, entities_to_update)
+
     return NL2DSLResponse(
         extraction_json=extraction_json.model_dump(),
         semantic=semantic.model_dump(),
@@ -171,6 +207,7 @@ def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
             "resolver_explain": resolver_explain,
             "timing": timing,
         },
+        session_id=ctx.session_id,
     )
 
 
@@ -187,3 +224,34 @@ async def query_bearer(req: BearerQueryRequest):
     except Exception as e:
         logger.error(f"Bearer query failed: {e}")
         return BearerQueryResponse(result={}, success=False, error=str(e))
+
+
+@app.get("/sessions")
+def list_sessions():
+    """列出所有会话（调试用）"""
+    sessions = session_manager.list_sessions()
+    return {
+        "count": len(sessions),
+        "sessions": [s.to_dict() for s in sessions],
+    }
+
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str):
+    """获取单个会话（调试用）"""
+    ctx = session_manager.get_session(session_id)
+    if not ctx:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Session not found")
+    return ctx.to_dict()
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: str):
+    """删除会话（调试用）"""
+    ctx = session_manager.get_session(session_id)
+    if not ctx:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Session not found")
+    del session_manager._sessions[session_id]
+    return {"deleted": session_id}

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from langchain_community.chat_models import ChatZhipuAI
@@ -22,6 +22,38 @@ def _query_hash(text: str) -> str:
 def _is_cache_enabled() -> bool:
     """检查是否启用缓存"""
     return os.getenv("ENABLE_LLM_CACHE", "true").lower() == "true"
+
+
+# ==================== 会话上下文 ====================
+def _build_context_str(session_context: Optional[Dict[str, Any]]) -> str:
+    """构建会话上下文字符串（注入到提示词）"""
+    if not session_context:
+        return ""
+
+    context_str = ""
+
+    # 对话历史
+    if session_context.get("recent_queries"):
+        context_str += "\n=== 对话历史 ===\n"
+        for i, q in enumerate(session_context["recent_queries"], 1):
+            context_str += f"Q{i}: {q}\n"
+        context_str += "=== 历史结束 ===\n"
+
+    # 已解析实体
+    if session_context.get("resolved_entities"):
+        e = session_context["resolved_entities"]
+        entity_parts = []
+        if e.get("region"):
+            entity_parts.append(f"地区={e['region']}")
+        if e.get("metric"):
+            entity_parts.append(f"指标={e['metric']}")
+        if e.get("event"):
+            entity_parts.append(f"事件={e['event']}")
+
+        if entity_parts:
+            context_str += f"\n已确认: {', '.join(entity_parts)}\n"
+
+    return context_str
 
 
 def _extract_json(content: str) -> str:
@@ -123,43 +155,55 @@ class ExtractionsJson(BaseModel):
     group_by_extractions: List[Extraction] = Field(default_factory=list)
 
 
-EXTRACTIONS_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            r"""
-            你是"提取器"。只做：从用户问题中抽取结构化片段（extractions）。
+_BASE_SYSTEM_PROMPT = r"""
+你是"提取器"。只做：从用户问题中抽取结构化片段（extractions）。
 
-            只输出 JSON，key 必须且仅能包含：
-            metric_extractions, time_extractions, event_extractions, region_filter, group_by_extractions
+只输出 JSON，key 必须且仅能包含：
+metric_extractions, time_extractions, event_extractions, region_filter, group_by_extractions
 
-            每个元素格式：
-            {{"text":"..."}}
+每个元素格式：
+{{"text":"..."}}
 
-            抽取规则：
-            - metric_extractions：从用户问题中提取指标
-              - 明确提到 PV/浏览量/访问量/点击量 → "PV"
-              - 明确提到 UV/独立访客/访客数/用户数 → "UV"
-              - 没有明确提到指标 → 默认提取为 "PV"（这是最常用的指标）
-              - metric_extractions 不能为空，必须有值
+抽取规则：
+- metric_extractions：从用户问题中提取指标
+  - 明确提到 PV/浏览量/访问量/点击量 → "PV"
+  - 明确提到 UV/独立访客/访客数/用户数 → "UV"
+  - 没有明确提到指标 → 默认提取为 "PV"（这是最常用的指标）
+  - metric_extractions 不能为空，必须有值
 
-            - region_filter：直接返回区域代码列表，注意不是国家名而是区域代码！
-              - 欧洲/欧盟国家（德国、法国、意大利等）→ ["EUTTP"]
-              - 美国/美国州（加州、纽约等）→ ["USTTP"]
-              - 其他/未知/新加坡等 → ["ROW"]
-              - 无区域信息 → ["ROW"]
+- region_filter：直接返回区域代码列表，注意不是国家名而是区域代码！
+  - 欧洲/欧盟国家（德国、法国、意大利等）→ ["EUTTP"]
+  - 美国/美国州（加州、纽约等）→ ["USTTP"]
+  - 其他/未知/新加坡等 → ["ROW"]
+  - 无区域信息 → ["ROW"]
 
-            输出要求：
-            - 不要输出任何解释文字
-            - 不要使用 Markdown 代码块（不要出现 ```）
-            - 直接输出 JSON，必须以 {{ 开头，以 }} 结尾
+输出要求：
+- 不要输出任何解释文字
+- 不要使用 Markdown 代码块（不要出现 ```）
+- 直接输出 JSON，必须以 {{ 开头，以 }} 结尾
 
-            """
-            + FEW_SHOT_EXAMPLES
-        ),
+""" + FEW_SHOT_EXAMPLES
+
+
+def _build_prompt_template(session_context: Optional[Dict[str, Any]] = None) -> ChatPromptTemplate:
+    """构建带会话上下文的提示词模板"""
+    context_str = _build_context_str(session_context)
+
+    if context_str:
+        # 添加上下文提示
+        context_instruction = "\n请参考上述对话历史和已确认信息，理解用户当前问题的完整意图。\n"
+        system_prompt = _BASE_SYSTEM_PROMPT + context_str + context_instruction
+    else:
+        system_prompt = _BASE_SYSTEM_PROMPT
+
+    return ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
         ("human", "用户问题：\n{query}\n\n返回 JSON："),
-    ]
-)
+    ])
+
+
+# 保持向后兼容
+EXTRACTIONS_PROMPT = _build_prompt_template(None)
 
 
 def get_llm():
@@ -190,16 +234,25 @@ def get_llm():
         return ChatZhipuAI(model=model, temperature=0.2)
 
 
-def extract_llm(query: str) -> ExtractionsJson:
-    # 检查缓存
-    if _is_cache_enabled():
+def extract_llm(query: str, session_context: Optional[Dict[str, Any]] = None) -> ExtractionsJson:
+    """LLM 提取实体（支持会话上下文）
+
+    Args:
+        query: 用户查询文本
+        session_context: 会话上下文，包含历史对话和已解析实体
+    """
+    # 检查缓存（暂不支持带上下文的缓存）
+    if _is_cache_enabled() and not session_context:
         cache_key = _query_hash(query)
         if cache_key in _query_cache:
             print(f"extract_llm: cache hit for query: {query}")
             return ExtractionsJson(**_query_cache[cache_key])
 
+    # 构建带上下文的提示词
+    prompt_template = _build_prompt_template(session_context)
+
     llm = get_llm()
-    chain = EXTRACTIONS_PROMPT | llm
+    chain = prompt_template | llm
     resp = chain.invoke({"query": query})
     content = getattr(resp, "content", resp)
 
