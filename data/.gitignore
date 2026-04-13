@@ -1,0 +1,5 @@
+# Session JSONL files (runtime data)
+sessions/*.jsonl
+
+# Keep memory directory structure
+!memory/.gitkeep
