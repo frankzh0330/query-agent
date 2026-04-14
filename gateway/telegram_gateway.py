@@ -8,7 +8,9 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from bus.message_schema import BusMessage
 from gateway.base import BaseGateway
+from ingress.telegram_adapter import TelegramAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -17,10 +19,12 @@ class TelegramGateway(BaseGateway):
     """
     Telegram Bot Gateway
 
-    使用 long polling 方式接收消息
+    使用 long polling 方式接收消息。
+    通过 MessageBus 将消息传递给 AgentWorker 处理，不再直接调用业务逻辑。
     """
 
-    def __init__(self, bot_token: Optional[str] = None):
+    def __init__(self, bot_token: Optional[str] = None, bus=None):
+        super().__init__(channel="telegram", bus=bus)
         self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
         self._running = False
@@ -40,7 +44,7 @@ class TelegramGateway(BaseGateway):
                 await self._poll_updates()
             except Exception as e:
                 logger.error(f"Error polling updates: {e}")
-                await asyncio.sleep(5)  # 出错后等待 5 秒
+                await asyncio.sleep(5)
 
     async def stop(self) -> None:
         """停止 Gateway"""
@@ -52,7 +56,7 @@ class TelegramGateway(BaseGateway):
         url = f"{self.base_url}/getUpdates"
         params = {
             "offset": self._offset + 1,
-            "timeout": 30,  # long polling timeout
+            "timeout": 30,
         }
 
         async with httpx.AsyncClient() as client:
@@ -69,43 +73,82 @@ class TelegramGateway(BaseGateway):
                 await self.handle_message(update)
 
     async def handle_message(self, update: Dict[str, Any]) -> None:
-        """处理消息"""
-        message = update.get("message", {})
-        chat_id = message.get("chat", {}).get("id")
-        text = message.get("text", "")
+        """处理消息：Ingress 清洗 → 入队"""
+        adapter = TelegramAdapter()
+        std_msg = adapter.adapt(update)
 
-        if not chat_id or not text:
+        # 检查是否重复
+        if std_msg.is_duplicate:
+            logger.info(f"Duplicate message ignored: {std_msg.message_id}")
             return
 
-        logger.info(f"Received message from {chat_id}: {text}")
+        # 检查清洗后是否为空
+        if not std_msg.text:
+            logger.info(f"Empty message after cleaning: {std_msg.raw_text}")
+            return
 
-        # 调用 nl2dsl
-        try:
-            from app import NL2DSLRequest, nl2dsl
-            req = NL2DSLRequest(text=text)
-            result = nl2dsl(req)
-
-            # 发送响应
-            response_text = self._format_response(result)
-            await self.send_response(str(chat_id), {"text": response_text})
-
-        except Exception as e:
-            logger.exception(f"Error processing message: {e}")
-            await self.send_response(str(chat_id), {"text": f"处理失败: {e}"})
-
-    def _format_response(self, result: Any) -> str:
-        """格式化响应消息"""
-        semantic = result.semantic
-        exec_dsl = result.exec_dsl
-
-        return (
-            f"**查询结果**\n"
-            f"地区: {', '.join(semantic.get('region_filter', []))}\n"
-            f"指标: {semantic.get('metric', {}).get('metric_id', 'N/A')}\n"
-            f"事件: {semantic.get('event', {}).get('event_name', 'N/A')}\n"
-            f"时间: 近 {semantic.get('time_range', {}).get('n', 0)} 天\n\n"
-            f"```\n{json.dumps(exec_dsl, ensure_ascii=False, indent=2)}\n```"
+        logger.info(
+            f"Received message: user={std_msg.user_id}, "
+            f"chat={std_msg.chat_id}, text={std_msg.text}"
         )
+
+        # 构建统一消息并通过 Bus 发送
+        bus_msg = BusMessage(
+            channel=self.channel,
+            chat_id=std_msg.chat_id,
+            user_id=std_msg.user_id,
+            text=std_msg.text,
+            project_id=55,
+        )
+
+        if self.bus:
+            await self.bus.enqueue_request(bus_msg)
+        else:
+            logger.error("No bus configured, message dropped")
+
+    def format_response(self, nl2dsl_result: Any, query_result: Any = None) -> str:
+        """格式化响应消息为 Telegram 文本"""
+        semantic = nl2dsl_result.get("semantic", {})
+        metric = semantic.get("metric", {})
+        event = semantic.get("event", {})
+        time_range = semantic.get("time_range", {})
+
+        lines = [
+            "\U0001F4CA 查询结果",
+            f"地区: {', '.join(semantic.get('region_filter', []))}",
+            f"指标: {metric.get('metric_id', 'N/A')}",
+            f"事件: {event.get('event_name', 'N/A')}",
+            f"时间: 近 {time_range.get('n', 0)} 天",
+        ]
+
+        if query_result and query_result.get("success"):
+            data = query_result.get("result", query_result)
+            mock_data = data.get("data", {})
+            records = mock_data.get("result", mock_data.get("data", []))
+
+            if records:
+                lines.append("\n\U0001F4C8 数据结果")
+                for record in records[:5]:
+                    parts = []
+                    for k, v in record.items():
+                        if k != "date":
+                            parts.append(f"{k}={v}")
+                    date_val = record.get('date', 'N/A')
+                    if parts:
+                        lines.append(f"{date_val}: {', '.join(parts)}")
+                    else:
+                        lines.append(f"{date_val}: {json.dumps(record, ensure_ascii=False)}")
+
+                if len(records) > 5:
+                    lines.append(f"...(还有 {len(records) - 5} 条记录)")
+            else:
+                lines.append("\n暂无数据")
+        elif query_result and query_result.get("error"):
+            lines.append(f"\n\U0000274C 查询失败: {query_result.get('error')}")
+        else:
+            lines.append("\n\U000026A0\uFE0F 未获取到查询结果")
+
+        return "\n".join(lines)
 
     async def send_response(self, recipient: str, response: Dict[str, Any]) -> None:
         """发送响应"""
@@ -113,7 +156,6 @@ class TelegramGateway(BaseGateway):
         payload = {
             "chat_id": recipient,
             "text": response.get("text", ""),
-            "parse_mode": "Markdown",
         }
 
         async with httpx.AsyncClient() as client:
@@ -124,33 +166,3 @@ class TelegramGateway(BaseGateway):
                 logger.error(f"Failed to send message: {data}")
             else:
                 logger.info(f"Message sent to {recipient}")
-
-
-# =========================
-# Gateway 管理器
-# =========================
-
-class GatewayManager:
-    """管理多个 Gateway 实例"""
-
-    def __init__(self):
-        self._gateways: Dict[str, BaseGateway] = {}
-
-    def register(self, name: str, gateway: BaseGateway) -> None:
-        """注册 Gateway"""
-        self._gateways[name] = gateway
-        logger.info(f"Gateway registered: {name}")
-
-    async def start_all(self) -> None:
-        """启动所有 Gateway"""
-        tasks = [gw.start() for gw in self._gateways.values()]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def stop_all(self) -> None:
-        """停止所有 Gateway"""
-        tasks = [gw.stop() for gw in self._gateways.values()]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
-# 全局 Gateway 管理器
-gateway_manager = GatewayManager()

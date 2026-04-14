@@ -9,41 +9,76 @@ import uvicorn
 from fastapi import FastAPI
 
 from app import app, set_matcher_service
-from gateway.telegram_gateway import TelegramGateway, gateway_manager
+from bus import create_bus
+from bus.direct_call_bus import DirectCallBus
+from dispatcher.response_dispatcher import ResponseDispatcher
+from gateway.telegram_gateway import TelegramGateway
 from matcher.matcher_service import MatcherService
 from service.catalog_scheduler import CatalogScheduler
 from service.catalog_sync import CatalogSync
+from worker.agent_worker import AgentWorker
 
 logger = logging.getLogger(__name__)
 
 
 # ====================
-# WebSocket 启动配置
+# 组件初始化
+# ====================
+
+# 全局消息总线
+bus = create_bus()
+
+# Agent Worker
+worker = AgentWorker()
+
+# 响应分派器
+dispatcher = ResponseDispatcher()
+
+# Gateway 管理器
+_gateways: dict[str, TelegramGateway] = {}
+
+
+# ====================
+# 服务生命周期
 # ====================
 
 @asynccontextmanager
 async def websocket_lifespan(app: FastAPI):
     """
-    WebSocket 服务生命周期管理
+    服务生命周期管理
 
     启动时:
     1. 初始化 MatcherService（构建索引）
-    2. 注册到 app
+    2. 创建 MessageBus + AgentWorker + ResponseDispatcher
     3. 启动 Telegram Gateway
     4. 启动 Catalog 定时同步调度器
     """
-    logger.info("=== Starting WebSocket Server ===")
+    logger.info("=== Starting Server ===")
 
     # 1. 初始化 MatcherService（构建索引）
     matcher_service = MatcherService(catalog_path="catalog")
     set_matcher_service(matcher_service)
     logger.info("MatcherService initialized and registered")
 
-    # 2. 启动 Telegram Gateway（后台任务）
+    # 2. 组装 Bus + Worker + Dispatcher
+    if isinstance(bus, DirectCallBus):
+        bus.bind_worker(worker)
+        bus.bind_dispatcher(dispatcher)
+        logger.info("DirectCallBus: worker and dispatcher bound")
+    else:
+        # Redis 模式：启动 worker 和 dispatcher 循环
+        asyncio.create_task(worker.run_loop(bus))
+        asyncio.create_task(dispatcher.run_loop(bus))
+        logger.info("Redis bus: worker and dispatcher loops started")
+
+    # 3. 启动 Telegram Gateway
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     if telegram_token:
-        telegram_gw = TelegramGateway(bot_token=telegram_token)
-        gateway_manager.register("telegram", telegram_gw)
+        telegram_gw = TelegramGateway(bot_token=telegram_token, bus=bus)
+        _gateways["telegram"] = telegram_gw
+
+        # 注册到 Dispatcher
+        dispatcher.register("telegram", telegram_gw)
 
         # 在后台运行 Gateway
         async def run_gateway():
@@ -54,7 +89,7 @@ async def websocket_lifespan(app: FastAPI):
     else:
         logger.warning("TELEGRAM_BOT_TOKEN not set, skipping TelegramGateway")
 
-    # 3. 启动 Catalog 定时同步调度器
+    # 4. 启动 Catalog 定时同步调度器
     catalog_api_base = os.getenv("CATALOG_API_BASE")
     if catalog_api_base:
         catalog_sync = CatalogSync(api_base=catalog_api_base, catalog_dir="catalog")
@@ -68,8 +103,9 @@ async def websocket_lifespan(app: FastAPI):
     yield
 
     # 清理
-    logger.info("=== Stopping WebSocket Server ===")
-    await gateway_manager.stop_all()
+    logger.info("=== Stopping Server ===")
+    for gw in _gateways.values():
+        await gw.stop()
     if catalog_scheduler:
         catalog_scheduler.shutdown()
 
@@ -80,8 +116,9 @@ app_with_ws = FastAPI(
     lifespan=websocket_lifespan,
 )
 
-# 挂载原有的 HTTP 路由
-app_with_ws.mount("/api", app)
+# 直接挂载原有路由（不使用 /api 前缀）
+for route in app.routes:
+    app_with_ws.routes.append(route)
 
 
 # ====================
@@ -89,7 +126,7 @@ app_with_ws.mount("/api", app)
 # ====================
 
 def main():
-    """启动 WebSocket 服务器"""
+    """启动服务器"""
     port = int(os.getenv("PORT", "8000"))
     host = os.getenv("HOST", "0.0.0.0")
 

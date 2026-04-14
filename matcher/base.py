@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import zlib
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import jieba
 from rapidfuzz import fuzz, process
 
 from common.text_utils import (
@@ -52,7 +54,6 @@ def _stable_id(name: str) -> int:
         _stable_id("payment_success") = 129485012
         # 任何顺序、任何次数启动，永远相同
     """
-    import zlib
     return zlib.crc32(name.encode()) & 0x7fffffff
 
 
@@ -132,7 +133,6 @@ class BaseMatcher:
 
     def _add_to_jieba_dict(self, aliases: List[str]) -> None:
         """将别名加入 jieba 词典"""
-        import jieba
         for alias in aliases:
             if contains_chinese(alias):
                 jieba.add_word(alias)

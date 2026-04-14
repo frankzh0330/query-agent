@@ -1,8 +1,20 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: query_agent_redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
   agent:
     build: .
-    container_name: first_agent
-    command: ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+    container_name: query_agent
+    command: ["uvicorn", "server:app_with_ws", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "8000:8000"
+    environment:
+      - MESSAGE_BUS_BACKEND=${MESSAGE_BUS_BACKEND:-direct}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
     restart: unless-stopped
