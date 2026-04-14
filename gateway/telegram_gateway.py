@@ -108,6 +108,13 @@ class TelegramGateway(BaseGateway):
 
     def format_response(self, nl2dsl_result: Any, query_result: Any = None) -> str:
         """格式化响应消息为 Telegram 文本"""
+        status = nl2dsl_result.get("status", "success")
+
+        # 确认流：返回候选列表供用户选择
+        if status == "needs_confirmation":
+            return self._format_confirmation(nl2dsl_result)
+
+        # 正常结果
         semantic = nl2dsl_result.get("semantic", {})
         metric = semantic.get("metric", {})
         event = semantic.get("event", {})
@@ -166,3 +173,21 @@ class TelegramGateway(BaseGateway):
                 logger.error(f"Failed to send message: {data}")
             else:
                 logger.info(f"Message sent to {recipient}")
+
+    def _format_confirmation(self, nl2dsl_result: Any) -> str:
+        """格式化确认请求消息"""
+        message = nl2dsl_result.get("message", "")
+        candidates = nl2dsl_result.get("candidates", {})
+
+        if not candidates:
+            return message
+
+        lines = []
+        for field_name, cands in candidates.items():
+            field_display = {"event": "事件", "metric": "指标"}.get(field_name, field_name)
+            lines.append(f"请选择{field_display}:")
+            for i, c in enumerate(cands[:5], 1):
+                lines.append(f"  {i}. {c['value']} (匹配度 {c['score']:.0f}%)")
+        lines.append("回复编号或名称即可")
+
+        return "\n".join(lines)

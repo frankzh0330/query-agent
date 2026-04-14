@@ -18,6 +18,7 @@ from service.bearer_service import execute_query
 from service.llm_extractions import extract_llm_async
 from service.session_manager import SessionManager
 from service.session_models import QueryState
+from service.task_manager import TaskManager
 
 app = FastAPI(title="query-agent: NL to Semantic DSL")
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 _matcher_service: Optional["MatcherService"] = None
 session_manager = SessionManager(data_path="data")
+task_manager = TaskManager()
 
 
 def set_matcher_service(service: "MatcherService") -> None:
@@ -62,8 +64,10 @@ class NL2DSLResponse(BaseModel):
     exec_dsl: Dict[str, Any]
     explain: Dict[str, Any]
     session_id: str | None = None  # 返回会话ID
-    status: str = "success"  # "success" | "early_exit"
-    message: str | None = None  # early_exit 时的提示消息
+    status: str = "success"  # "success" | "early_exit" | "needs_confirmation"
+    message: str | None = None  # 提示消息
+    task_id: str | None = None  # 确认任务ID
+    candidates: Dict[str, Any] | None = None  # 候选列表
 
 
 class BearerQueryRequest(BaseModel):
@@ -100,6 +104,153 @@ async def _send_telegram_notification(chat_id: str, message: str) -> None:
         logger.warning(f"Failed to send Telegram notification: {e}")
 
 
+def _match_user_input_to_candidates(user_input: str, candidates: list[dict]) -> str | None:
+    """将用户输入匹配到候选项（支持编号和名称）"""
+    text = user_input.strip()
+
+    # 尝试编号匹配
+    if text.isdigit():
+        idx = int(text) - 1
+        if 0 <= idx < len(candidates):
+            return candidates[idx]["value"]
+
+    # 尝试名称匹配（忽略大小写）
+    text_lower = text.lower()
+    for c in candidates:
+        if c["value"].lower() == text_lower:
+            return c["value"]
+
+    # 尝试部分匹配
+    for c in candidates:
+        if text_lower in c["value"].lower() or c["value"].lower() in text_lower:
+            return c["value"]
+
+    return None
+
+
+async def _handle_confirmation(
+    req: NL2DSLRequest,
+    ctx: "SessionContext",
+    task: "TaskContext",
+    service: "MatcherService",
+    catalog,
+) -> NL2DSLResponse:
+    """处理用户对确认任务的回复"""
+    user_input = req.text.strip()
+    confirmed_values = {}
+
+    # 对每个待确认字段尝试匹配用户输入
+    for field_name, candidates in task.candidates.items():
+        matched = _match_user_input_to_candidates(user_input, candidates)
+        if matched:
+            task_manager.confirm_task(task.task_id, field_name, matched)
+            confirmed_values[field_name] = matched
+            logger.info(f"User confirmed {field_name}={matched} for task {task.task_id}")
+
+    if not confirmed_values:
+        # 用户输入没匹配到任何候选 → 提示重新选择
+        message_lines = ["未能识别您的选择，请回复编号或名称:"]
+        for field_name, cands in task.candidates.items():
+            field_display = {"event": "事件", "metric": "指标"}.get(field_name, field_name)
+            message_lines.append(f"请选择{field_display}:")
+            for i, c in enumerate(cands[:5], 1):
+                message_lines.append(f"  {i}. {c['value']} (匹配度 {c['score']:.0f}%)")
+
+        hint_msg = "\n".join(message_lines)
+        if req.chat_id:
+            await _send_telegram_notification(req.chat_id, hint_msg)
+
+        return NL2DSLResponse(
+            extraction_json=task.extraction,
+            semantic={},
+            exec_dsl={},
+            explain={},
+            session_id=ctx.session_id,
+            status="needs_confirmation",
+            message=hint_msg,
+            task_id=task.task_id,
+            candidates=task.candidates,
+        )
+
+    # 检查是否所有待确认字段都已确认
+    all_confirmed = all(
+        field in task.user_selection
+        for field in task.candidates.keys()
+    )
+
+    if not all_confirmed:
+        # 还有字段未确认 → 继续等待
+        remaining = {
+            f: c for f, c in task.candidates.items()
+            if f not in task.user_selection
+        }
+        message_lines = [f"已确认: {confirmed_values}"]
+        for field_name, cands in remaining.items():
+            field_display = {"event": "事件", "metric": "指标"}.get(field_name, field_name)
+            message_lines.append(f"还需要选择{field_display}:")
+            for i, c in enumerate(cands[:5], 1):
+                message_lines.append(f"  {i}. {c['value']} (匹配度 {c['score']:.0f}%)")
+
+        hint_msg = "\n".join(message_lines)
+        return NL2DSLResponse(
+            extraction_json=task.extraction,
+            semantic={},
+            exec_dsl={},
+            explain={},
+            session_id=ctx.session_id,
+            status="needs_confirmation",
+            message=hint_msg,
+            task_id=task.task_id,
+            candidates=remaining,
+        )
+
+    # 全部确认 → 用确认后的 query_state 继续构建 DSL
+    ctx.pending_task_id = None
+    task_manager.update_status(task.task_id, "confirmed")
+
+    qs = task.partial_query_state
+    # 用用户确认的值覆盖
+    for field, value in task.user_selection.items():
+        if field == "event":
+            qs.event = value
+        elif field == "metric":
+            qs.metric = value
+
+    # Layer3: 语义 DSL 构建
+    semantic = SemanticDSL(
+        project_id=qs.project_id,
+        region_filter=qs.region_filter,
+        metric=Metric(metric_id=qs.metric),
+        event=Event(event_name=qs.event),
+        time_range=TimeRange(type="last_n_days", n=qs.time_range["n"] if qs.time_range else 7),
+        group_by=[GroupBy(dimension_id=d) for d in qs.group_by],
+        filters=qs.filters,
+    )
+
+    # Layer4: DSL 渲染
+    exec_dsl = render_exec_dsl(semantic, catalog)
+
+    # Validate
+    validate_region(exec_dsl)
+    validate_region_consistency(semantic, exec_dsl)
+
+    # 记录到会话
+    session_manager.add_message(ctx.session_id, "user", task.raw_query)
+    session_manager.add_message(ctx.session_id, "user", user_input, metadata={"confirmed": task.user_selection})
+    session_manager.update_query_state(ctx.session_id, qs)
+    task_manager.update_status(task.task_id, "completed")
+
+    return NL2DSLResponse(
+        extraction_json=task.extraction,
+        semantic=semantic.model_dump(),
+        exec_dsl=exec_dsl,
+        explain={"confirmed": task.user_selection, "method": "user_confirmation"},
+        session_id=ctx.session_id,
+        status="success",
+        message=f"已按您的选择生成查询: {task.user_selection}",
+    )
+
+
 # ====================
 # HTTP API 端点
 # ====================
@@ -117,6 +268,15 @@ async def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
 
     # 获取或创建会话
     ctx = session_manager.create_or_get(req.session_id, req.user_id, req.project_id)
+
+    # ============ 入口拦截：检查是否有待确认任务 ============
+    if ctx.pending_task_id:
+        task = task_manager.get_task(ctx.pending_task_id)
+        if task and task.status == "waiting_confirmation":
+            # 用户的这条消息是确认回复，不是新查询
+            return await _handle_confirmation(req, ctx, task, service, catalog)
+
+    # ============ 正常查询流程 ============
 
     # 获取增强会话上下文（包含长期记忆）
     session_context = session_manager.get_enhanced_context(ctx.session_id)
@@ -155,7 +315,7 @@ async def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
             message=error_msg,
         )
 
-    # Layer2: 使用 MatcherService 解析
+    # Layer2: 使用 MatcherService 解析（带候选和置信度）
     layer2_start = time.time()
     region_filter = extraction_json.region_filter if extraction_json.region_filter else ["ROW"]
     region_explain = {"stage": "llm_direct", "region_filter": region_filter}
@@ -164,30 +324,95 @@ async def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
     print(f"extraction_json: {extraction_json.model_dump()}")
     print(f"region_filter: {region_filter}")
 
-    metric_id, metric_explain = service.resolve_from_extractions(
+    metric_result = service.resolve_with_candidates(
         MatcherType.METRIC, extraction_json.metric_extractions, default="pv"
     )
-    print(f"metric_id: {metric_id}, metric_explain: {metric_explain}")
+    print(f"metric: value={metric_result.value}, score={metric_result.score}, needs_confirm={metric_result.needs_confirmation}")
 
-    event_name, event_explain = service.resolve_from_extractions(
+    event_result = service.resolve_with_candidates(
         MatcherType.EVENT, extraction_json.event_extractions, default="app_launch"
     )
-    print(f"event_name: {event_name}, event_explain: {event_explain}")
+    print(f"event: value={event_result.value}, score={event_result.score}, needs_confirm={event_result.needs_confirmation}")
 
-    group_by_dim, group_by_explain = service.resolve_from_extractions(
+    group_by_result = service.resolve_with_candidates(
         MatcherType.DIMENSION, extraction_json.group_by_extractions, default="country"
     )
-    print(f"group_by_dim: {group_by_dim}, group_by_explain: {group_by_explain}")
+    print(f"group_by: value={group_by_result.value}, score={group_by_result.score}, needs_confirm={group_by_result.needs_confirmation}")
 
     n_days, time_explain = service.resolve_time(extraction_json)
     print(f"n_days: {n_days}, time_explain: {time_explain}")
     timing["layer2_resolution_s"] = round(time.time() - layer2_start, 3)
 
+    # ============ 确认流判断（确定性代码规则，不依赖 LLM） ============
+    pending_fields = {}
+    if event_result.needs_confirmation:
+        pending_fields["event"] = event_result.candidates
+    if metric_result.needs_confirmation:
+        pending_fields["metric"] = metric_result.candidates
+
+    if pending_fields:
+        # 有低置信度字段 → 创建确认任务
+        partial_state = QueryState(
+            project_id=req.project_id,
+            event=event_result.value,
+            metric=metric_result.value,
+            time_range={"type": "last_n_days", "n": n_days},
+            region_filter=region_filter,
+            group_by=[group_by_result.value],
+            filters=[],
+        )
+        task = task_manager.create_task(
+            session_id=ctx.session_id,
+            raw_query=req.text,
+            extraction=extraction_json.model_dump(),
+            user_id=ctx.user_id,
+            candidates=pending_fields,
+            partial_query_state=partial_state,
+        )
+        ctx.pending_task_id = task.task_id
+
+        # 构建候选提示消息
+        message_lines = []
+        for field_name, cands in pending_fields.items():
+            field_display = {"event": "事件", "metric": "指标"}.get(field_name, field_name)
+            message_lines.append(f"请选择{field_display}:")
+            for i, c in enumerate(cands[:5], 1):
+                message_lines.append(f"  {i}. {c['value']} (匹配度 {c['score']:.0f}%)")
+        message_lines.append("回复编号或名称即可")
+
+        confirm_msg = "\n".join(message_lines)
+
+        if req.chat_id:
+            await _send_telegram_notification(req.chat_id, confirm_msg)
+
+        return NL2DSLResponse(
+            extraction_json=extraction_json.model_dump(),
+            semantic={},
+            exec_dsl={},
+            explain={"resolver_explain": {
+                "region": region_explain,
+                "metric": {"method": metric_result.method, "score": metric_result.score},
+                "event": {"method": event_result.method, "score": event_result.score},
+                "group_by": {"method": group_by_result.method, "score": group_by_result.score},
+                "time": time_explain,
+            }},
+            session_id=ctx.session_id,
+            status="needs_confirmation",
+            message=confirm_msg,
+            task_id=task.task_id,
+            candidates=pending_fields,
+        )
+
+    # 高置信度 → 使用解析结果
+    metric_id = metric_result.value
+    event_name = event_result.value
+    group_by_dim = group_by_result.value
+
     resolver_explain = {
         "region": region_explain,
-        "metric": metric_explain,
-        "event": event_explain,
-        "group_by": group_by_explain,
+        "metric": {"method": metric_result.method, "score": metric_result.score},
+        "event": {"method": event_result.method, "score": event_result.score},
+        "group_by": {"method": group_by_result.method, "score": group_by_result.score},
         "time": time_explain,
     }
 

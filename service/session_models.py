@@ -137,6 +137,9 @@ class SessionContext:
     # 最近一次结果摘要（可选）
     last_result_summary: Optional[str] = None
 
+    # 当前等待用户确认的任务 ID
+    pending_task_id: Optional[str] = None
+
     created_at: datetime = field(default_factory=datetime.now)
     last_active: datetime = field(default_factory=datetime.now)
 
@@ -163,6 +166,7 @@ class SessionContext:
             "messages": [m.to_dict() for m in self.messages],
             "last_query_state": self.last_query_state.to_dict() if self.last_query_state else None,
             "last_result_summary": self.last_result_summary,
+            "pending_task_id": self.pending_task_id,
             "created_at": self.created_at.isoformat(),
             "last_active": self.last_active.isoformat(),
         }

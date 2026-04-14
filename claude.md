@@ -521,6 +521,43 @@ redis>=5.0.0        # Redis 存储 (可选)
 ## 八、后续优化方向
 
 1. **智能上下文摘要**：使用 LLM 生成对话摘要，节省 token
-2. **用户偏好学习**：记录用户常用的 metric/event/region
-3. **会话过期策略**：自动清理长期不活跃的会话
-4. **跨会话记忆**：持久化用户级别的偏好设置
+2. **会话过期策略**：自动清理长期不活跃的会话
+3. **跨会话记忆**：持久化用户级别的偏好设置
+
+---
+
+# 测试基础设施
+
+## 测试框架
+
+- 使用 `pytest`（统一，不再混用 unittest）
+- 配置文件：`pytest.ini`
+- 共享 fixtures：`tests/conftest.py`
+
+## 运行测试
+
+```bash
+pytest tests/ -v
+```
+
+## 测试文件清单
+
+| 文件 | 覆盖模块 | 测试数量 |
+|------|---------|---------|
+| `test_session_storage.py` | `memory/storage/memory_file.py` — JSONL 持久化、容错 | 15 |
+| `test_long_term_memory.py` | `memory/long_term_memory.py` — 记忆注入、缓存、截断 | 11 |
+| `test_task_manager.py` | `service/task_manager.py` — 确认流生命周期、过期 | 17 |
+| `test_session_manager.py` | `service/session_manager.py` — 会话管理集成 | 15 |
+| `test_ingress.py` | `ingress/` — 清洗、去重、Telegram 适配 | 20 |
+| `test_bus.py` | `bus/` — 消息总线、DirectCallBus、工厂函数 | 10 |
+| `test_app_endpoints.py` | `app.py` — HTTP 端点（happy path / early_exit / confirmation / fallback） | 16 |
+| `test_matchers.py` | `matcher/` — 文本工具、事件/指标/维度/时间匹配 | 29 |
+
+## 关键测试场景
+
+1. **Session recovery**：JSONL 写入 → create_or_get → 恢复 messages + query_state
+2. **Memory injection**：get_enhanced_context → memory_corrections 注入
+3. **early_exit**：空 event_extractions → status=early_exit
+4. **Fallback**：低分 → 使用 default 值
+5. **Confirmation flow**：低置信度 → needs_confirmation → 用户选择 → success
+6. **JSONL 容错**：corrupted line → 跳过，不崩溃
