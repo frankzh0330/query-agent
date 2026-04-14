@@ -31,11 +31,13 @@ class AgentWorker:
         from app import NL2DSLRequest, nl2dsl
         from service.bearer_service import execute_query
 
+        # 用 chat_id 作为 session_id，同一聊天的消息共享会话上下文
         req = NL2DSLRequest(
             text=msg.text,
             user_id=msg.user_id,
             project_id=msg.project_id,
             chat_id=msg.chat_id,
+            session_id=f"tg_{msg.chat_id}",
         )
 
         result = await nl2dsl(req)
