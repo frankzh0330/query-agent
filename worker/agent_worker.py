@@ -31,6 +31,8 @@ class AgentWorker:
         from app import NL2DSLRequest, nl2dsl
         from service.bearer_service import execute_query
 
+        logger.info(f"Worker processing: msg={msg.msg_id}, channel={msg.channel}, text={msg.text[:60]}")
+
         # 用 chat_id 作为 session_id，同一聊天的消息共享会话上下文
         req = NL2DSLRequest(
             text=msg.text,
@@ -42,9 +44,11 @@ class AgentWorker:
 
         result = await nl2dsl(req)
         result_data = result.model_dump()
+        logger.debug(f"Worker nl2dsl done: status={result.status}, session={result.session_id}")
 
         # early_exit 场景（缺少 event_name 等）
         if result.status == "early_exit":
+            logger.info(f"Worker early_exit: msg={msg.msg_id}, reason={result.message}")
             return {
                 "nl2dsl": result_data,
                 "query": None,
@@ -55,6 +59,7 @@ class AgentWorker:
         # 执行 Bearer 查询
         try:
             query_result = await execute_query(result.exec_dsl)
+            logger.info(f"Worker query done: msg={msg.msg_id}, success=True")
         except Exception as e:
             logger.exception(f"Bearer query failed for msg={msg.msg_id}: {e}")
             query_result = {"success": False, "error": str(e)}

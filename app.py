@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ from service.llm_extractions import extract_llm_async
 from service.session_manager import SessionManager
 from service.session_models import QueryState
 from service.task_manager import TaskManager
+from memory.memory_writer import MemoryWriter
 
 app = FastAPI(title="query-agent: NL to Semantic DSL")
 logger = logging.getLogger(__name__)
@@ -30,6 +32,7 @@ logger = logging.getLogger(__name__)
 _matcher_service: Optional["MatcherService"] = None
 session_manager = SessionManager(data_path="data")
 task_manager = TaskManager()
+memory_writer = MemoryWriter(data_path="data/memory")
 
 
 def set_matcher_service(service: "MatcherService") -> None:
@@ -240,6 +243,18 @@ async def _handle_confirmation(
     session_manager.update_query_state(ctx.session_id, qs)
     task_manager.update_status(task.task_id, "completed")
 
+    # ============ 确认流完成 → 异步学习用户选择 ============
+    asyncio.create_task(
+        memory_writer.maybe_save(
+            project_id=qs.project_id,
+            user_query=task.raw_query,
+            extraction=task.extraction,
+            resolver_explain={"user_confirmed": task.user_selection},
+            current_state=qs.to_dict(),
+            confirmed_selection=task.user_selection,
+        )
+    )
+
     return NL2DSLResponse(
         extraction_json=task.extraction,
         semantic=semantic.model_dump(),
@@ -290,8 +305,7 @@ async def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
     timing["layer1_llm_extraction_s"] = round(time.time() - layer1_start, 3)
 
     # 打印 LLM 提取结果
-    print(f"\n=== Layer1: LLM 提取结果 ===")
-    print(f"用户输入: {req.text}, extraction_json: {json.dumps(extraction_json.model_dump(), ensure_ascii=False)}")
+    logger.debug(f"Layer1: user={req.text}, extraction={json.dumps(extraction_json.model_dump(), ensure_ascii=False)}")
 
     # === 验证必填字段 event ===
     if not extraction_json.event_extractions:
@@ -320,27 +334,26 @@ async def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
     region_filter = extraction_json.region_filter if extraction_json.region_filter else ["ROW"]
     region_explain = {"stage": "llm_direct", "region_filter": region_filter}
 
-    print(f"\n=== Layer2: MatcherService 解析 ===")
-    print(f"extraction_json: {extraction_json.model_dump()}")
-    print(f"region_filter: {region_filter}")
+    logger.debug(f"Layer2: extraction={extraction_json.model_dump()}, region_filter={region_filter}")
 
     metric_result = service.resolve_with_candidates(
         MatcherType.METRIC, extraction_json.metric_extractions, default="pv"
     )
-    print(f"metric: value={metric_result.value}, score={metric_result.score}, needs_confirm={metric_result.needs_confirmation}")
 
     event_result = service.resolve_with_candidates(
         MatcherType.EVENT, extraction_json.event_extractions, default="app_launch"
     )
-    print(f"event: value={event_result.value}, score={event_result.score}, needs_confirm={event_result.needs_confirmation}")
 
     group_by_result = service.resolve_with_candidates(
         MatcherType.DIMENSION, extraction_json.group_by_extractions, default="country"
     )
-    print(f"group_by: value={group_by_result.value}, score={group_by_result.score}, needs_confirm={group_by_result.needs_confirmation}")
 
     n_days, time_explain = service.resolve_time(extraction_json)
-    print(f"n_days: {n_days}, time_explain: {time_explain}")
+    logger.debug(
+        f"Layer2 resolved: event={event_result.value}({event_result.score:.0f}/{event_result.method}), "
+        f"metric={metric_result.value}({metric_result.score:.0f}/{metric_result.method}), "
+        f"group_by={group_by_result.value}({group_by_result.score:.0f}), n_days={n_days}"
+    )
     timing["layer2_resolution_s"] = round(time.time() - layer2_start, 3)
 
     # ============ 确认流判断（确定性代码规则，不依赖 LLM） ============
@@ -442,9 +455,7 @@ async def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
     timing["layer4_render_exec_dsl_s"] = round(time.time() - layer4_start, 3)
 
     # 打印 exec_dsl 用于调试
-    print(f"\n=== Layer4: exec_dsl ===")
-    print(f"{json.dumps(exec_dsl, ensure_ascii=False)}")
-    # logger.info(f"Generated exec_dsl: {exec_dsl}")
+    logger.debug(f"Layer4: exec_dsl={json.dumps(exec_dsl, ensure_ascii=False)}")
 
     # Validate
     validate_start = time.time()
@@ -453,9 +464,7 @@ async def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
     timing["validation_s"] = round(time.time() - validate_start, 3)
 
     timing["total_s"] = round(time.time() - total_start, 3)
-    # logger.info(f"nl2dsl timing: {timing}")
-    print(f"\n=== Timing ===")
-    print(f"timing: {json.dumps(timing, ensure_ascii=False)}")
+    logger.debug(f"Timing: {json.dumps(timing, ensure_ascii=False)}")
 
     # 记录用户消息到会话
     session_manager.add_message(
@@ -480,6 +489,19 @@ async def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
         filters=[],
     )
     session_manager.update_query_state(ctx.session_id, query_state)
+
+    # ============ 异步触发记忆学习（不阻塞响应） ============
+    prev_state_dict = prev_qs.to_dict() if (prev_qs := ctx.last_query_state) else None
+    asyncio.create_task(
+        memory_writer.maybe_save(
+            project_id=req.project_id,
+            user_query=req.text,
+            extraction=extraction_json.model_dump(),
+            resolver_explain=resolver_explain,
+            current_state=query_state.to_dict(),
+            prev_state=prev_state_dict,
+        )
+    )
 
     return NL2DSLResponse(
         extraction_json=extraction_json.model_dump(),

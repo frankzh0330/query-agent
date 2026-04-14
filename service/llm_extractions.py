@@ -379,6 +379,7 @@ def extract_llm(query: str, session_context: Optional[Dict[str, Any]] = None) ->
         "messages": messages,
         "temperature": 0.2,
     }
+    logger.debug(f"LLM extract: model={model}, tool_calling={use_tool_calling}, query={query[:80]}")
 
     if use_tool_calling:
         kwargs["tools"] = [EXTRACT_ENTITIES_TOOL]
@@ -391,15 +392,18 @@ def extract_llm(query: str, session_context: Optional[Dict[str, Any]] = None) ->
     # Function Calling 路径：从 tool_calls 提取结构化参数
     if use_tool_calling and message.tool_calls:
         args = json.loads(message.tool_calls[0].function.arguments)
+        logger.debug(f"LLM extract (tool_call): {json.dumps(args, ensure_ascii=False)[:200]}")
         result = _parse_result(args)
     else:
         # Prompt-based 路径（fallback 或 Ollama）
         content = message.content if hasattr(message, "content") else str(message)
         content = _extract_json(content)
+        logger.debug(f"LLM extract (prompt): raw={content[:200]}")
         try:
             data = json.loads(content)
             result = _parse_result(data)
         except (json.JSONDecodeError, ValidationError) as e:
+            logger.error(f"LLM extract parse failed: {e}, raw={content[:300]}")
             raise ValueError(f"LLM extractions 输出不合法: {e}\nRaw:\n{content}")
 
     # 保存到缓存（仅无上下文时）

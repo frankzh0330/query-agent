@@ -218,5 +218,6 @@ class SessionManager:
         )
         if memory_content:
             context["memory_corrections"] = memory_content
+            logger.debug(f"Enhanced context for {session_id}: injected {len(memory_content)} chars memory")
 
         return context

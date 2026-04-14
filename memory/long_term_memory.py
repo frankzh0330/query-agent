@@ -51,8 +51,10 @@ class LongTermMemory:
 
         # 检查缓存
         if cache_key in self._cache and not self._is_cache_stale(cache_key):
+            logger.debug(f"LongTermMemory: cache hit for project={project_id}")
             return self._cache[cache_key]
 
+        logger.debug(f"LongTermMemory: loading from disk for project={project_id}")
         parts = []
 
         # 1. 加载全局记忆
@@ -69,6 +71,7 @@ class LongTermMemory:
                 parts.extend(project_parts)
 
         if not parts:
+            logger.debug(f"LongTermMemory: no memory found for project={project_id}")
             return ""
 
         result = "\n\n".join(parts)
@@ -76,6 +79,7 @@ class LongTermMemory:
 
         self._cache[cache_key] = result
         self._cache_mtime[cache_key] = self._latest_mtime(project_id)
+        logger.debug(f"LongTermMemory: loaded {len(result)} chars for project={project_id}")
         return result
 
     def _load_dir(self, directory: Path) -> list[str]:
