@@ -1,18 +1,25 @@
 """长期记忆管理器
 
 读取 MEMORY.md 索引文件中引用的记忆文件，拼接后用于注入 system prompt。
+按 project_id 分桶，避免跨项目污染。
 
-借鉴 cc_python 的 load_memory_prompt() 设计，但简化为：
-- 不注入"如何管理记忆"的 instruction（LLM 是提取器，不管理记忆）
-- 记忆文件由服务端/人工管理
-- 截断保护避免 token 溢出
-- 文件 mtime 检测实现缓存失效
+存储结构:
+  data/memory/
+    ├── _global/                  # 所有项目共享
+    │   ├── MEMORY.md
+    │   └── common_corrections.md
+    ├── project_55/               # 只给 project_id=55 注入
+    │   ├── MEMORY.md
+    │   └── eu_metrics.md
+    └── project_60/               # 只给 project_id=60 注入
+        ├── MEMORY.md
+        └── us_events.md
 """
 
 import logging
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -21,38 +28,45 @@ _MAX_MEMORY_BYTES = 5000
 
 
 class LongTermMemory:
-    """长期记忆 — 读取记忆文件并构建注入内容
-
-    存储结构:
-      data/memory/
-        ├── MEMORY.md                 # 索引文件，格式: - [Title](file.md) — 描述
-        ├── user_corrections.md       # 纠正记忆（frontmatter + 内容）
-        └── domain_constraints.md     # 领域约束（frontmatter + 内容）
-    """
+    """长期记忆 — 按 project_id 分桶读取记忆文件并构建注入内容"""
 
     def __init__(self, data_path: str = "data/memory"):
         self.data_path = Path(data_path)
         self.data_path.mkdir(parents=True, exist_ok=True)
-        self._cache: Optional[str] = None
-        self._cache_mtime: float = 0
+        # 缓存: key=(project_id,), value=拼接后的内容
+        self._cache: Dict[Tuple[int, ...], str] = {}
+        self._cache_mtime: Dict[Tuple[int, ...], float] = {}
 
-    def load_memory_context(self) -> str:
-        """加载所有记忆内容（用于注入 system prompt）
+    def load_memory_context(self, project_id: Optional[int] = None) -> str:
+        """加载记忆内容（用于注入 system prompt）
 
-        流程:
-        1. 检查缓存是否过期
-        2. 读取 MEMORY.md 索引
-        3. 读取各记忆文件，去掉 frontmatter
-        4. 拼接 + 截断保护
+        按 project_id 分桶加载：
+        1. 始终加载 _global/ 下的全局记忆
+        2. 如果指定了 project_id，额外加载 project_{id}/ 下的项目记忆
+
+        Args:
+            project_id: 项目ID，为 None 时只加载全局记忆
         """
-        if self._cache and not self._is_cache_stale():
-            return self._cache
+        cache_key = (project_id,) if project_id is not None else (None,)
 
-        memory_index = self.data_path / "MEMORY.md"
-        if not memory_index.exists():
-            return ""
+        # 检查缓存
+        if cache_key in self._cache and not self._is_cache_stale(cache_key):
+            return self._cache[cache_key]
 
-        parts = self._load_all_files(memory_index)
+        parts = []
+
+        # 1. 加载全局记忆
+        global_dir = self.data_path / "_global"
+        global_parts = self._load_dir(global_dir)
+        if global_parts:
+            parts.extend(global_parts)
+
+        # 2. 加载项目记忆
+        if project_id is not None:
+            project_dir = self.data_path / f"project_{project_id}"
+            project_parts = self._load_dir(project_dir)
+            if project_parts:
+                parts.extend(project_parts)
 
         if not parts:
             return ""
@@ -60,9 +74,17 @@ class LongTermMemory:
         result = "\n\n".join(parts)
         result = self._truncate(result)
 
-        self._cache = result
-        self._cache_mtime = self._latest_mtime()
+        self._cache[cache_key] = result
+        self._cache_mtime[cache_key] = self._latest_mtime(project_id)
         return result
+
+    def _load_dir(self, directory: Path) -> list[str]:
+        """读取某个目录下的 MEMORY.md 索引及其引用的文件"""
+        memory_index = directory / "MEMORY.md"
+        if not memory_index.exists():
+            return []
+
+        return self._load_all_files(memory_index)
 
     def _load_all_files(self, memory_index: Path) -> list[str]:
         """读取 MEMORY.md 索引中引用的所有文件内容"""
@@ -71,11 +93,12 @@ class LongTermMemory:
         except OSError:
             return []
 
+        base_dir = memory_index.parent
         parts = []
         for line in index_content.split("\n"):
             match = re.match(r"- \[.+?\]\((.+?)\)", line)
             if match:
-                file_path = self.data_path / match.group(1)
+                file_path = base_dir / match.group(1)
                 if file_path.exists():
                     try:
                         content = file_path.read_text(encoding="utf-8")
@@ -89,18 +112,26 @@ class LongTermMemory:
 
         return parts
 
-    def _is_cache_stale(self) -> bool:
-        """检查记忆文件是否有更新"""
-        return self._latest_mtime() > self._cache_mtime
+    def _is_cache_stale(self, cache_key: Tuple[int, ...]) -> bool:
+        """检查相关目录的文件是否有更新"""
+        project_id = cache_key[0]
+        current_mtime = self._latest_mtime(project_id)
+        cached_mtime = self._cache_mtime.get(cache_key, 0.0)
+        return current_mtime > cached_mtime
 
-    def _latest_mtime(self) -> float:
-        """获取 memory 目录下所有 .md 文件的最新修改时间"""
+    def _latest_mtime(self, project_id: Optional[int] = None) -> float:
+        """获取相关目录下所有 .md 文件的最新修改时间"""
         latest = 0.0
-        try:
-            for f in self.data_path.glob("*.md"):
-                latest = max(latest, f.stat().st_mtime)
-        except OSError:
-            pass
+        dirs = [self.data_path / "_global"]
+        if project_id is not None:
+            dirs.append(self.data_path / f"project_{project_id}")
+
+        for d in dirs:
+            try:
+                for f in d.glob("*.md"):
+                    latest = max(latest, f.stat().st_mtime)
+            except OSError:
+                pass
         return latest
 
     @staticmethod

@@ -212,8 +212,10 @@ class SessionManager:
 
         context = self.get_context(session_id)
 
-        # 加载记忆文件内容（纠正/约束）
-        memory_content = self.long_term.load_memory_context()
+        # 按 project_id 分桶加载记忆文件内容（纠正/约束）
+        memory_content = self.long_term.load_memory_context(
+            project_id=session.project_id
+        )
         if memory_content:
             context["memory_corrections"] = memory_content
 
