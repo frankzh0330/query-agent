@@ -44,6 +44,7 @@ class DirectCallBus(MessageBus):
                 success=True,
                 nl2dsl_result=result.get("nl2dsl"),
                 query_result=result.get("query"),
+                error=result.get("message") if result.get("early_exit") else None,
             )
         except Exception as e:
             logger.exception(f"Worker error for msg={msg.msg_id}: {e}")

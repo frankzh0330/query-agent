@@ -165,8 +165,8 @@ class ExtractionsJson(BaseModel):
 
 FEW_SHOT_EXAMPLES = r"""
 示例:
-德国 PV -> {"metric_extractions":[{"text":"PV"}],"region_filter":["EUTTP"]}
-加州 UV -> {"metric_extractions":[{"text":"UV"}],"region_filter":["USTTP"]}
+德国 PV -> {"metric_extractions":[{"text":"PV"}],"event_extractions":[],"region_filter":["EUTTP"]}
+加州 UV -> {"metric_extractions":[{"text":"UV"}],"event_extractions":[],"region_filter":["USTTP"]}
 欧洲 app_launch的PV -> {"metric_extractions":[{"text":"PV"}],"event_extractions":[{"text":"app_launch"}],"region_filter":["EUTTP"]}
 欧洲 近7天 app_launch -> {"metric_extractions":[{"text":"PV"}],"time_extractions":[{"text":"近7天"}],"event_extractions":[{"text":"app_launch"}],"region_filter":["EUTTP"]}
 """
@@ -186,6 +186,7 @@ _BASE_SYSTEM_PROMPT = r"""你是"提取器"。只做：从用户问题中抽取�
   - view/浏览/浏览事件 → "view"
   - 其他事件名 → 直接提取原文
   - 注意：如果提到 app launch、click、view 等，这些是事件，不是时间！
+  - 只有用户明确提到事件才提取，不要猜测或默认填充
 
 - time_extractions：从用户问题中提取时间范围
   - 近7天/最近7天/7天内 → "近7天"
@@ -305,9 +306,12 @@ def _get_model_name() -> str:
 
 
 def _supports_tool_calling() -> bool:
-    """检查当前后端是否支持 function calling"""
-    backend = os.getenv("LLM_BACKEND", "zhipu").lower()
-    return backend == "zhipu"
+    """检查是否启用 function calling
+
+    默认 true，所有 OpenAI 兼容后端均可使用。
+    设 TOOL_CALLING_ENABLED=false 可强制走 prompt-based 路径。
+    """
+    return os.getenv("TOOL_CALLING_ENABLED", "true").lower() == "true"
 
 
 # ==================== 构建消息 ====================

@@ -308,17 +308,19 @@ async def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
     logger.debug(f"Layer1: user={req.text}, extraction={json.dumps(extraction_json.model_dump(), ensure_ascii=False)}")
 
     # === 验证必填字段 event ===
+    # 如果当前消息没提取到 event，但会话上下文中有 last_query_state 的 event，可以继承
+    inherited_event = None
     if not extraction_json.event_extractions:
+        prev_qs = ctx.last_query_state
+        if prev_qs and prev_qs.event:
+            inherited_event = prev_qs.event
+            logger.debug(f"Early exit check: no event extracted, inherited event={inherited_event} from session")
+
+    if not extraction_json.event_extractions and not inherited_event:
         error_msg = "您目前没有输入任何event_name,无法查询哦"
 
-        # 发送 Telegram 提示
-        if req.chat_id:
-            await _send_telegram_notification(req.chat_id, error_msg)
-
-        # 记录用户消息（解析失败）
         session_manager.add_message(ctx.session_id, "user", req.text, metadata={"error": "missing_event"})
 
-        # 返回 early_exit 状态
         return NL2DSLResponse(
             extraction_json=extraction_json.model_dump(),
             semantic={},
@@ -328,6 +330,12 @@ async def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
             status="early_exit",
             message=error_msg,
         )
+
+    # 继承上轮 event
+    if not extraction_json.event_extractions and inherited_event:
+        from service.llm_extractions import Extraction
+        extraction_json.event_extractions = [Extraction(text=inherited_event)]
+        logger.info(f"Inherited event from session: {inherited_event}")
 
     # Layer2: 使用 MatcherService 解析（带候选和置信度）
     layer2_start = time.time()

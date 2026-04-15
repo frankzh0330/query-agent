@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any, Dict, Optional
@@ -15,9 +16,7 @@ _bearer_client: Optional[BearerClient] = None
 
 def _is_mock_mode() -> bool:
     """检查是否启用 Mock 模式"""
-    # 临时强制开启 mock 模式用于调试
-    return True
-    # return os.getenv("BEARER_MOCK", "false").lower() == "true"
+    return os.getenv("BEARER_MOCK", "false").lower() == "true"
 
 
 def get_bearer_client() -> BearerClient:
@@ -86,19 +85,17 @@ async def execute_query(exec_dsl: Dict[str, Any]) -> Dict[str, Any]:
         # 模拟网络延迟
         await asyncio.sleep(0.5)
         result = _mock_query_result(exec_dsl)
-        print(f"Mock 模式查询: {json.dumps(result, ensure_ascii=False)}")
+        logger.info(f"Mock query result: {json.dumps(result, ensure_ascii=False)}")
         return result
 
     # 正常模式
-    # logger.info(f"BEARER_MOCK env var: {os.getenv('BEARER_MOCK', 'not set')}")
     client = get_bearer_client()
     try:
         result = await client.query(exec_dsl)
-        # logger.info(f"Query executed successfully")
+        logger.info("Query executed successfully")
         return result
     except Exception as e:
-        # logger.error(f"Query execution failed: {e}")
-        print(f"查询失败: {e}")
+        logger.error(f"Query execution failed: {e}")
         raise
 
 

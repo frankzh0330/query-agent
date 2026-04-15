@@ -8,6 +8,14 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
+# 全局日志配置
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 from app import app, set_matcher_service
 from bus import create_bus
 from bus.direct_call_bus import DirectCallBus
@@ -136,7 +144,7 @@ def main():
         app_with_ws,
         host=host,
         port=port,
-        log_level="info",
+        log_level=LOG_LEVEL.lower(),
     )
 
 
