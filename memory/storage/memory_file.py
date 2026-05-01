@@ -14,6 +14,10 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+_COMPACTION_THRESHOLD = 500  # 超过此行数触发 compaction
+_COMPACTION_KEEP_TAIL = 100   # compaction 后保留最近 N 条
+
+
 class JsonlStorage:
     """JSONL append-only 存储基类"""
 
@@ -34,7 +38,52 @@ class JsonlStorage:
                 f.flush()
                 os.fsync(f.fileno())
         except OSError as e:
-            logger.error(f"Failed to append record to {record_id}: {e}")
+            logger.error("Failed to append record to %s: %s", record_id, e)
+            return
+
+        # 延迟 compaction 检查
+        self._maybe_compact(record_id)
+
+    def _maybe_compact(self, record_id: str) -> None:
+        """行数超过阈值时自动 compaction，保留 tail + 最新 state/meta"""
+        path = self._file_path(record_id)
+        if not path.exists():
+            return
+
+        try:
+            line_count = sum(1 for _ in open(path, "r", encoding="utf-8"))
+        except OSError:
+            return
+
+        if line_count < _COMPACTION_THRESHOLD:
+            return
+
+        records = self.read_all(record_id)
+
+        # 保留最近的记录
+        kept = records[-_COMPACTION_KEEP_TAIL:]
+
+        # 确保不丢失最新的 query_state 和 session_meta
+        for r in reversed(records):
+            if r.get("type") in ("query_state", "session_meta") and r not in kept:
+                kept.insert(0, r)
+            if len(kept) >= _COMPACTION_KEEP_TAIL + 5:
+                break
+
+        # 原子写入
+        tmp_path = path.with_suffix(".tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                for r in kept:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(path)
+            logger.info("Compacted %s: %d → %d records", record_id, len(records), len(kept))
+        except OSError as e:
+            logger.warning("Compaction failed for %s: %s", record_id, e)
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     def read_all(self, record_id: str) -> List[Dict[str, Any]]:
         """读取全部记录（跳过损坏行）"""

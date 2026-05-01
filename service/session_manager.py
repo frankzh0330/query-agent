@@ -215,6 +215,15 @@ class SessionManager:
         """列出所有会话"""
         return list(self._sessions.values())
 
+    def delete_session(self, session_id: str) -> bool:
+        """删除会话（内存 + 磁盘文件）"""
+        if session_id not in self._sessions:
+            return False
+        del self._sessions[session_id]
+        self.storage.delete(session_id)
+        logger.info("Deleted session: %s", session_id)
+        return True
+
     def cleanup_inactive(self, max_age_minutes: int = 60) -> int:
         """清理不活跃的会话"""
         now = datetime.now()
@@ -225,10 +234,10 @@ class SessionManager:
                 to_remove.append(sid)
 
         for sid in to_remove:
-            del self._sessions[sid]
+            self.delete_session(sid)
 
         if to_remove:
-            logger.info(f"Cleaned up {len(to_remove)} inactive sessions")
+            logger.info("Cleaned up %d inactive sessions", len(to_remove))
 
         return len(to_remove)
 

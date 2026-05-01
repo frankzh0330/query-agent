@@ -13,7 +13,8 @@ This document summarizes the current architecture of `query-agent`, the responsi
 ├──────────────────────────────────────────────────────────────┤
 │                        API Layer                            │
 │   app.py                                                    │
-│   request parsing · session bootstrap · NL2DSL orchestration│
+│   endpoint defs · global service wiring · delegates to       │
+│   QueryOrchestrator                                         │
 ├──────────────────────────────────────────────────────────────┤
 │                     Turn / State Layer                      │
 │   session_manager.py · session_models.py                    │
@@ -45,19 +46,20 @@ server.py
   ├─ worker/*
   ├─ dispatcher/*
   └─ app.py
-       ├─ service/session_manager.py
-       ├─ service/task_manager.py
-       ├─ service/followup_resolver.py
-       ├─ service/query_state_merger.py
-       ├─ service/llm_extractions.py
-       ├─ matcher/*
-       ├─ dsl/*
-       └─ memory/*
+       └─ service/query_orchestrator.py
+            ├─ service/session_manager.py
+            ├─ service/task_manager.py
+            ├─ service/followup_resolver.py
+            ├─ service/query_state_merger.py
+            ├─ service/llm_extractions.py
+            ├─ matcher/*
+            ├─ dsl/*
+            └─ memory/*
 ```
 
 Guidelines:
 
-- `app.py` owns request orchestration, not long-lived infra loops.
+- `app.py` owns endpoint definitions and global wiring; business logic delegates to `QueryOrchestrator`.
 - `server.py` owns startup wiring and lifecycle, not query semantics.
 - `matcher/*` should stay focused on matching/retrieval, not session policy.
 - `memory/*` should provide reusable signal/knowledge layers, not FastAPI behavior.
@@ -69,7 +71,8 @@ Guidelines:
 ```mermaid
 flowchart TD
     U["User"] --> API["POST /nl2dsl"]
-    API --> S["SessionManager.create_or_get"]
+    API --> ORC["QueryOrchestrator.process()"]
+    ORC --> S["SessionManager.create_or_get"]
     S --> C["Enhanced Context"]
     C --> L1["LLM Extraction"]
     L1 --> L2["Matcher Resolution"]
@@ -93,8 +96,8 @@ flowchart TD
     TG["Telegram Gateway"] --> IN["Ingress Adapter + Cleaner + Dedup"]
     IN --> BUS["Message Bus"]
     BUS --> W["Agent Worker"]
-    W --> API["app.nl2dsl"]
-    API --> DISP["Response Dispatcher"]
+    W --> ORC["orchestrator.process()"]
+    ORC --> DISP["Response Dispatcher"]
     DISP --> TG
 ```
 
@@ -281,11 +284,13 @@ Session state and task state are persisted separately:
 
 - session: JSONL append-only session log
 - task: JSONL append-only task log
+- JSONL compaction: auto-compress when exceeding 500 lines, keeping 100 most recent + latest state/meta
 
 This allows:
 
 - process restart recovery
 - delayed confirmation in chat channels
+- long-running deployments without unbounded disk growth
 
 ## Async Memory Learning
 
@@ -310,11 +315,9 @@ This is intentionally sidecar behavior:
 Responsibilities:
 
 - request/response models
-- session bootstrap
-- follow-up / confirmation routing
-- matcher orchestration
-- semantic / exec DSL construction
-- final `explain` assembly
+- global service instantiation (SessionManager, TaskManager, QueryOrchestrator)
+- endpoint definitions (delegates to QueryOrchestrator)
+- Telegram notification helper
 
 ### `server.py`
 
@@ -325,6 +328,7 @@ Responsibilities:
 - bus / worker / dispatcher wiring
 - Telegram gateway startup
 - catalog scheduler startup
+- session periodic cleanup (5 min interval, 60 min expiry)
 
 ### `gateway/*`, `ingress/*`, `bus/*`, `worker/*`, `dispatcher/*`
 
@@ -388,15 +392,3 @@ This matters because real deployments may have:
 - tens of thousands of events
 - multiple dimensions/properties per event
 - project-specific vocabularies and constraints
-
-## Current Architectural Position
-
-The project is currently best described as:
-
-- a layered NL2DSL engine
-- plus turn-based query-state handling
-- plus scoped memory
-- plus explicit ambiguity handling
-- plus agent-style async learning
-
-It is no longer just a stateless prompt wrapper.

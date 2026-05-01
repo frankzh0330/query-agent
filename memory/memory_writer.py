@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -193,16 +194,23 @@ class MemoryWriter:
             auto_file.write_text(trimmed, encoding="utf-8")
 
     def _is_duplicate(self, project_dir: Path, content: str) -> bool:
-        """检查是否已有相似记忆（简单关键字去重）"""
+        """检查是否已有相似记忆（hash + 归一化全文去重）"""
         auto_file = project_dir / "auto_learned.md"
         if not auto_file.exists():
             return False
 
+        content_hash = hashlib.md5(content.encode("utf-8")).hexdigest()
         existing = auto_file.read_text(encoding="utf-8")
-        # 双方都去标点后匹配
+
+        # 逐行 hash 去重
+        for line in existing.splitlines():
+            if hashlib.md5(line.strip().encode("utf-8")).hexdigest() == content_hash:
+                return True
+
+        # 归一化全文包含检查
         normalized_existing = re.sub(r"[^\w\u4e00-\u9fff]", "", existing)
-        keywords = re.sub(r"[^\w\u4e00-\u9fff]", "", content)[:20]
-        return keywords in normalized_existing
+        normalized_content = re.sub(r"[^\w\u4e00-\u9fff]", "", content)
+        return normalized_content in normalized_existing
 
     def _read_existing(self, project_dir: Path) -> str:
         """读取已有的 auto_learned.md 内容"""

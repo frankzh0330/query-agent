@@ -143,8 +143,6 @@ def get_session(session_id: str):
 
 @app.delete("/sessions/{session_id}")
 def delete_session(session_id: str):
-    ctx = session_manager.get_session(session_id)
-    if not ctx:
+    if not session_manager.delete_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
-    del session_manager._sessions[session_id]
     return {"deleted": session_id}

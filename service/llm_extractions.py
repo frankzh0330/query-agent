@@ -297,26 +297,29 @@ EXTRACT_ENTITIES_TOOL = {
 
 # ==================== LLM Client ====================
 
-def get_llm_client() -> OpenAI:
-    """
-    获取 OpenAI 兼容客户端
+_llm_client: OpenAI | None = None
 
-    支持：
-    - zhipu: 智谱 AI API（OpenAI 兼容协议）
-    - ollama: 本地 Ollama（OpenAI 兼容协议）
-    """
+
+def get_llm_client() -> OpenAI:
+    """获取 OpenAI 兼容客户端（模块级单例，复用连接池）"""
+    global _llm_client
+    if _llm_client is not None:
+        return _llm_client
+
     backend = os.getenv("LLM_BACKEND", "zhipu").lower()
 
     if backend == "ollama":
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-        return OpenAI(
-            api_key="ollama",  # Ollama 不需要 key，但 OpenAI SDK 要求非空
+        _llm_client = OpenAI(
+            api_key="ollama",
             base_url=base_url,
         )
     else:  # zhipu (默认)
         api_key = os.getenv("ZHIPU_API_KEY", os.getenv("ZHIPUAI_API_KEY", ""))
         base_url = os.getenv("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/coding/paas/v4")
-        return OpenAI(api_key=api_key, base_url=base_url)
+        _llm_client = OpenAI(api_key=api_key, base_url=base_url)
+
+    return _llm_client
 
 
 def _get_model_name() -> str:

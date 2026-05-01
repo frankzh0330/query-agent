@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Dict
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -39,7 +42,7 @@ def load_catalog(base_dir: str) -> Catalog:
             if nk:
                 metric_alias_lookup[nk] = metric_id
 
-    print("metric_alias_lookup:{}".format(metric_alias_lookup))
+    logger.debug("metric_alias_lookup: %s", metric_alias_lookup)
 
     # 构建事件别名查找表
     event_alias_lookup: Dict[str, str] = {}
@@ -49,7 +52,7 @@ def load_catalog(base_dir: str) -> Catalog:
             if nk:
                 event_alias_lookup[nk] = event_id
 
-    print("event_alias_lookup:{}".format(event_alias_lookup))
+    logger.debug("event_alias_lookup: %s", event_alias_lookup)
 
     # 构建维度别名查找表
     dimension_alias_lookup: Dict[str, str] = {}
@@ -59,7 +62,7 @@ def load_catalog(base_dir: str) -> Catalog:
             if nk:
                 dimension_alias_lookup[nk] = dim_id
 
-    print("dimension_alias_lookup:{}".format(dimension_alias_lookup))
+    logger.debug("dimension_alias_lookup: %s", dimension_alias_lookup)
 
     return Catalog(
         metrics=metrics,

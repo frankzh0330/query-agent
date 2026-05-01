@@ -13,7 +13,7 @@
 ├──────────────────────────────────────────────────────────────┤
 │                          API Layer                          │
 │   app.py                                                    │
-│   请求解析 · session bootstrap · NL2DSL orchestration       │
+│   端点定义 · 全局服务实例化 · 委托 QueryOrchestrator        │
 ├──────────────────────────────────────────────────────────────┤
 │                       Turn / State Layer                    │
 │   session_manager.py · session_models.py                    │
@@ -45,19 +45,20 @@ server.py
   ├─ worker/*
   ├─ dispatcher/*
   └─ app.py
-       ├─ service/session_manager.py
-       ├─ service/task_manager.py
-       ├─ service/followup_resolver.py
-       ├─ service/query_state_merger.py
-       ├─ service/llm_extractions.py
-       ├─ matcher/*
-       ├─ dsl/*
-       └─ memory/*
+       └─ service/query_orchestrator.py
+            ├─ service/session_manager.py
+            ├─ service/task_manager.py
+            ├─ service/followup_resolver.py
+            ├─ service/query_state_merger.py
+            ├─ service/llm_extractions.py
+            ├─ matcher/*
+            ├─ dsl/*
+            └─ memory/*
 ```
 
 设计约束：
 
-- `app.py` 负责请求编排，不负责长生命周期后台循环
+- `app.py` 只负责端点定义和全局实例化，业务逻辑委托给 `QueryOrchestrator`
 - `server.py` 负责启动 wiring 和生命周期，不负责查询语义
 - `matcher/*` 聚焦匹配与召回，不掺入 session 策略
 - `memory/*` 提供可复用知识层和偏好信号，不直接耦合 FastAPI 行为
@@ -69,7 +70,8 @@ server.py
 ```mermaid
 flowchart TD
     U["用户"] --> API["POST /nl2dsl"]
-    API --> S["SessionManager.create_or_get"]
+    API --> ORC["QueryOrchestrator.process()"]
+    ORC --> S["SessionManager.create_or_get"]
     S --> C["Enhanced Context"]
     C --> L1["LLM Extraction"]
     L1 --> L2["Matcher Resolution"]
@@ -93,8 +95,8 @@ flowchart TD
     TG["Telegram Gateway"] --> IN["Ingress Adapter + Cleaner + Dedup"]
     IN --> BUS["Message Bus"]
     BUS --> W["Agent Worker"]
-    W --> API["app.nl2dsl"]
-    API --> DISP["Response Dispatcher"]
+    W --> ORC["orchestrator.process()"]
+    ORC --> DISP["Response Dispatcher"]
     DISP --> TG
 ```
 
@@ -281,11 +283,13 @@ Session 和 Task 分开持久化：
 
 - session：JSONL append-only session log
 - task：JSONL append-only task log
+- JSONL compaction：超过 500 行自动压缩，保留 100 条 + 最新 state/meta
 
 这样可以支持：
 
 - 进程重启恢复
 - 聊天渠道里的延迟确认
+- 长期运行不撑爆磁盘
 
 ## Async Memory Learning
 
@@ -310,11 +314,9 @@ Session 和 Task 分开持久化：
 职责：
 
 - request/response models
-- session bootstrap
-- follow-up / confirmation routing
-- matcher orchestration
-- semantic / exec DSL 构建
-- 最终 `explain` 组装
+- 全局服务实例化（SessionManager、TaskManager、QueryOrchestrator）
+- 端点定义（委托给 QueryOrchestrator）
+- Telegram 通知辅助
 
 ### `server.py`
 
@@ -325,6 +327,7 @@ Session 和 Task 分开持久化：
 - bus / worker / dispatcher 装配
 - Telegram gateway 启动
 - catalog scheduler 启动
+- session 定时清理（5 分钟间隔，60 分钟过期）
 
 ### `gateway/*`, `ingress/*`, `bus/*`, `worker/*`, `dispatcher/*`
 
@@ -389,14 +392,4 @@ Session 和 Task 分开持久化：
 - 每个 event 多个 dimension/property
 - 强项目语义和业务约束
 
-## 当前架构定位
 
-现在的项目更适合被描述为：
-
-- 一个分层 NL2DSL 引擎
-- 加上 turn-based query-state handling
-- 加上 scoped memory
-- 加上 explicit ambiguity handling
-- 加上 agent-style async learning
-
-它已经不是一个 stateless prompt wrapper。

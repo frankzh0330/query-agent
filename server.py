@@ -108,6 +108,20 @@ async def websocket_lifespan(app: FastAPI):
         catalog_scheduler = None
         logger.info("CATALOG_API_BASE not set, skipping CatalogScheduler")
 
+    # 5. 启动 Session 定时清理
+    from app import session_manager
+
+    async def _session_cleanup_loop():
+        while True:
+            await asyncio.sleep(300)  # 每 5 分钟
+            try:
+                session_manager.cleanup_inactive(max_age_minutes=60)
+            except Exception as e:
+                logger.warning("Session cleanup failed: %s", e)
+
+    asyncio.create_task(_session_cleanup_loop())
+    logger.info("Session cleanup loop started (interval=5min, max_age=60min)")
+
     yield
 
     # 清理

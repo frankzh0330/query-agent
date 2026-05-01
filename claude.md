@@ -4,560 +4,305 @@
 
 - **画图格式**: 所有架构图、流程图、时序图默认使用 Mermaid 格式（不使用 PlantUML）
 
-## 0. 顶层分层架构
+## 1. 顶层分层架构
 
-### 架构图
-文件位置：`architecture.puml`
-
-```plantuml
-@startuml
-!theme plain
-skinparam backgroundColor #FFFFFF
-skinparam componentStyle rectangle
-
-title Query Agent - 顶层分层架构
-
-' 客户端层
-package "Client Layer" {
-    [User] as User
-}
-
-' API 层
-package "API Layer" #E3F2FD {
-    [FastAPI\napp.py] as API
-    [Request/Response\nModels] as Models
-}
-
-' 服务层
-package "Service Layer" #FFF3E0 {
-    [LLM Extractions\nllm_extractions.py] as LLM
-    [Session Manager\nsession_manager.py] as Session
-}
-
-' 解析层
-package "Resolver Layer" #E8F5E9 {
-    [Metric Resolver] as Metric
-    [Event Resolver] as Event
-    [GroupBy Resolver] as GroupBy
-    [Time Resolver] as Time
-}
-
-' DSL 层
-package "DSL Layer" #F3E5F5 {
-    [Semantic Models\nsemantic_models.py] as Semantic
-    [DSL Renderer\nrenderer.py] as Renderer
-}
-
-' 配置层
-package "Config Layer" #E0F2F1 {
-    [Catalog\nmetrics/events/dimensions] as Catalog
-}
-
-' 验证层
-package "Validation Layer" #FFEBEE {
-    [Region Validator] as Val1
-    [Consistency Validator] as Val2
-}
-
-' 关系定义
-User --> API : HTTP POST\n/nl2dsl
-API --> Models : (use)
-API --> Session : (manage session)
-API --> LLM : Layer 1:\nExtract Entities
-
-LLM --> Metric : Layer 2:\nResolve Metric
-LLM --> Event : Layer 2:\nResolve Event
-LLM --> GroupBy : Layer 2:\nResolve GroupBy
-LLM --> Time : Layer 2:\nResolve Time
-
-Metric --> Catalog : (lookup)
-Event --> Catalog : (lookup)
-GroupBy --> Catalog : (lookup)
-
-Metric --> Semantic : Layer 3:\nBuild DSL
-Event --> Semantic : Layer 3:\nBuild DSL
-GroupBy --> Semantic : Layer 3:\nBuild DSL
-Time --> Semantic : Layer 3:\nBuild DSL
-
-Semantic --> Renderer : Layer 4:\nRender Exec DSL
-Renderer --> Val1 : (validate)
-Renderer --> Val2 : (validate)
-
-Session --> LLM : (inject context)
-
-legend right
-  |## Layer Architecture|
-  |**Layer 1**: LLM Entity Extraction|
-  |**Layer 2**: Entity Resolution|
-  |**Layer 3**: DSL Generation|
-  |**Layer 4**: DSL Rendering|
-endlegend
-
-@enduml
+```text
+┌──────────────────────────────────────────────────────────────┐
+│                        Gateway Layer                        │
+│   TelegramGateway · HTTP Client / FastAPI Entry            │
+├──────────────────────────────────────────────────────────────┤
+│                          API Layer                          │
+│   app.py — 端点定义 · 全局服务实例化 · Telegram 通知         │
+├──────────────────────────────────────────────────────────────┤
+│                      Orchestrator Layer                     │
+│   service/query_orchestrator.py — 三路径路由与业务编排       │
+├──────────────────────────────────────────────────────────────┤
+│                      Turn / State Layer                     │
+│   session_manager.py · session_models.py                    │
+│   task_manager.py · followup_resolver.py                    │
+│   query_state_merger.py                                     │
+├──────────────────────────────────────────────────────────────┤
+│                      NL2DSL Pipeline                        │
+│   llm_extractions.py (LLM 单例 + 多轮 patch 指令)           │
+│   matcher_service.py + matchers (event/metric/dim/time)     │
+│   semantic_models.py · renderer.py · validators.py          │
+├──────────────────────────────────────────────────────────────┤
+│                       Memory Layer                          │
+│   long_term_memory.py (query-aware 相关性筛选)              │
+│   memory_writer.py (hash 去重 + LLM judge)                  │
+│   user_preference_store.py (log2 bias reranking)            │
+├──────────────────────────────────────────────────────────────┤
+│                   Persistence Layer                         │
+│   JsonlStorage 基类 → SessionStorage / TaskStorage          │
+│   JSONL compaction (500 行阈值自动压缩)                      │
+├──────────────────────────────────────────────────────────────┤
+│                   Runtime / System Layer                    │
+│   bus/* · worker/* · dispatcher/* · server.py               │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### 分层说明
 
 | 层级 | 模块 | 文件 | 职责 |
 |------|------|------|------|
-| **Client** | User | - | 发起 HTTP 请求 |
-| **API** | FastAPI | `app.py` | 请求处理、响应封装、会话管理 |
-| **Service** | LLM Extractions | `service/llm_extractions.py` | LLM 实体提取 (Layer 1) |
-| | Session Manager | `service/session_manager.py` | 会话上下文管理 |
-| **Resolver** | Metric Resolver | `resolver/metric_resolver.py` | 指标解析 (Layer 2) |
-| | Event Resolver | `resolver/event_resolver.py` | 事件解析 (Layer 2) |
-| | GroupBy Resolver | `resolver/groupby_resolver.py` | 维度解析 (Layer 2) |
-| | Time Resolver | `resolver/time_resolver.py` | 时间范围解析 (Layer 2) |
-| **DSL** | Semantic Models | `dsl/semantic_models.py` | 语义 DSL 生成 (Layer 3) |
-| | DSL Renderer | `dsl/renderer.py` | 执行 DSL 渲染 (Layer 4) |
-| **Config** | Catalog | `catalog/*.yaml` | 配置数据 (指标/事件/维度) |
-| **Validation** | Validators | `dsl/validators.py` | 结果验证 |
+| **Gateway** | Telegram | `gateway/telegram_gateway.py` | Telegram 长轮询消息接收 |
+| **API** | FastAPI | `app.py` | 端点定义、请求/响应模型、全局实例化 |
+| **Orchestrator** | QueryOrchestrator | `service/query_orchestrator.py` | 三路径路由 (new_query/followup_patch/confirmation) |
+| **Turn/State** | SessionManager | `service/session_manager.py` | 会话管理 + JSONL 持久化 + 定时清理 |
+| | SessionModels | `service/session_models.py` | QueryState / SessionContext / TaskContext |
+| | TaskManager | `service/task_manager.py` | 确认流管理 + TaskStorage 持久化 |
+| | FollowupResolver | `service/followup_resolver.py` | 纯规则 follow-up 检测 |
+| | QueryStateMerger | `service/query_state_merger.py` | patch 合并 + explicit/inherited 标记 |
+| **NL2DSL** | LLM Extractions | `service/llm_extractions.py` | LLM 实体提取（模块级 client 单例） |
+| | MatcherService | `matcher/matcher_service.py` | event/metric/dimension/time 解析 |
+| | Semantic DSL | `dsl/semantic_models.py` | 语义 DSL 模型 |
+| | Renderer | `dsl/renderer.py` | Exec DSL 渲染 |
+| | Validators | `dsl/validators.py` | region 一致性校验 |
+| **Memory** | LongTermMemory | `memory/long_term_memory.py` | 项目级记忆 + query-aware 筛选 |
+| | MemoryWriter | `memory/memory_writer.py` | LLM 驱动记忆学习 + hash 去重 |
+| | UserPreference | `memory/user_preference_store.py` | 用户偏好存储 + log2 bias |
+| **Persistence** | JsonlStorage | `memory/storage/memory_file.py` | JSONL append-only + compaction |
+| **Runtime** | Server | `server.py` | 生命周期 + 服务装配 |
+| | Bus / Worker | `bus/` · `worker/` | 消息总线 + Worker |
+| | Dispatcher | `dispatcher/` | 响应路由 |
 
-### 数据流
+### 依赖方向
 
+```text
+server.py
+  ├─ gateway/*
+  ├─ bus/*
+  ├─ worker/*
+  ├─ dispatcher/*
+  └─ app.py
+       └─ service/query_orchestrator.py
+            ├─ service/session_manager.py
+            ├─ service/task_manager.py
+            ├─ service/followup_resolver.py
+            ├─ service/query_state_merger.py
+            ├─ service/llm_extractions.py (LLM client 单例)
+            ├─ matcher/*
+            ├─ dsl/*
+            └─ memory/*
 ```
-User Request
-    ↓
-API Layer (FastAPI)
-    ↓
-Service Layer (LLM Extractions) ← Session Context
-    ↓
-Resolver Layer (Metric/Event/GroupBy/Time)
-    ↓
-DSL Layer (Semantic Models → Renderer)
-    ↓
-Validation Layer
-    ↓
-Response
+
+设计约束：
+- `app.py` 只负责端点定义，业务逻辑委托给 `QueryOrchestrator`
+- `server.py` 负责生命周期管理（含 session 定时清理 5min/60min）
+- `matcher/*` 聚焦匹配与召回，不掺入 session 策略
+- `memory/*` 提供可复用知识层和偏好信号
+
+---
+
+## 2. 核心数据流
+
+### HTTP 路径
+
+```mermaid
+flowchart TD
+    U["用户"] --> API["POST /nl2dsl"]
+    API --> ORC["QueryOrchestrator.process()"]
+    ORC --> S["SessionManager.create_or_get"]
+    S --> C["Enhanced Context (session + memory)"]
+    C --> L1["LLM Extraction (单例 client)"]
+    L1 --> FD["detect_followup()"]
+    FD --> T{"Turn Routing"}
+    T -->|new_query| NQ["_process_new_query"]
+    T -->|followup_patch| FP["_process_followup"]
+    T -->|confirmation| CF["_process_confirmation"]
+    NQ --> D1["Semantic DSL"]
+    FP --> MS["merge_query_state"] --> D1
+    CF --> D1
+    D1 --> D2["Exec DSL Render + Validate"]
+    D2 --> O["Response"]
+    D2 --> ML["Async MemoryWriter"]
+```
+
+### Telegram / Bus 路径
+
+```mermaid
+flowchart TD
+    TG["Telegram Gateway"] --> IN["Ingress Adapter + Cleaner + Dedup"]
+    IN --> BUS["Message Bus"]
+    BUS --> W["Agent Worker"]
+    W --> ORC["orchestrator.process()"]
+    ORC --> DISP["Response Dispatcher"]
+    DISP --> TG
+```
+
+Worker 直接调用 `orchestrator.process()`，不经过 FastAPI 端点。
+
+---
+
+## 3. Turn-Based Querying
+
+### Turn 模式
+
+系统区分三种 turn 模式：
+
+| 模式 | 触发条件 | 处理方式 |
+|------|---------|---------|
+| `new_query` | 完整新查询 | 完整 LLM → Matcher → DSL 流程 |
+| `followup_patch` | follow-up 检测命中 | 增量 patch → 合并上轮 state → DSL |
+| `confirmation` | 低置信度候选等待确认 | 用户回复 → 确认值 → DSL |
+
+### Follow-up 检测优先级
+
+`detect_followup()` 纯规则判断，不依赖 LLM：
+
+1. pending_task + 确认回复词（"1"、"第一个"） → `confirmation_reply`
+2. 纯时间词（"今天"、"本周"） → `followup_patch` + patch_hints
+3. 前缀词（"换成"、"那"、"对比"） → `followup_patch`
+4. 比较短语（"和昨天比"、"同比"） → `followup_patch`
+5. 短句 + 领域 token → `followup_patch`
+6. 以上都不满足 → `new_query`
+
+### QueryState 合并
+
+`merge_query_state()` 将 patch 合并到上轮 QueryState：
+- patch 中出现的字段 → `explicit`
+- 上轮存在且 patch 未覆盖的 → `inherited`
+- 输出 `field_sources` 字典记录每个字段来源
+
+### 多轮查询示例
+
+```text
+Q1: 德国 app_launch 的 PV     → new_query
+Q2: 昨天                       → followup_patch (time_only_term)
+Q3: 改成 UV                    → followup_patch (followup_prefix)
+Q4: 再按渠道拆一下             → followup_patch (short_patch)
+Q5: 那美国呢                   → followup_patch (followup_prefix)
 ```
 
 ---
 
-# Memory (会话记忆) 功能设计与实施计划
+## 4. Memory 三层架构
 
-## 一、背景与目标
+### Session Memory
 
-### 当前状态
-- 系统**无会话管理**，每个请求独立处理
-- 无法利用对话历史理解用户意图
-- 多轮对话场景下用户体验较差（需要重复上下文）
+- 存储：JSONL append-only，支持 compaction（500 行阈值）
+- 内容：`last_query_state`、`pending_task_id`、`turn_index`、`last_user_query`
+- 特性：进程重启可恢复、定时清理不活跃 session（5 分钟检查，60 分钟过期）
 
-### 目标
-实现会话记忆功能，使系统能够：
-1. 记录用户对话历史
-2. 利用历史上下文理解当前查询
-3. 支持多轮对话的上下文继承
+### Project Memory (LongTermMemory)
 
----
+- 存储：项目级 Markdown 文件 (`data/memory/project_{id}/`)
+- 特性：query-aware 相关性筛选（CJK bigram + event/metric/region 关键词）
+- 不再每轮注入全量 memory，只选 top 3 相关片段
 
-## 二、架构设计
+### User Preference Signal
 
-### 2.1 会话数据模型
-
-**新建文件：`service/session_models.py`**
-
-```python
-from datetime import datetime
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel
-
-class ConversationMessage(BaseModel):
-    """单条对话消息"""
-    role: str  # "user" or "assistant"
-    content: str  # 用户输入或助手响应摘要
-    timestamp: datetime
-    metadata: Optional[Dict[str, Any]] = None  # 存储解析结果等
-
-class UserSession(BaseModel):
-    """用户会话"""
-    session_id: str
-    user_id: Optional[str] = None
-    project_id: int
-    messages: List[ConversationMessage] = []
-    created_at: datetime
-    last_active: datetime
-    # 可选：存储用户偏好上下文
-    context: Dict[str, Any] = {}
-```
-
-### 2.2 会话管理服务
-
-**新建文件：`service/session_manager.py`**
-
-```python
-import uuid
-from datetime import datetime
-from typing import List, Optional
-from service.session_models import UserSession, ConversationMessage
-
-class SessionManager:
-    """会话管理服务"""
-
-    def __init__(self, storage_backend: str = "memory"):
-        # 支持：memory, redis, file
-        self.storage_backend = storage_backend
-        self._sessions: Dict[str, UserSession] = {}
-
-    def create_session(self, user_id: Optional[str], project_id: int) -> UserSession:
-        """创建新会话"""
-        session_id = str(uuid.uuid4())
-        now = datetime.now()
-        session = UserSession(
-            session_id=session_id,
-            user_id=user_id,
-            project_id=project_id,
-            created_at=now,
-            last_active=now
-        )
-        self._sessions[session_id] = session
-        return session
-
-    def get_session(self, session_id: str) -> Optional[UserSession]:
-        """获取会话"""
-        return self._sessions.get(session_id)
-
-    def add_message(self, session_id: str, role: str, content: str,
-                    metadata: Optional[Dict] = None):
-        """添加消息到会话"""
-        session = self.get_session(session_id)
-        if session:
-            msg = ConversationMessage(
-                role=role,
-                content=content,
-                timestamp=datetime.now(),
-                metadata=metadata
-            )
-            session.messages.append(msg)
-            session.last_active = datetime.now()
-
-    def get_conversation_history(self, session_id: str,
-                                  limit: int = 5) -> List[ConversationMessage]:
-        """获取最近对话历史"""
-        session = self.get_session(session_id)
-        if session:
-            return session.messages[-limit:]
-        return []
-
-    def get_context_summary(self, session_id: str) -> Dict[str, Any]:
-        """获取会话上下文摘要（用于注入 LLM）"""
-        history = self.get_conversation_history(session_id, limit=3)
-        context = {
-            "recent_queries": [m.content for m in history if m.role == "user"],
-            "resolved_entities": self._extract_resolved_entities(session_id)
-        }
-        return context
-
-    def _extract_resolved_entities(self, session_id: str) -> Dict[str, Any]:
-        """从历史对话中提取已解析的实体"""
-        session = self.get_session(session_id)
-        if not session:
-            return {}
-
-        # 从历史消息的 metadata 中提取实体
-        entities = {
-            "regions": set(),
-            "metrics": set(),
-            "events": set()
-        }
-
-        for msg in session.messages:
-            if msg.metadata:
-                if "region" in msg.metadata:
-                    entities["regions"].add(msg.metadata["region"])
-                if "metric" in msg.metadata:
-                    entities["metrics"].add(msg.metadata["metric"])
-
-        return {k: list(v) for k, v in entities.items()}
-```
-
-### 2.3 API 层修改
-
-**修改文件：`app.py`**
-
-```python
-# 新增导入
-from service.session_manager import SessionManager
-from typing import Optional
-
-# 全局会话管理器
-session_manager = SessionManager(storage_backend="memory")
-
-# 修改请求模型
-class NL2DSLRequest(BaseModel):
-    text: str
-    project_id: int = Field(default=55)
-    user_id: Optional[str] = None
-    session_id: Optional[str] = None  # 新增：会话ID
-
-# 修改响应模型
-class NL2DSLResponse(BaseModel):
-    extraction_json: Dict[str, Any]
-    semantic: Dict[str, Any]
-    exec_dsl: Dict[str, Any]
-    explain: Dict[str, Any]
-    session_id: Optional[str] = None  # 新增：返回会话ID
-
-# 修改主处理函数
-@app.post("/nl2dsl", response_model=NL2DSLResponse)
-def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
-    # 会话处理
-    session_id = req.session_id
-    if not session_id:
-        session = session_manager.create_session(req.user_id, req.project_id)
-        session_id = session.session_id
-    else:
-        session = session_manager.get_session(session_id)
-        if not session:
-            session = session_manager.create_session(req.user_id, req.project_id)
-            session_id = session.session_id
-
-    # 获取会话上下文
-    session_context = session_manager.get_context_summary(session_id)
-
-    # Layer1: 传入会话上下文
-    extraction_json = extract_llm(req.text, session_context=session_context)
-
-    # ... 原有处理逻辑 ...
-
-    # 记录用户消息
-    session_manager.add_message(
-        session_id,
-        role="user",
-        content=req.text,
-        metadata={
-            "region": region_filter,
-            "metric": metric_id,
-            "event": event_name
-        }
-    )
-
-    return NL2DSLResponse(
-        # ... 原有返回 ...
-        session_id=session_id
-    )
-```
-
-### 2.4 LLM 层修改
-
-**修改文件：`service/llm_extractions.py`**
-
-```python
-def extract_llm(query: str, session_context: Optional[Dict[str, Any]] = None) -> ExtractionsJson:
-    """
-    LLM 提取实体
-
-    Args:
-        query: 用户查询文本
-        session_context: 会话上下文，包含历史对话和已解析实体
-    """
-    llm = get_llm()
-
-    # 构建带上下文的提示词
-    context_prompt = _build_context_prompt(session_context)
-
-    chain = context_prompt | llm
-    resp = chain.invoke({"query": query})
-    # ... 原有解析逻辑 ...
-
-def _build_context_prompt(session_context: Optional[Dict[str, Any]]) -> ChatPromptTemplate:
-    """构建带会话上下文的提示词"""
-    base_system = """你是一个..."""
-
-    context_instruction = ""
-
-    if session_context and session_context.get("recent_queries"):
-        context_instruction = r"""
-
-=== 对话历史 ===
-"""
-        for i, prev_query in enumerate(session_context["recent_queries"], 1):
-            context_instruction += f"Q{i}: {prev_query}\n"
-
-        if session_context.get("resolved_entities"):
-            entities = session_context["resolved_entities"]
-            if entities.get("regions"):
-                context_instruction += f"\n已识别地区: {', '.join(entities['regions'])}"
-            if entities.get("metrics"):
-                context_instruction += f"\n已识别指标: {', '.join(entities['metrics'])}"
-
-        context_instruction += "\n=== 历史结束 ===\n\n"
-        context_instruction += "请参考上述对话历史，理解用户当前问题的完整意图。"
-
-    return ChatPromptTemplate.from_messages([
-        ("system", base_system + context_instruction),
-        ("human", "用户问题：\n{query}\n\n返回 JSON："),
-    ])
-```
+- 存储：JSON 文件 (`data/user_preferences/project_{id}__user_{user_id}.json`)
+- 机制：记录用户选择频率，用 `log2(count+1) * 2` 作为 bias 加分（上限 6.0）
+- 时机：resolve 后 rerank，不替代 matcher 主判断
 
 ---
 
-## 三、实施步骤
+## 5. Persistence
 
-### Phase 1: 创建数据模型与会话管理 (优先级: 高)
+### JsonlStorage 基类
 
-| 步骤 | 文件 | 内容 |
-|------|------|------|
-| 1.1 | `service/session_models.py` | 创建会话数据模型 |
-| 1.2 | `service/session_manager.py` | 实现内存版本 SessionManager |
-| 1.3 | `tests/test_session_manager.py` | 编写单元测试 |
+```text
+JsonlStorage (基类)
+  ├─ append() + fsync
+  ├─ read_all() (容错跳过损坏行)
+  ├─ _maybe_compact() (500 行阈值 → 保留 100 条 + 最新 state/meta)
+  │
+  ├─ SessionStorage
+  │   ├─ read_tail()
+  │   └─ read_last_state()
+  │
+  └─ TaskStorage
+      ├─ read_latest()
+      └─ list_by_session()
+```
 
-### Phase 2: API 层集成 (优先级: 高)
+### Compaction 机制
 
-| 步骤 | 文件 | 修改内容 |
-|------|------|----------|
-| 2.1 | `app.py` | 添加 session_id 到请求/响应模型 |
-| 2.2 | `app.py` | 集成 SessionManager |
-| 2.3 | `app.py` | 在 nl2dsl 函数中处理会话逻辑 |
+- 每次 append 后检查行数
+- 超过 500 行时：保留最近 100 条 + 所有 query_state / session_meta 记录
+- 原子写入（先写 .tmp 再 replace）
 
-### Phase 3: LLM 层改造 (优先级: 高)
-
-| 步骤 | 文件 | 修改内容 |
-|------|------|----------|
-| 3.1 | `service/llm_extractions.py` | 修改 extract_llm 函数签名 |
-| 3.2 | `service/llm_extractions.py` | 实现 _build_context_prompt |
-| 3.3 | `service/llm_extractions.py` | 将上下文注入 LLM 提示词 |
-
-### Phase 4: 持久化存储 (优先级: 中)
-
-| 步骤 | 文件 | 内容 |
-|------|------|------|
-| 4.1 | `service/storage_backend.py` | 定义存储接口 |
-| 4.2 | `service/redis_storage.py` | 实现 Redis 后端 |
-| 4.3 | `service/file_storage.py` | 实现文件后端 |
-| 4.4 | 配置 | 添加存储配置选项 |
-
-### Phase 5: 测试验证 (优先级: 中)
-
-| 步骤 | 内容 |
-|------|------|
-| 5.1 | 单元测试：SessionManager |
-| 5.2 | 集成测试：多轮对话场景 |
-| 5.3 | 端到端测试：验证上下文继承 |
 
 ---
 
-## 四、关键文件清单
+## 6. 示例使用场景
 
-### 需要新建的文件
+### 场景 1: 首次查询
 
-```
-service/
-├── session_models.py      # 会话数据模型
-├── session_manager.py      # 会话管理服务
-├── storage_backend.py      # 存储接口定义 (Phase 4)
-├── redis_storage.py        # Redis 存储 (Phase 4)
-└── file_storage.py         # 文件存储 (Phase 4)
-
-tests/
-└── test_session_manager.py # 会话管理测试
-```
-
-### 需要修改的文件
-
-```
-app.py                      # API 层集成
-service/llm_extractions.py  # LLM 层改造
-requirements.txt            # 可能需要新增依赖 (Phase 4)
-```
-
----
-
-## 五、示例使用场景
-
-### 场景 1: 首次请求
 ```json
 POST /nl2dsl
-{
-  "text": "德国的PV",
-  "project_id": 55
-}
+{ "text": "德国的app_launch的PV", "project_id": 55 }
 
 Response:
-{
-  "extraction_json": {...},
-  "semantic": {...},
-  "exec_dsl": {...},
-  "explain": {...},
-  "session_id": "abc-123-def"  // 返回新会话ID
-}
+{ "status": "success", "session_id": "abc-123", "explain": { "turn_explain": { "mode": "new_query" } } }
 ```
 
-### 场景 2: 后续请求（带上下文）
+### 场景 2: Follow-up 修改指标
+
 ```json
 POST /nl2dsl
-{
-  "text": "对比昨天的数据",  // 系统理解"昨天"基于德国PV的上下文
-  "project_id": 55,
-  "session_id": "abc-123-def"  // 传入会话ID
-}
+{ "text": "换成UV", "project_id": 55, "session_id": "abc-123" }
 
 Response:
-{
-  // ... 系统利用上下文生成正确的查询
-}
+{ "status": "success", "explain": { "turn_explain": { "mode": "followup_patch", "applied_patch": { "metric": "uv" } } } }
+```
+
+### 场景 3: 确认流
+
+```json
+// 低置信度触发
+POST /nl2dsl
+{ "text": "<模糊event>", "project_id": 55 }
+→ { "status": "needs_confirmation", "task_id": "xxx", "candidates": {...} }
+
+// 用户确认
+POST /nl2dsl
+{ "text": "1", "session_id": "abc-123" }
+→ { "status": "success", "explain": { "confirmed": {...} } }
 ```
 
 ---
 
-## 六、依赖项
+## 7. 测试基础设施
 
-### Python 包 (Phase 4 需要)
-```
-# requirements.txt 新增
-redis>=5.0.0        # Redis 存储 (可选)
-```
+### 测试框架
 
----
-
-## 七、注意事项
-
-1. **向后兼容**：`session_id` 为可选参数，不影响现有无状态调用
-2. **上下文窗口**：限制历史消息数量，避免超出 LLM token 限制
-3. **隐私安全**：生产环境需考虑用户数据加密
-4. **扩展性**：存储接口设计支持多种后端（内存/Redis/数据库）
-
----
-
-## 八、后续优化方向
-
-1. **智能上下文摘要**：使用 LLM 生成对话摘要，节省 token
-2. **会话过期策略**：自动清理长期不活跃的会话
-3. **跨会话记忆**：持久化用户级别的偏好设置
-
----
-
-# 测试基础设施
-
-## 测试框架
-
-- 使用 `pytest`（统一，不再混用 unittest）
+- 使用 `pytest`
 - 配置文件：`pytest.ini`
 - 共享 fixtures：`tests/conftest.py`
 
-## 运行测试
+### 运行测试
 
 ```bash
 pytest tests/ -v
 ```
 
-## 测试文件清单
+### 测试文件清单
 
 | 文件 | 覆盖模块 | 测试数量 |
 |------|---------|---------|
-| `test_session_storage.py` | `memory/storage/memory_file.py` — JSONL 持久化、容错 | 15 |
-| `test_long_term_memory.py` | `memory/long_term_memory.py` — 记忆注入、缓存、截断 | 11 |
-| `test_task_manager.py` | `service/task_manager.py` — 确认流生命周期、过期 | 17 |
-| `test_session_manager.py` | `service/session_manager.py` — 会话管理集成 | 15 |
+| `test_session_storage.py` | `memory/storage/memory_file.py` — JSONL 持久化、容错、compaction | 15 |
+| `test_long_term_memory.py` | `memory/long_term_memory.py` — 记忆注入、缓存、相关性筛选 | 12 |
+| `test_task_manager.py` | `service/task_manager.py` — 确认流、持久化恢复、过期 | 23 |
+| `test_session_manager.py` | `service/session_manager.py` — 会话管理、turn 追踪 | 19 |
+| `test_followup_resolver.py` | `service/followup_resolver.py` — follow-up 检测各规则 | 8 |
+| `test_query_state_merger.py` | `service/query_state_merger.py` — patch 合并、字段来源 | 6 |
+| `test_app_endpoints.py` | `app.py` — HTTP 端点集成 | 23 |
+| `test_matchers.py` | `matcher/` — 事件/指标/维度/时间匹配 | 29 |
+| `test_user_preference_store.py` | `memory/user_preference_store.py` — 偏好存储 | 2 |
+| `test_memory_writer.py` | `memory/memory_writer.py` — hash 去重 | 12 |
 | `test_ingress.py` | `ingress/` — 清洗、去重、Telegram 适配 | 20 |
-| `test_bus.py` | `bus/` — 消息总线、DirectCallBus、工厂函数 | 10 |
-| `test_app_endpoints.py` | `app.py` — HTTP 端点（happy path / early_exit / confirmation / fallback） | 16 |
-| `test_matchers.py` | `matcher/` — 文本工具、事件/指标/维度/时间匹配 | 29 |
+| `test_bus.py` | `bus/` — 消息总线、DirectCallBus | 11 |
+| `test_end_to_end_evals.py` | 端到端 eval (YAML 驱动) | 多场景 |
 
-## 关键测试场景
+### 关键测试场景
 
-1. **Session recovery**：JSONL 写入 → create_or_get → 恢复 messages + query_state
-2. **Memory injection**：get_enhanced_context → memory_corrections 注入
-3. **early_exit**：空 event_extractions → status=early_exit
-4. **Fallback**：低分 → 使用 default 值
+1. **Session recovery**：JSONL 写入 → create_or_get → 恢复 messages + query_state + turn_index
+2. **Memory injection**：get_enhanced_context → query-aware 相关性筛选 → memory_corrections
+3. **Follow-up detection**：纯时间词 / 前缀词 / 比较短语 / 短句模式
+4. **QueryState merge**：explicit/inherited 标记、field_sources 追踪
 5. **Confirmation flow**：低置信度 → needs_confirmation → 用户选择 → success
-6. **JSONL 容错**：corrupted line → 跳过，不崩溃
+6. **JSONL compaction**：超过 500 行 → 自动压缩保留 100 条
+7. **User preference bias**：多次选择 → log2 bias rerank
+8. **JSONL 容错**：corrupted line → 跳过，不崩溃
