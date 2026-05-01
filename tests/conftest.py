@@ -1,7 +1,7 @@
 """共享 fixtures"""
 import pytest
 
-from memory.storage.memory_file import SessionStorage
+from memory.storage.memory_file import SessionStorage, TaskStorage
 from memory.long_term_memory import LongTermMemory
 from service.session_manager import SessionManager
 from service.task_manager import TaskManager
@@ -15,6 +15,11 @@ def session_storage(tmp_path):
 
 
 @pytest.fixture
+def task_storage(tmp_path):
+    return TaskStorage(data_path=str(tmp_path / "tasks"))
+
+
+@pytest.fixture
 def long_term_memory(tmp_path):
     return LongTermMemory(data_path=str(tmp_path / "memory"))
 
@@ -25,8 +30,8 @@ def session_manager(tmp_path):
 
 
 @pytest.fixture
-def task_manager():
-    return TaskManager(ttl_minutes=30)
+def task_manager(task_storage):
+    return TaskManager(ttl_minutes=30, storage=task_storage)
 
 
 @pytest.fixture

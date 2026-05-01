@@ -1,0 +1,11 @@
+{
+  "events": {
+    "app_launch": 1
+  },
+  "metrics": {
+    "pv": 1
+  },
+  "dimensions": {
+    "country": 1
+  }
+}

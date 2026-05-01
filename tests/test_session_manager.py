@@ -37,7 +37,17 @@ class TestSessionManager:
                 "region_filter": ["ROW"],
                 "group_by": ["country"],
                 "filters": [],
+                "turn_type": "followup_patch",
             },
+            "turn_type": "followup_patch",
+            "timestamp": datetime.now().isoformat(),
+        })
+        session_manager.storage.append(sid, {
+            "type": "session_meta",
+            "pending_task_id": "task_123",
+            "last_turn_type": "followup_patch",
+            "last_user_query": "hello from file",
+            "turn_index": 1,
             "timestamp": datetime.now().isoformat(),
         })
 
@@ -47,6 +57,10 @@ class TestSessionManager:
         assert ctx.messages[0].content == "hello from file"
         assert ctx.last_query_state is not None
         assert ctx.last_query_state.event == "app_launch"
+        assert ctx.last_turn_type == "followup_patch"
+        assert ctx.pending_task_id == "task_123"
+        assert ctx.last_user_query == "hello from file"
+        assert ctx.turn_index == 1
 
     def test_create_or_get_new_when_jsonl_missing(self, session_manager):
         ctx = session_manager.create_or_get("nonexistent_id", "user_1", 55)
@@ -60,6 +74,8 @@ class TestSessionManager:
         assert len(ctx.messages) == 1
         assert ctx.messages[0].content == "hello"
         assert ctx.messages[0].role == "user"
+        assert ctx.last_user_query == "hello"
+        assert ctx.turn_index == 1
 
     def test_add_message_persists_to_jsonl(self, session_manager):
         ctx = session_manager.create_or_get(None, "user_1", 55)
@@ -89,24 +105,41 @@ class TestSessionManager:
         # 不崩溃即可
 
     def test_update_query_state_stores_in_memory(self, session_manager, sample_query_state):
-        from service.session_models import QueryState
         ctx = session_manager.create_or_get(None, "user_1", 55)
+        sample_query_state.turn_type = "followup_patch"
         session_manager.update_query_state(ctx.session_id, sample_query_state)
         assert ctx.last_query_state is not None
         assert ctx.last_query_state.event == "app_launch"
+        assert ctx.last_turn_type == "followup_patch"
 
     def test_update_query_state_persists_to_jsonl(self, session_manager, sample_query_state):
         ctx = session_manager.create_or_get(None, "user_1", 55)
+        sample_query_state.turn_type = "followup_patch"
         session_manager.update_query_state(ctx.session_id, sample_query_state)
 
         records = session_manager.storage.read_tail(ctx.session_id)
         state_records = [r for r in records if r.get("type") == "query_state"]
         assert len(state_records) == 1
         assert state_records[0]["data"]["event"] == "app_launch"
+        assert state_records[0]["turn_type"] == "followup_patch"
+
+    def test_update_pending_task_stores_in_memory(self, session_manager):
+        ctx = session_manager.create_or_get(None, "user_1", 55)
+        session_manager.update_pending_task(ctx.session_id, "task_1")
+        assert ctx.pending_task_id == "task_1"
+
+    def test_update_pending_task_persists_to_jsonl(self, session_manager):
+        ctx = session_manager.create_or_get(None, "user_1", 55)
+        session_manager.update_pending_task(ctx.session_id, "task_1")
+        records = session_manager.storage.read_tail(ctx.session_id)
+        meta_records = [r for r in records if r.get("type") == "session_meta"]
+        assert len(meta_records) == 1
+        assert meta_records[0]["pending_task_id"] == "task_1"
 
     def test_get_enhanced_context_includes_session(self, session_manager, sample_query_state):
         ctx = session_manager.create_or_get(None, "user_1", 55)
         session_manager.add_message(ctx.session_id, "user", "查询PV")
+        sample_query_state.turn_type = "new_query"
         session_manager.update_query_state(ctx.session_id, sample_query_state)
 
         context = session_manager.get_enhanced_context(ctx.session_id)
@@ -114,6 +147,9 @@ class TestSessionManager:
         assert "查询PV" in context["recent_queries"]
         assert "last_query_state" in context
         assert context["last_query_state"]["event"] == "app_launch"
+        assert context["last_turn_type"] == "new_query"
+        assert context["last_user_query"] == "查询PV"
+        assert context["turn_index"] == 1
 
     def test_get_enhanced_context_includes_memory(self, session_manager, tmp_path):
         ctx = session_manager.create_or_get(None, "user_1", 55)
@@ -128,6 +164,23 @@ class TestSessionManager:
         context = session_manager.get_enhanced_context(ctx.session_id)
         assert "memory_corrections" in context
         assert "Use ROW for default" in context["memory_corrections"]
+
+    def test_get_enhanced_context_selects_memory_by_query(self, session_manager, tmp_path):
+        ctx = session_manager.create_or_get(None, "user_1", 55)
+        session_manager.add_message(ctx.session_id, "user", "看激活数据")
+
+        project_dir = tmp_path / "data" / "memory" / "project_55"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "activation.md").write_text("激活默认映射 activation_success", encoding="utf-8")
+        (project_dir / "payment.md").write_text("支付默认看 payment_success", encoding="utf-8")
+        (project_dir / "MEMORY.md").write_text(
+            "- [Activation](activation.md)\n- [Payment](payment.md)\n",
+            encoding="utf-8",
+        )
+
+        context = session_manager.get_enhanced_context(ctx.session_id, query_text="看激活数据")
+        assert "activation_success" in context["memory_corrections"]
+        assert "payment_success" not in context["memory_corrections"]
 
     def test_get_enhanced_context_no_memory(self, session_manager):
         ctx = session_manager.create_or_get(None, "user_1", 55)

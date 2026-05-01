@@ -147,6 +147,31 @@ class TestTaskManager:
     def test_update_status_nonexistent_returns_none(self, task_manager):
         assert task_manager.update_status("nonexistent", "confirmed") is None
 
+    def test_create_task_persists_to_storage(self, task_manager):
+        task = task_manager.create_task("s1", "q1", {}, candidates={"event": [{"value": "x", "score": 0.5}]})
+        latest = task_manager.storage.read_latest(task.task_id)
+        assert latest is not None
+        assert latest["status"] == "waiting_confirmation"
+        assert latest["session_id"] == "s1"
+
+    def test_get_task_restores_from_storage(self, task_manager):
+        task = task_manager.create_task("s1", "q1", {}, candidates={"event": [{"value": "x", "score": 0.5}]})
+        task_manager._tasks.clear()
+        restored = task_manager.get_task(task.task_id)
+        assert restored is not None
+        assert restored.task_id == task.task_id
+        assert restored.session_id == "s1"
+
+    def test_confirm_task_persists_updated_state(self, task_manager):
+        task = task_manager.create_task(
+            "s1", "q1", {},
+            candidates={"event": [{"value": "payment_success", "score": 0.55}]},
+        )
+        task_manager.confirm_task(task.task_id, "event", "payment_success")
+        latest = task_manager.storage.read_latest(task.task_id)
+        assert latest["user_selection"]["event"] == "payment_success"
+        assert latest["status"] == "confirmed"
+
 
 # 避免顶层 import 冲突，在测试方法内引用
 from service.session_models import QueryState

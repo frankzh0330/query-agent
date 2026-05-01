@@ -28,7 +28,7 @@ class AgentWorker:
         Returns:
             {"nl2dsl": result.model_dump(), "query": query_result}
         """
-        from app import NL2DSLRequest, nl2dsl
+        from app import NL2DSLRequest, get_matcher_service, orchestrator, _send_telegram_notification
         from service.bearer_service import execute_query
 
         logger.info(f"Worker processing: msg={msg.msg_id}, channel={msg.channel}, text={msg.text[:60]}")
@@ -42,30 +42,30 @@ class AgentWorker:
             session_id=f"tg_{msg.chat_id}",
         )
 
-        result = await nl2dsl(req)
-        result_data = result.model_dump()
-        logger.debug(f"Worker nl2dsl done: status={result.status}, session={result.session_id}")
+        service = get_matcher_service()
+        result = await orchestrator.process(req, service, service.catalog, notify_fn=_send_telegram_notification)
+        logger.debug("Worker nl2dsl done: status=%s, session=%s", result.get("status"), result.get("session_id"))
 
         # early_exit 场景（缺少 event_name 等）
-        if result.status == "early_exit":
-            logger.info(f"Worker early_exit: msg={msg.msg_id}, reason={result.message}")
+        if result.get("status") == "early_exit":
+            logger.info("Worker early_exit: msg=%s, reason=%s", msg.msg_id, result.get("message"))
             return {
-                "nl2dsl": result_data,
+                "nl2dsl": result,
                 "query": None,
                 "early_exit": True,
-                "message": result.message,
+                "message": result.get("message"),
             }
 
         # 执行 Bearer 查询
         try:
-            query_result = await execute_query(result.exec_dsl)
-            logger.info(f"Worker query done: msg={msg.msg_id}, success=True")
+            query_result = await execute_query(result["exec_dsl"])
+            logger.info("Worker query done: msg=%s, success=True", msg.msg_id)
         except Exception as e:
-            logger.exception(f"Bearer query failed for msg={msg.msg_id}: {e}")
+            logger.exception("Bearer query failed for msg=%s: %s", msg.msg_id, e)
             query_result = {"success": False, "error": str(e)}
 
         return {
-            "nl2dsl": result_data,
+            "nl2dsl": result,
             "query": query_result,
             "early_exit": False,
         }
@@ -83,7 +83,15 @@ class AgentWorker:
                 if msg is None:
                     continue
 
+                logger.info(
+                    "[Worker] ← Dequeued msg_id=%s user=%s chat=%s text=%.80s",
+                    msg.msg_id, msg.user_id, msg.chat_id, msg.text,
+                )
                 result = await self.process(msg)
+                logger.info(
+                    "[Worker] → Enqueuing result msg_id=%s early_exit=%s has_query=%s",
+                    msg.msg_id, result.get("early_exit"), result.get("query") is not None,
+                )
                 from bus.message_schema import BusResult
                 bus_result = BusResult(
                     msg=msg,

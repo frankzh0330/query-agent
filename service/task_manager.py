@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from memory.storage.memory_file import TaskStorage
 from service.session_models import TaskContext, QueryState
 
 logger = logging.getLogger(__name__)
@@ -24,9 +25,10 @@ class TaskManager:
 
     DEFAULT_TTL_MINUTES = 30
 
-    def __init__(self, ttl_minutes: int = DEFAULT_TTL_MINUTES):
+    def __init__(self, ttl_minutes: int = DEFAULT_TTL_MINUTES, storage: TaskStorage | None = None):
         self._tasks: Dict[str, TaskContext] = {}
         self._ttl_minutes = ttl_minutes
+        self.storage = storage
 
     def create_task(
         self,
@@ -64,6 +66,7 @@ class TaskManager:
         )
 
         self._tasks[task_id] = task
+        self._persist_task(task)
         logger.info(f"Task created: {task_id} (session={session_id}, status=waiting_confirmation)")
         return task
 
@@ -74,10 +77,15 @@ class TaskManager:
         """
         task = self._tasks.get(task_id)
         if not task:
-            return None
+            restored = self._restore_task(task_id)
+            if restored:
+                task = restored
+            else:
+                return None
 
         if task.is_expired(self._ttl_minutes):
             task.status = "expired"
+            self._persist_task(task)
             logger.info(f"Task expired: {task_id}")
             return None
 
@@ -129,6 +137,7 @@ class TaskManager:
             task.status = "confirmed"
 
         task.updated_at = datetime.now()
+        self._persist_task(task)
         logger.info(f"Task confirmed: {task_id}, field={field}, value={value}, all_confirmed={all_confirmed}")
         return task
 
@@ -152,6 +161,7 @@ class TaskManager:
         if status in valid_transitions.get(current, []):
             task.status = status
             task.updated_at = datetime.now()
+            self._persist_task(task)
             logger.info(f"Task status updated: {task_id} {current} → {status}")
         else:
             logger.warning(f"Invalid status transition: {task_id} {current} → {status}")
@@ -164,6 +174,7 @@ class TaskManager:
         if task:
             task.status = "expired"
             task.updated_at = datetime.now()
+            self._persist_task(task)
             logger.info(f"Task manually expired: {task_id}")
 
     def cleanup_expired(self) -> int:
@@ -175,6 +186,8 @@ class TaskManager:
 
         for task_id in to_remove:
             del self._tasks[task_id]
+            if self.storage:
+                self.storage.delete(task_id)
 
         if to_remove:
             logger.info(f"Cleaned up {len(to_remove)} expired tasks")
@@ -187,3 +200,53 @@ class TaskManager:
         if session_id:
             tasks = [t for t in tasks if t.session_id == session_id]
         return tasks
+
+    def _persist_task(self, task: TaskContext) -> None:
+        if not self.storage:
+            return
+        self.storage.append(
+            task.task_id,
+            {
+                "task_id": task.task_id,
+                "session_id": task.session_id,
+                "user_id": task.user_id,
+                "raw_query": task.raw_query,
+                "extraction": task.extraction,
+                "partial_query_state": task.partial_query_state.to_dict() if task.partial_query_state else None,
+                "candidates": task.candidates,
+                "user_selection": task.user_selection,
+                "status": task.status,
+                "turn_type": task.turn_type,
+                "resume_count": task.resume_count,
+                "last_prompt": task.last_prompt,
+                "created_at": task.created_at.isoformat(),
+                "updated_at": task.updated_at.isoformat(),
+            },
+        )
+
+    def _restore_task(self, task_id: str) -> Optional[TaskContext]:
+        if not self.storage:
+            return None
+        latest = self.storage.read_latest(task_id)
+        if not latest:
+            return None
+
+        partial_state = latest.get("partial_query_state")
+        task = TaskContext(
+            task_id=latest["task_id"],
+            session_id=latest["session_id"],
+            raw_query=latest["raw_query"],
+            user_id=latest.get("user_id"),
+            extraction=latest.get("extraction", {}),
+            partial_query_state=QueryState(**partial_state) if partial_state else None,
+            candidates=latest.get("candidates", {}),
+            user_selection=latest.get("user_selection", {}),
+            status=latest.get("status", "waiting_confirmation"),
+            turn_type=latest.get("turn_type", "confirmation"),
+            resume_count=latest.get("resume_count", 0),
+            last_prompt=latest.get("last_prompt"),
+            created_at=datetime.fromisoformat(latest["created_at"]),
+            updated_at=datetime.fromisoformat(latest["updated_at"]),
+        )
+        self._tasks[task_id] = task
+        return task

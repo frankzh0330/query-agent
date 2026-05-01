@@ -112,3 +112,17 @@ class TestLongTermMemory:
         result = long_term_memory.load_memory_context()
         # 不崩溃，返回空
         assert result == ""
+
+    def test_selects_relevant_memory_parts_for_query(self, long_term_memory, tmp_path):
+        project_dir = tmp_path / "memory" / "project_55"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "activation.md").write_text("激活默认映射 activation_success", encoding="utf-8")
+        (project_dir / "payment.md").write_text("支付成功默认看 payment_success", encoding="utf-8")
+        (project_dir / "MEMORY.md").write_text(
+            "- [Activation](activation.md)\n- [Payment](payment.md)\n",
+            encoding="utf-8",
+        )
+
+        result = long_term_memory.load_memory_context(project_id=55, query_text="看激活数据")
+        assert "activation_success" in result
+        assert "payment_success" not in result

@@ -76,6 +76,28 @@ def _build_context_str(session_context: Optional[Dict[str, Any]]) -> str:
     return "\n".join(parts) if parts else ""
 
 
+def _is_followup_turn(session_context: Optional[Dict[str, Any]]) -> bool:
+    """是否处于更可能是 follow-up 的轮次。"""
+    if not session_context:
+        return False
+    return bool(session_context.get("last_query_state")) and bool(session_context.get("turn_index", 0))
+
+
+def _build_followup_instruction(session_context: Optional[Dict[str, Any]]) -> str:
+    """为多轮 follow-up 场景追加更偏 patch extraction 的指令。"""
+    if not _is_followup_turn(session_context):
+        return ""
+
+    return (
+        "\n\n=== 多轮查询补充规则 ===\n"
+        "如果当前问题看起来是在补充、修改或缩写上一轮查询，请优先抽取本轮明确提到的新信息。\n"
+        "不要为了补全而重复输出用户本轮没有明确说出的 event、metric、group_by。\n"
+        "如果本轮只说了时间、地区、指标或分组变化，就只抽取这些变化。\n"
+        "只有当用户本轮明确提到 event 时，才填充 event_extractions。\n"
+        "=== 规则结束 ===\n"
+    )
+
+
 def _extract_json(content: str) -> str:
     """
     从内容中提取第一个完整的 JSON 对象
@@ -293,7 +315,7 @@ def get_llm_client() -> OpenAI:
         )
     else:  # zhipu (默认)
         api_key = os.getenv("ZHIPU_API_KEY", os.getenv("ZHIPUAI_API_KEY", ""))
-        base_url = os.getenv("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+        base_url = os.getenv("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/coding/paas/v4")
         return OpenAI(api_key=api_key, base_url=base_url)
 
 
@@ -339,7 +361,12 @@ def _build_messages(query: str, session_context: Optional[Dict[str, Any]],
     # 层 2：动态上下文（QueryState + 最近消息）
     context_str = _build_context_str(session_context)
     if context_str:
-        system_prompt += "\n\n请参考上述上下文理解用户当前问题的完整意图。\n" + context_str
+        system_prompt += "\n\n请参考上述上下文理解用户当前问题。\n" + context_str
+
+    # 层 3：follow-up patch extraction 指令
+    followup_instruction = _build_followup_instruction(session_context)
+    if followup_instruction:
+        system_prompt += followup_instruction
 
     messages = [
         {"role": "system", "content": system_prompt},

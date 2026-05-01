@@ -15,12 +15,24 @@ from service.session_models import QueryState
 def client(tmp_path):
     """创建隔离的 TestClient，使用 tmp_path 避免 state 泄漏"""
     import app as app_module
+    from memory.storage.memory_file import TaskStorage
+    from memory.user_preference_store import UserPreferenceStore
     from service.session_manager import SessionManager
     from service.task_manager import TaskManager
 
     # 替换全局实例为隔离版本
     app_module.session_manager = SessionManager(data_path=str(tmp_path / "data"))
-    app_module.task_manager = TaskManager()
+    app_module.task_manager = TaskManager(
+        storage=TaskStorage(data_path=str(tmp_path / "data" / "tasks"))
+    )
+    app_module.user_preference_store = UserPreferenceStore(
+        data_path=str(tmp_path / "data" / "user_preferences")
+    )
+
+    # 同步更新 orchestrator 的引用
+    app_module.orchestrator.session = app_module.session_manager
+    app_module.orchestrator.task = app_module.task_manager
+    app_module.orchestrator.preferences = app_module.user_preference_store
 
     # 初始化 matcher_service（用 mock 避免加载真实 catalog）
     mock_service = mock.MagicMock()
@@ -96,6 +108,23 @@ def _mock_low_score_resolver():
 # ==================== Tests: Happy Path ====================
 
 class TestNL2DSLHappyPath:
+    @staticmethod
+    def _seed_previous_state():
+        import app as app_module
+
+        ctx = app_module.session_manager.create_or_get(None, "user_1", 55)
+        prev_qs = QueryState(
+            project_id=55,
+            event="app_launch",
+            metric="pv",
+            time_range={"type": "last_n_days", "n": 7},
+            region_filter=["ROW"],
+            group_by=["country"],
+            filters=[],
+            turn_type="new_query",
+        )
+        app_module.session_manager.update_query_state(ctx.session_id, prev_qs)
+        return ctx, prev_qs
 
     def test_nl2dsl_success(self, client):
         extraction = ExtractionsJson(
@@ -106,10 +135,10 @@ class TestNL2DSLHappyPath:
         )
         mock_service = _mock_high_confidence_resolver()
 
-        with mock.patch("app.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
             with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("app.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("app.validate_region"), mock.patch("app.validate_region_consistency"):
+                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
+                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
                         resp = client.post("/nl2dsl", json={
                             "text": "查询近7天 app_launch 的PV",
                             "project_id": 55,
@@ -129,10 +158,10 @@ class TestNL2DSLHappyPath:
         )
         mock_service = _mock_high_confidence_resolver()
 
-        with mock.patch("app.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
             with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("app.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("app.validate_region"), mock.patch("app.validate_region_consistency"):
+                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
+                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
                         resp = client.post("/nl2dsl", json={"text": "test", "project_id": 55})
 
         assert resp.json()["session_id"] is not None
@@ -148,10 +177,10 @@ class TestNL2DSLHappyPath:
         )
         mock_service = _mock_high_confidence_resolver()
 
-        with mock.patch("app.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
             with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("app.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("app.validate_region"), mock.patch("app.validate_region_consistency"):
+                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
+                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
                         resp = client.post("/nl2dsl", json={
                             "text": "test",
                             "project_id": 55,
@@ -159,6 +188,195 @@ class TestNL2DSLHappyPath:
                         })
 
         assert resp.json()["session_id"] == sid
+
+    def test_nl2dsl_followup_inherits_previous_state(self, client):
+        ctx, _ = self._seed_previous_state()
+
+        extraction = ExtractionsJson(
+            time_extractions=[Extraction(text="昨天")],
+            event_extractions=[],
+            region_filter=["ROW"],
+        )
+        mock_service = mock.MagicMock()
+        mock_service.resolve_time.return_value = (1, {"method": "matched", "n": 1})
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+            with mock.patch("app.get_matcher_service", return_value=mock_service):
+                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
+                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
+                        resp = client.post("/nl2dsl", json={
+                            "text": "昨天",
+                            "project_id": 55,
+                            "session_id": ctx.session_id,
+                        })
+
+        body = resp.json()
+        assert body["status"] == "success"
+        assert body["semantic"]["event"]["event_name"] == "app_launch"
+        assert body["semantic"]["metric"]["metric_id"] == "pv"
+        assert body["semantic"]["time_range"]["n"] == 1
+        assert body["explain"]["turn_explain"]["mode"] == "followup_patch"
+        assert body["explain"]["turn_explain"]["decision"]["reason"] == "time_only_term"
+        assert body["explain"]["turn_explain"]["applied_patch_fields"] == ["time_range"]
+
+    def test_nl2dsl_followup_changes_metric_only(self, client):
+        ctx, _ = self._seed_previous_state()
+
+        extraction = ExtractionsJson(
+            metric_extractions=[Extraction(text="UV")],
+            event_extractions=[],
+            region_filter=["ROW"],
+        )
+        mock_service = mock.MagicMock()
+
+        def _resolve(mtype, extractions, default):
+            if mtype.value == "metric":
+                return ResolvedResult(
+                    value="uv",
+                    score=96.0,
+                    method="exact",
+                    candidates=[],
+                    needs_confirmation=False,
+                )
+            raise AssertionError(f"unexpected matcher type: {mtype}")
+
+        mock_service.resolve_with_candidates.side_effect = _resolve
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+            with mock.patch("app.get_matcher_service", return_value=mock_service):
+                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
+                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
+                        resp = client.post("/nl2dsl", json={
+                            "text": "改成UV",
+                            "project_id": 55,
+                            "session_id": ctx.session_id,
+                        })
+
+        body = resp.json()
+        assert body["status"] == "success"
+        assert body["semantic"]["metric"]["metric_id"] == "uv"
+        assert body["semantic"]["event"]["event_name"] == "app_launch"
+        assert body["explain"]["turn_explain"]["explicit_fields"] == ["metric"]
+        assert body["explain"]["turn_explain"]["decision"]["matched_signals"]
+        assert body["explain"]["turn_explain"]["state_snapshot"]["metric"] == "uv"
+
+    def test_nl2dsl_followup_changes_region_only(self, client):
+        ctx, _ = self._seed_previous_state()
+
+        extraction = ExtractionsJson(
+            event_extractions=[],
+            region_filter=["USTTP"],
+        )
+        mock_service = mock.MagicMock()
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+            with mock.patch("app.get_matcher_service", return_value=mock_service):
+                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
+                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
+                        resp = client.post("/nl2dsl", json={
+                            "text": "那美国呢",
+                            "project_id": 55,
+                            "session_id": ctx.session_id,
+                        })
+
+        body = resp.json()
+        assert body["status"] == "success"
+        assert body["semantic"]["region_filter"] == ["USTTP"]
+        assert body["semantic"]["metric"]["metric_id"] == "pv"
+        assert body["semantic"]["event"]["event_name"] == "app_launch"
+        assert body["explain"]["turn_explain"]["explicit_fields"] == ["region_filter"]
+        assert "region_token" in body["explain"]["turn_explain"]["decision"]["matched_signals"]
+
+    def test_nl2dsl_followup_changes_group_by_only(self, client):
+        ctx, _ = self._seed_previous_state()
+
+        extraction = ExtractionsJson(
+            event_extractions=[],
+            region_filter=["ROW"],
+            group_by_extractions=[Extraction(text="渠道")],
+        )
+        mock_service = mock.MagicMock()
+
+        def _resolve(mtype, extractions, default):
+            if mtype.value == "dimension":
+                return ResolvedResult(
+                    value="channel",
+                    score=94.0,
+                    method="exact",
+                    candidates=[],
+                    needs_confirmation=False,
+                )
+            raise AssertionError(f"unexpected matcher type: {mtype}")
+
+        mock_service.resolve_with_candidates.side_effect = _resolve
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+            with mock.patch("app.get_matcher_service", return_value=mock_service):
+                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
+                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
+                        resp = client.post("/nl2dsl", json={
+                            "text": "再按渠道拆一下",
+                            "project_id": 55,
+                            "session_id": ctx.session_id,
+                        })
+
+        body = resp.json()
+        assert body["status"] == "success"
+        assert body["semantic"]["group_by"] == [{"dimension_id": "channel"}]
+        assert body["semantic"]["metric"]["metric_id"] == "pv"
+        assert body["semantic"]["event"]["event_name"] == "app_launch"
+        assert body["explain"]["turn_explain"]["explicit_fields"] == ["group_by"]
+        assert body["explain"]["turn_explain"]["applied_patch"]["group_by"] == ["channel"]
+
+    def test_nl2dsl_applies_user_preference_rerank_after_recall(self, client):
+        import app as app_module
+
+        for _ in range(6):
+            app_module.user_preference_store.record_selection(
+                55, "user_pref", event="payment_submit"
+            )
+
+        extraction = ExtractionsJson(
+            event_extractions=[Extraction(text="支付")],
+            region_filter=["ROW"],
+        )
+        mock_service = mock.MagicMock()
+
+        def _resolve(mtype, extractions, default):
+            if mtype.value == "event":
+                return ResolvedResult(
+                    value="purchase_success",
+                    score=55.0,
+                    method="fuzzy_low_confidence",
+                    candidates=[
+                        {"value": "purchase_success", "score": 55.0},
+                        {"value": "payment_submit", "score": 54.0},
+                    ],
+                    needs_confirmation=True,
+                )
+            return ResolvedResult(
+                value="pv" if mtype.value == "metric" else "country",
+                score=95.0,
+                method="exact",
+                candidates=[],
+                needs_confirmation=False,
+            )
+
+        mock_service.resolve_with_candidates.side_effect = _resolve
+        mock_service.resolve_time.return_value = (7, {"method": "default", "n": 7})
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+            with mock.patch("app.get_matcher_service", return_value=mock_service):
+                resp = client.post("/nl2dsl", json={
+                    "text": "支付情况",
+                    "project_id": 55,
+                    "user_id": "user_pref",
+                })
+
+        body = resp.json()
+        assert body["status"] == "needs_confirmation"
+        assert body["candidates"]["event"][0]["value"] == "payment_submit"
+        assert body["explain"]["resolver_explain"]["event"]["user_preference_bias"]["applied"] is True
 
 
 # ==================== Tests: Early Exit ====================
@@ -172,7 +390,7 @@ class TestNL2DSLEarlyExit:
             region_filter=["ROW"],
         )
 
-        with mock.patch("app.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
             resp = client.post("/nl2dsl", json={
                 "text": "PV数据",
                 "project_id": 55,
@@ -191,7 +409,7 @@ class TestNL2DSLEarlyExit:
             region_filter=["ROW"],
         )
 
-        with mock.patch("app.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
             resp = client.post("/nl2dsl", json={
                 "text": "some query",
                 "project_id": 55,
@@ -206,6 +424,23 @@ class TestNL2DSLEarlyExit:
 # ==================== Tests: Confirmation Flow ====================
 
 class TestNL2DSLConfirmation:
+    @staticmethod
+    def _seed_previous_state():
+        import app as app_module
+
+        ctx = app_module.session_manager.create_or_get(None, "user_1", 55)
+        prev_qs = QueryState(
+            project_id=55,
+            event="app_launch",
+            metric="pv",
+            time_range={"type": "last_n_days", "n": 7},
+            region_filter=["ROW"],
+            group_by=["country"],
+            filters=[],
+            turn_type="new_query",
+        )
+        app_module.session_manager.update_query_state(ctx.session_id, prev_qs)
+        return ctx, prev_qs
 
     def test_nl2dsl_needs_confirmation(self, client):
         extraction = ExtractionsJson(
@@ -214,7 +449,7 @@ class TestNL2DSLConfirmation:
         )
         mock_service = _mock_low_confidence_resolver()
 
-        with mock.patch("app.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
             with mock.patch("app.get_matcher_service", return_value=mock_service):
                 resp = client.post("/nl2dsl", json={
                     "text": "purchase的情况",
@@ -237,7 +472,7 @@ class TestNL2DSLConfirmation:
         mock_service = _mock_low_confidence_resolver()
 
         # 第一次请求：触发确认
-        with mock.patch("app.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
             with mock.patch("app.get_matcher_service", return_value=mock_service):
                 resp1 = client.post("/nl2dsl", json={
                     "text": "purchase的情况",
@@ -250,8 +485,8 @@ class TestNL2DSLConfirmation:
         assert body1["status"] == "needs_confirmation"
 
         # 第二次请求：用户回复确认
-        with mock.patch("app.render_exec_dsl", return_value={"content": {"queries": []}}):
-            with mock.patch("app.validate_region"), mock.patch("app.validate_region_consistency"):
+        with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
+            with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
                 resp2 = client.post("/nl2dsl", json={
                     "text": "1",
                     "project_id": 55,
@@ -261,6 +496,97 @@ class TestNL2DSLConfirmation:
         body2 = resp2.json()
         assert body2["status"] == "success"
         assert "confirmed" in body2.get("message", "") or body2["status"] == "success"
+        assert body2["explain"]["turn_explain"]["mode"] == "confirmation"
+        assert body2["explain"]["turn_explain"]["field_sources"]["event"] == "confirmed"
+        assert body2["explain"]["turn_explain"]["confirmed_fields"]["event"] == "purchase_success"
+
+    def test_nl2dsl_followup_confirmation_then_reply(self, client):
+        ctx, _ = self._seed_previous_state()
+
+        extraction = ExtractionsJson(
+            event_extractions=[Extraction(text="purchase")],
+            region_filter=["ROW"],
+        )
+        mock_service = _mock_low_confidence_resolver()
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+            with mock.patch("app.get_matcher_service", return_value=mock_service):
+                resp1 = client.post("/nl2dsl", json={
+                    "text": "对比purchase",
+                    "project_id": 55,
+                    "session_id": ctx.session_id,
+                })
+
+        body1 = resp1.json()
+        assert body1["status"] == "needs_confirmation"
+        assert body1["explain"]["turn_explain"]["mode"] == "followup_patch"
+
+        with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
+            with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
+                resp2 = client.post("/nl2dsl", json={
+                    "text": "1",
+                    "project_id": 55,
+                    "session_id": ctx.session_id,
+                })
+
+        body2 = resp2.json()
+        assert body2["status"] == "success"
+        assert body2["semantic"]["event"]["event_name"] == "purchase_success"
+        assert body2["semantic"]["metric"]["metric_id"] == "pv"
+        assert body2["semantic"]["group_by"] == [{"dimension_id": "country"}]
+        assert body2["explain"]["turn_explain"]["mode"] == "confirmation"
+        assert body2["explain"]["turn_explain"]["field_sources"]["event"] == "confirmed"
+        assert "metric" in body2["explain"]["turn_explain"]["inherited_fields"]
+        assert body2["explain"]["turn_explain"]["confirmed_fields"]["event"] == "purchase_success"
+
+    def test_nl2dsl_confirmation_after_session_restore(self, client):
+        import app as app_module
+        from service.session_manager import SessionManager
+
+        extraction = ExtractionsJson(
+            event_extractions=[Extraction(text="purchase")],
+            region_filter=["ROW"],
+        )
+        mock_service = _mock_low_confidence_resolver()
+
+        # 第一次请求：触发确认并落盘
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+            with mock.patch("app.get_matcher_service", return_value=mock_service):
+                resp1 = client.post("/nl2dsl", json={
+                    "text": "purchase的情况",
+                    "project_id": 55,
+                })
+
+        body1 = resp1.json()
+        sid = body1["session_id"]
+        assert body1["status"] == "needs_confirmation"
+
+        # 模拟服务重启：清空内存 session 和 task，再从同一路径恢复
+        original_session_manager = app_module.session_manager
+        original_task_manager = app_module.task_manager
+        app_module.session_manager = SessionManager(
+            data_path=str(original_session_manager.storage.data_path.parent)
+        )
+        app_module.task_manager = type(original_task_manager)(
+            ttl_minutes=30,
+            storage=original_task_manager.storage,
+        )
+
+        try:
+            with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
+                with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
+                    resp2 = client.post("/nl2dsl", json={
+                        "text": "1",
+                        "project_id": 55,
+                        "session_id": sid,
+                    })
+        finally:
+            # 恢复 fixture 中的隔离实例，避免影响后续测试
+            app_module.session_manager = original_session_manager
+            app_module.task_manager = original_task_manager
+
+        body2 = resp2.json()
+        assert body2["status"] == "success"
 
 
 # ==================== Tests: Fallback ====================
@@ -274,10 +600,10 @@ class TestNL2DSLFallback:
         )
         mock_service = _mock_low_score_resolver()
 
-        with mock.patch("app.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
             with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("app.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("app.validate_region"), mock.patch("app.validate_region_consistency"):
+                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
+                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
                         resp = client.post("/nl2dsl", json={
                             "text": "unknown query",
                             "project_id": 55,

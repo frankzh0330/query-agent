@@ -37,6 +37,10 @@ class QueryState:
 
     # 调试
     confidence: Optional[float] = None
+    explicit_fields: list[str] = field(default_factory=list)
+    inherited_fields: list[str] = field(default_factory=list)
+    field_sources: Dict[str, str] = field(default_factory=dict)
+    turn_type: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -50,6 +54,10 @@ class QueryState:
             "chart_type": self.chart_type,
             "interaction_mode": self.interaction_mode,
             "confidence": self.confidence,
+            "explicit_fields": self.explicit_fields,
+            "inherited_fields": self.inherited_fields,
+            "field_sources": self.field_sources,
+            "turn_type": self.turn_type,
         }
 
 
@@ -81,6 +89,9 @@ class TaskContext:
 
     # 状态：waiting_confirmation | confirmed | completed | cancelled | expired
     status: str = "waiting_confirmation"
+    turn_type: str = "confirmation"
+    resume_count: int = 0
+    last_prompt: Optional[str] = None
 
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
@@ -101,6 +112,9 @@ class TaskContext:
             "candidates": self.candidates,
             "user_selection": self.user_selection,
             "status": self.status,
+            "turn_type": self.turn_type,
+            "resume_count": self.resume_count,
+            "last_prompt": self.last_prompt,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
@@ -139,6 +153,9 @@ class SessionContext:
 
     # 当前等待用户确认的任务 ID
     pending_task_id: Optional[str] = None
+    last_turn_type: Optional[str] = None
+    last_user_query: Optional[str] = None
+    turn_index: int = 0
 
     created_at: datetime = field(default_factory=datetime.now)
     last_active: datetime = field(default_factory=datetime.now)
@@ -153,6 +170,9 @@ class SessionContext:
         )
         self.messages.append(msg)
         self.last_active = datetime.now()
+        if role == "user":
+            self.last_user_query = content
+            self.turn_index += 1
 
     def get_recent_messages(self, limit: int = 5) -> list[Message]:
         """获取最近的消息"""
@@ -167,6 +187,9 @@ class SessionContext:
             "last_query_state": self.last_query_state.to_dict() if self.last_query_state else None,
             "last_result_summary": self.last_result_summary,
             "pending_task_id": self.pending_task_id,
+            "last_turn_type": self.last_turn_type,
+            "last_user_query": self.last_user_query,
+            "turn_index": self.turn_index,
             "created_at": self.created_at.isoformat(),
             "last_active": self.last_active.isoformat(),
         }

@@ -4,7 +4,7 @@
 
 `query-agent` 是一个面向数据查询场景的 NL2DSL Agent。它接收自然语言问题，解析出 `event / metric / time / region / group_by`，构建语义 DSL，渲染为可执行 DSL，并支持多轮会话、确认流、项目记忆、用户偏好重排和异步记忆学习。
 
-当前项目已经不只是一个单轮 `NL -> DSL` Demo，而是一个更接近真实 Data Agent 的系统：
+这个项目已经不只是一个单轮 `NL -> DSL` Demo，而是一个更接近真实 Data Agent 的系统：
 
 - 支持 HTTP 和 Telegram 两种入口
 - 支持 turn-based follow-up 和 confirmation
@@ -13,7 +13,7 @@
 - 支持项目级 catalog 定时同步
 - 支持 end-to-end eval 样例集
 
-## Overview
+## 总览
 
 核心查询链路：
 
@@ -38,30 +38,30 @@ Gateway
   -> Dispatcher
 ```
 
-## Highlights
+## 亮点
 
-- Layered NL2DSL pipeline: extraction, matching, semantic DSL, exec DSL, validation
-- Turn-based Q&A: `last_query_state`, follow-up detection, patch merge, confirmation flow
-- Session persistence: JSONL append-only session storage with restart recovery
-- Pending task persistence: confirmation task can survive process restart
-- Project-scoped memory: `project_{id}/MEMORY.md` with relevant-snippet selection
-- User preference rerank: post-recall bias scoped by `project_id + user_id`
-- Async memory learning: successful queries can write back correction/preference/constraint memory
-- Telegram long polling gateway and message-bus-based worker orchestration
-- End-to-end eval suite for new query, follow-up, confirmation, memory injection, and restart recovery
+- 分层 NL2DSL Pipeline：extraction、matching、semantic DSL、exec DSL、validation
+- Turn-based Q&A：`last_query_state`、follow-up detection、patch merge、confirmation flow
+- Session 持久化：基于 JSONL append-only 的会话存储与恢复
+- Pending task 持久化：确认任务可跨进程重启恢复
+- 项目级 memory：`project_{id}/MEMORY.md` + 相关片段选择
+- 用户偏好重排：按 `project_id + user_id` 作用域做 post-recall bias
+- 异步 memory learning：成功查询后可写回 correction / preference / constraint
+- Telegram long polling gateway + message bus worker 架构
+- end-to-end eval：覆盖新查询、follow-up、confirmation、memory 注入、重启恢复
 
-## Key Concepts
+## 核心概念
 
 ### 1. Semantic DSL vs Exec DSL
 
 - `Semantic DSL` 表示用户查询意图的规范化结构
 - `Exec DSL` 是最终发给下游查询系统的执行格式
 
-这种分层让系统更容易：
+这样分层的好处是：
 
-- 解释为什么这样解析
-- 在中间层做确认、修正、验证
-- 做端到端回归测试
+- 更容易解释为什么这样解析
+- 可以在中间层做确认、修正、验证
+- 更适合做端到端回归测试
 
 ### 2. Turn-Based Querying
 
@@ -80,7 +80,7 @@ Q4: 那美国呢
 - 用 `followup_resolver` 判断这轮是 new query 还是 follow-up
 - 用 `query_state_merger` 做字段级 patch merge
 
-### 3. Memory Layers
+### 3. 三层 Memory
 
 当前项目里最重要的记忆分层是：
 
@@ -93,21 +93,21 @@ Q4: 那美国呢
 
 这里的用户偏好不是主判定器，只用于 recall 后的轻量 rerank。
 
-## Quick Start
+## 快速开始
 
-### Requirements
+### 环境要求
 
 - Python 3.11+
 - `pip`
 - Redis 仅在 `MESSAGE_BUS_BACKEND=redis` 时需要
 
-### Install
+### 安装
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Configure
+### 配置
 
 复制环境变量：
 
@@ -117,19 +117,19 @@ cp .env.example .env
 
 常用环境变量：
 
-| Variable | Required | Default | Description |
+| 变量 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
-| `PORT` | No | `8000` | HTTP 端口 |
-| `HOST` | No | `0.0.0.0` | 监听地址 |
-| `LOG_LEVEL` | No | `DEBUG` | 日志级别 |
-| `TELEGRAM_BOT_TOKEN` | No | - | Telegram 入口 |
-| `MESSAGE_BUS_BACKEND` | No | `direct` | `direct` 或 `redis` |
-| `REDIS_URL` | No | `redis://localhost:6379/0` | Redis 连接地址 |
-| `CATALOG_API_BASE` | No | - | Catalog 同步源 |
+| `PORT` | 否 | `8000` | HTTP 端口 |
+| `HOST` | 否 | `0.0.0.0` | 监听地址 |
+| `LOG_LEVEL` | 否 | `DEBUG` | 日志级别 |
+| `TELEGRAM_BOT_TOKEN` | 否 | - | Telegram 入口 |
+| `MESSAGE_BUS_BACKEND` | 否 | `direct` | `direct` 或 `redis` |
+| `REDIS_URL` | 否 | `redis://localhost:6379/0` | Redis 连接地址 |
+| `CATALOG_API_BASE` | 否 | - | Catalog 同步源 |
 
 LLM、下游查询、Bearer 相关变量请按你的本地环境配置。
 
-### Run
+### 启动
 
 本地直连模式：
 
@@ -188,13 +188,13 @@ MESSAGE_BUS_BACKEND=redis docker-compose up --build
 
 执行下游 Bearer 查询。
 
-### Session Debug APIs
+### Session 调试接口
 
 - `GET /sessions`
 - `GET /sessions/{session_id}`
 - `DELETE /sessions/{session_id}`
 
-## Architecture Summary
+## 架构摘要
 
 ```mermaid
 flowchart TD
@@ -216,14 +216,14 @@ flowchart TD
     Validate --> Memory["Async Memory Learning"]
 ```
 
-更完整的模块说明见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+更完整的模块说明见 [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md)。
 
-## Project Layout
+## 项目结构
 
 ```text
 query-agent/
 ├── app.py                     # FastAPI route + NL2DSL main flow
-├── server.py                  # Lifecycle bootstrap + gateway/bus wiring
+├── server.py                  # 生命周期启动 + gateway/bus wiring
 ├── gateway/                   # Telegram gateway
 ├── ingress/                   # cleaning / dedup / adapter
 ├── bus/                       # direct / redis bus
@@ -247,7 +247,7 @@ query-agent/
 └── tests/
 ```
 
-## Catalog Note
+## Catalog 说明
 
 仓库里的 `catalog/*.yaml` 主要用于 Demo 和本地开发。真实场景下，项目设计上更偏向：
 
@@ -259,7 +259,7 @@ query-agent/
 - `catalog YAML` 是开发态/演示态输入
 - `metadata service + sync` 才是生产态方向
 
-## Evaluation
+## 评估
 
 当前测试包含两类：
 
@@ -285,21 +285,21 @@ end-to-end eval 位于：
 ./.venv311/bin/pytest -q
 ```
 
-## Docs Map
+## 文档导航
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): 当前真实架构、模块职责、依赖方向
-- [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md): 中文架构说明
+- [ARCHITECTURE.md](ARCHITECTURE.md): 英文架构说明
+- [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md): 当前真实架构、模块职责、依赖方向
 - [EVALUATION.md](EVALUATION.md): eval harness、golden cases、回归策略
 - [EVALUATION.zh-CN.md](EVALUATION.zh-CN.md): 中文评估说明
 - [MEMORY.md](MEMORY.md): session/project/user memory 设计
 - [MEMORY.zh-CN.md](MEMORY.zh-CN.md): 中文 memory 设计说明
-- [current-architecture.md](current-architecture.md): 更偏“目标态/演进态”的设计稿
+- [current-architecture.md](current-architecture.md): 更偏目标态/演进态的设计稿
 - [diagrams/architecture.md](diagrams/architecture.md): Mermaid 架构图
 - [diagrams/sequence.md](diagrams/sequence.md): 时序图
 - [diagrams/flowchart.md](diagrams/flowchart.md): 总体流程图
 - [TELEGRAM_TEST.md](TELEGRAM_TEST.md): Telegram 相关测试说明
 
-## Current Status
+## 当前状态
 
 当前主线能力已经具备：
 

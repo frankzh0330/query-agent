@@ -80,21 +80,29 @@ class SessionManager:
         for r in records:
             if r.get("type") == "message":
                 try:
-                    ctx.messages.append(
-                        Message(
-                            role=r["role"],
-                            content=r["content"],
-                            timestamp=datetime.fromisoformat(r["timestamp"]),
-                            metadata=r.get("metadata", {}),
-                        )
+                    msg = Message(
+                        role=r["role"],
+                        content=r["content"],
+                        timestamp=datetime.fromisoformat(r["timestamp"]),
+                        metadata=r.get("metadata", {}),
                     )
+                    ctx.messages.append(msg)
+                    if msg.role == "user":
+                        ctx.last_user_query = msg.content
+                        ctx.turn_index += 1
                 except (KeyError, ValueError) as e:
                     logger.warning(f"Skipping invalid message record: {e}")
             elif r.get("type") == "query_state":
                 try:
                     ctx.last_query_state = QueryState(**r["data"])
+                    ctx.last_turn_type = r.get("turn_type") or ctx.last_query_state.turn_type
                 except (TypeError, ValueError) as e:
                     logger.warning(f"Skipping invalid query_state record: {e}")
+            elif r.get("type") == "session_meta":
+                ctx.pending_task_id = r.get("pending_task_id")
+                ctx.last_turn_type = r.get("last_turn_type", ctx.last_turn_type)
+                ctx.last_user_query = r.get("last_user_query", ctx.last_user_query)
+                ctx.turn_index = r.get("turn_index", ctx.turn_index)
 
         ctx.last_active = datetime.now()
         return ctx
@@ -138,16 +146,40 @@ class SessionManager:
             logger.warning(f"Session not found: {session_id}")
             return
 
-        self._sessions[session_id].last_query_state = query_state
+        ctx = self._sessions[session_id]
+        ctx.last_query_state = query_state
+        ctx.last_turn_type = query_state.turn_type
         self.storage.append(
             session_id,
             {
                 "type": "query_state",
                 "data": query_state.to_dict(),
+                "turn_type": query_state.turn_type,
                 "timestamp": datetime.now().isoformat(),
             },
         )
         logger.debug(f"Updated last_query_state for session {session_id}")
+
+    def update_pending_task(self, session_id: str, task_id: str | None) -> None:
+        """更新 session 的 pending_task_id（内存 + 持久化）。"""
+        if session_id not in self._sessions:
+            logger.warning(f"Session not found: {session_id}")
+            return
+
+        ctx = self._sessions[session_id]
+        ctx.pending_task_id = task_id
+        self.storage.append(
+            session_id,
+            {
+                "type": "session_meta",
+                "pending_task_id": task_id,
+                "last_turn_type": ctx.last_turn_type,
+                "last_user_query": ctx.last_user_query,
+                "turn_index": ctx.turn_index,
+                "timestamp": datetime.now().isoformat(),
+            },
+        )
+        logger.debug(f"Updated pending_task_id for session {session_id}: {task_id}")
 
     def get_query_state(self, session_id: str) -> Optional[QueryState]:
         """获取最近一次查询状态"""
@@ -165,6 +197,9 @@ class SessionManager:
         result: Dict[str, Any] = {
             "recent_queries": [m.content for m in recent if m.role == "user"],
             "project_id": ctx.project_id,
+            "last_turn_type": ctx.last_turn_type,
+            "last_user_query": ctx.last_user_query,
+            "turn_index": ctx.turn_index,
         }
 
         if ctx.last_query_state:
@@ -199,7 +234,7 @@ class SessionManager:
 
     # ============ 增强上下文（集成长期记忆）============
 
-    def get_enhanced_context(self, session_id: str) -> Dict[str, Any]:
+    def get_enhanced_context(self, session_id: str, query_text: str | None = None) -> Dict[str, Any]:
         """获取增强上下文（会话 + 记忆文件）
 
         Returns:
@@ -214,7 +249,9 @@ class SessionManager:
 
         # 按 project_id 分桶加载记忆文件内容（纠正/约束）
         memory_content = self.long_term.load_memory_context(
-            project_id=session.project_id
+            project_id=session.project_id,
+            query_text=query_text,
+            last_query_state=context.get("last_query_state"),
         )
         if memory_content:
             context["memory_corrections"] = memory_content

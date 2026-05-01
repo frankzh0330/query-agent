@@ -37,7 +37,13 @@ class LongTermMemory:
         self._cache: Dict[Tuple[int, ...], str] = {}
         self._cache_mtime: Dict[Tuple[int, ...], float] = {}
 
-    def load_memory_context(self, project_id: Optional[int] = None) -> str:
+    def load_memory_context(
+        self,
+        project_id: Optional[int] = None,
+        *,
+        query_text: str | None = None,
+        last_query_state: Optional[Dict[str, object]] = None,
+    ) -> str:
         """加载记忆内容（用于注入 system prompt）
 
         按 project_id 分桶加载：
@@ -74,7 +80,8 @@ class LongTermMemory:
             logger.debug(f"LongTermMemory: no memory found for project={project_id}")
             return ""
 
-        result = "\n\n".join(parts)
+        selected_parts = self._select_relevant_parts(parts, query_text=query_text, last_query_state=last_query_state)
+        result = "\n\n".join(selected_parts)
         result = self._truncate(result)
 
         self._cache[cache_key] = result
@@ -115,6 +122,72 @@ class LongTermMemory:
                         logger.warning(f"Failed to read memory file {file_path}: {e}")
 
         return parts
+
+    def _select_relevant_parts(
+        self,
+        parts: list[str],
+        *,
+        query_text: str | None = None,
+        last_query_state: Optional[Dict[str, object]] = None,
+    ) -> list[str]:
+        if not query_text and not last_query_state:
+            return parts
+
+        keywords = self._build_keywords(query_text=query_text, last_query_state=last_query_state)
+        if not keywords:
+            return parts
+
+        scored_parts = []
+        for part in parts:
+            lowered = part.lower()
+            score = sum(1 for kw in keywords if kw and kw in lowered)
+            scored_parts.append((score, len(part), part))
+
+        matched = [part for score, _, part in sorted(scored_parts, key=lambda item: (item[0], item[1]), reverse=True) if score > 0]
+        if matched:
+            return matched[:3]
+
+        # 没有命中时保守回退，避免完全丢失上下文
+        return parts[:2]
+
+    @staticmethod
+    def _build_keywords(
+        *,
+        query_text: str | None = None,
+        last_query_state: Optional[Dict[str, object]] = None,
+    ) -> list[str]:
+        raw_tokens: list[str] = []
+        if query_text:
+            normalized_query = query_text.lower()
+            raw_tokens.extend(re.findall(r"[a-z0-9_]+", normalized_query))
+            cjk_chunks = re.findall(r"[\u4e00-\u9fff]+", normalized_query)
+            for chunk in cjk_chunks:
+                raw_tokens.append(chunk)
+                if len(chunk) <= 2:
+                    continue
+                for idx in range(len(chunk) - 1):
+                    raw_tokens.append(chunk[idx : idx + 2])
+
+        if last_query_state:
+            for key in ("event", "metric"):
+                value = last_query_state.get(key)
+                if isinstance(value, str) and value:
+                    raw_tokens.append(value.lower())
+            for key in ("group_by", "region_filter"):
+                values = last_query_state.get(key)
+                if isinstance(values, list):
+                    raw_tokens.extend(str(value).lower() for value in values if value)
+
+        seen = set()
+        keywords = []
+        for token in raw_tokens:
+            if len(token) < 2:
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            keywords.append(token)
+        return keywords
 
     def _is_cache_stale(self, cache_key: Tuple[int, ...]) -> bool:
         """检查相关目录的文件是否有更新"""
