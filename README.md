@@ -1,21 +1,21 @@
 # Query Agent
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [Chinese](docs/README.zh-CN.md)
 
-`query-agent` 是一个面向数据查询场景的 NL2DSL Agent。它接收自然语言问题，解析出 `event / metric / time / region / group_by`，构建语义 DSL，渲染为可执行 DSL，并支持多轮会话、确认流、项目记忆、用户偏好重排和异步记忆学习。
+`query-agent` is a data-query-oriented NL2DSL agent. It accepts natural language questions, extracts `event / metric / time / region / group_by`, builds a canonical semantic DSL, renders an executable DSL, and supports multi-turn sessions, confirmation flows, project memory, user preference reranking, and asynchronous memory learning.
 
-当前项目已经不只是一个单轮 `NL -> DSL` Demo，而是一个更接近真实 Data Agent 的系统：
+The project is no longer a single-turn `NL -> DSL` demo. It is evolving into a controlled data agent with:
 
-- 支持 HTTP 和 Telegram 两种入口
-- 支持 turn-based follow-up 和 confirmation
-- 支持 Session Memory、Project Memory、User Preference Signal
-- 支持 Direct / Redis 两种消息总线模式
-- 支持项目级 catalog 定时同步
-- 支持 end-to-end eval 样例集
+- HTTP and Telegram entry points
+- turn-based follow-up and confirmation handling
+- Session Memory, Project Memory, and User Preference signals
+- Direct and Redis message bus modes
+- project-level catalog synchronization
+- data-driven end-to-end eval cases
 
 ## Overview
 
-核心查询链路：
+Core query flow:
 
 ```text
 Natural Language
@@ -27,7 +27,7 @@ Natural Language
   -> Validation
 ```
 
-系统运行链路：
+Runtime flow:
 
 ```text
 Gateway
@@ -43,55 +43,55 @@ Gateway
 - Layered NL2DSL pipeline: extraction, matching, semantic DSL, exec DSL, validation
 - Turn-based Q&A: `last_query_state`, follow-up detection, patch merge, confirmation flow
 - Session persistence: JSONL append-only session storage with restart recovery
-- Pending task persistence: confirmation task can survive process restart
+- Pending task persistence: confirmation tasks can survive process restarts
 - Project-scoped memory: `project_{id}/MEMORY.md` with relevant-snippet selection
 - User preference rerank: post-recall bias scoped by `project_id + user_id`
-- Async memory learning: successful queries can write back correction/preference/constraint memory
-- Telegram long polling gateway and message-bus-based worker orchestration
-- End-to-end eval suite for new query, follow-up, confirmation, memory injection, and restart recovery
+- Async memory learning: successful queries can write back correction, preference, and constraint memory
+- Telegram long-polling gateway and message-bus-based worker orchestration
+- End-to-end eval suite for new queries, follow-ups, confirmations, memory injection, and restart recovery
 
 ## Key Concepts
 
 ### 1. Semantic DSL vs Exec DSL
 
-- `Semantic DSL` 表示用户查询意图的规范化结构
-- `Exec DSL` 是最终发给下游查询系统的执行格式
+- `Semantic DSL` represents the normalized intent of a user query.
+- `Exec DSL` is the executable payload sent to the downstream query system.
 
-这种分层让系统更容易：
+This split makes it easier to:
 
-- 解释为什么这样解析
-- 在中间层做确认、修正、验证
-- 做端到端回归测试
+- explain why the agent resolved a query in a certain way
+- confirm, patch, and validate intermediate state
+- test behavior at the semantic layer before execution details
 
 ### 2. Turn-Based Querying
 
-系统支持多轮查询，例如：
+The system supports multi-turn querying, for example:
 
 ```text
-Q1: 德国 app_launch 的 PV
-Q2: 换成昨天
-Q3: 再按渠道拆一下
-Q4: 那美国呢
+Q1: Show PV for app_launch in Germany
+Q2: Change it to yesterday
+Q3: Break it down by channel
+Q4: What about the US?
 ```
 
-这里不是每轮都重新完整理解，而是：
+The agent does not rebuild the whole query from scratch on every turn. Instead:
 
-- 用 `last_query_state` 继承上轮结构化状态
-- 用 `followup_resolver` 判断这轮是 new query 还是 follow-up
-- 用 `query_state_merger` 做字段级 patch merge
+- `last_query_state` carries the previous structured state
+- `followup_resolver` decides whether the current turn is a new query or a follow-up
+- `query_state_merger` applies field-level patches to the previous state
 
 ### 3. Memory Layers
 
-当前项目里最重要的记忆分层是：
+The project currently uses three main memory layers:
 
 - `Session Memory`
-  - 当前会话里的 `last_query_state / pending_task / recent turns`
+  - current-session `last_query_state / pending_task / recent turns`
 - `Project Memory`
-  - 某个项目的业务约束、默认映射、口径说明、纠正知识
+  - project-specific business constraints, default mappings, corrections, and caveats
 - `User Preference Signal`
-  - 某个用户在某个项目里的常用 `event / metric / group_by`
+  - frequently used `event / metric / group_by` scoped by `project_id + user_id`
 
-这里的用户偏好不是主判定器，只用于 recall 后的轻量 rerank。
+User preference is not a primary resolver. It is only used as a weak post-recall rerank signal.
 
 ## Quick Start
 
@@ -99,7 +99,7 @@ Q4: 那美国呢
 
 - Python 3.11+
 - `pip`
-- Redis 仅在 `MESSAGE_BUS_BACKEND=redis` 时需要
+- Redis only when `MESSAGE_BUS_BACKEND=redis`
 
 ### Install
 
@@ -109,41 +109,41 @@ pip install -r requirements.txt
 
 ### Configure
 
-复制环境变量：
+Copy and edit the environment file:
 
 ```bash
 cp .env.example .env
 ```
 
-常用环境变量：
+Common environment variables:
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PORT` | No | `8000` | HTTP 端口 |
-| `HOST` | No | `0.0.0.0` | 监听地址 |
-| `LOG_LEVEL` | No | `DEBUG` | 日志级别 |
-| `TELEGRAM_BOT_TOKEN` | No | - | Telegram 入口 |
-| `MESSAGE_BUS_BACKEND` | No | `direct` | `direct` 或 `redis` |
-| `REDIS_URL` | No | `redis://localhost:6379/0` | Redis 连接地址 |
-| `CATALOG_API_BASE` | No | - | Catalog 同步源 |
+| `PORT` | No | `8000` | HTTP port |
+| `HOST` | No | `0.0.0.0` | Bind address |
+| `LOG_LEVEL` | No | `DEBUG` | Logging level |
+| `TELEGRAM_BOT_TOKEN` | No | - | Telegram gateway token |
+| `MESSAGE_BUS_BACKEND` | No | `direct` | `direct` or `redis` |
+| `REDIS_URL` | No | `redis://localhost:6379/0` | Redis URL |
+| `CATALOG_API_BASE` | No | - | Catalog sync source |
 
-LLM、下游查询、Bearer 相关变量请按你的本地环境配置。
+Configure LLM, downstream query, and Bearer-related variables according to your local environment.
 
 ### Run
 
-本地直连模式：
+Local direct mode:
 
 ```bash
 python server.py
 ```
 
-开发模式：
+Development mode:
 
 ```bash
 uvicorn server:app_with_ws --reload --port 8000
 ```
 
-Redis 模式：
+Redis mode:
 
 ```bash
 MESSAGE_BUS_BACKEND=redis docker-compose up --build
@@ -153,20 +153,20 @@ MESSAGE_BUS_BACKEND=redis docker-compose up --build
 
 ### `POST /nl2dsl`
 
-主查询接口。
+Main natural-language-to-DSL endpoint.
 
-请求示例：
+Request example:
 
 ```json
 {
-  "text": "德国近7天 app_launch 的 PV",
+  "text": "Show PV for app_launch in Germany over the last 7 days",
   "project_id": 55,
   "session_id": "optional-session-id",
   "user_id": "optional-user-id"
 }
 ```
 
-返回字段包括：
+Response fields include:
 
 - `extraction_json`
 - `semantic`
@@ -178,15 +178,15 @@ MESSAGE_BUS_BACKEND=redis docker-compose up --build
 - `task_id`
 - `candidates`
 
-其中：
+Status values:
 
-- `status=success`：查询已构建完成
-- `status=early_exit`：缺少必要信息，例如没有 event
-- `status=needs_confirmation`：低置信度候选，需要用户确认
+- `status=success`: the query was resolved and DSL was generated
+- `status=early_exit`: required information is missing, such as an event
+- `status=needs_confirmation`: low-confidence candidates require user confirmation
 
 ### `POST /query/bearer`
 
-执行下游 Bearer 查询。
+Execute a downstream Bearer query.
 
 ### Session Debug APIs
 
@@ -216,14 +216,14 @@ flowchart TD
     Validate --> Memory["Async Memory Learning"]
 ```
 
-更完整的模块说明见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+For a deeper module breakdown, see [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Project Layout
 
 ```text
 query-agent/
 ├── app.py                     # FastAPI route + NL2DSL main flow
-├── server.py                  # Lifecycle bootstrap + gateway/bus wiring
+├── server.py                  # lifecycle bootstrap + gateway/bus wiring
 ├── gateway/                   # Telegram gateway
 ├── ingress/                   # cleaning / dedup / adapter
 ├── bus/                       # direct / redis bus
@@ -249,29 +249,29 @@ query-agent/
 
 ## Catalog Note
 
-仓库里的 `catalog/*.yaml` 主要用于 Demo 和本地开发。真实场景下，项目设计上更偏向：
+The checked-in `catalog/*.yaml` files are mainly for demos and local development. In a realistic deployment, metadata is expected to come from:
 
-- 项目启动时从 HTTP 接口加载 metadata
-- 或通过定时同步将 metadata 落到本地 catalog
+- HTTP metadata services loaded at startup
+- scheduled sync jobs that materialize metadata into the local catalog
 
-所以：
+In other words:
 
-- `catalog YAML` 是开发态/演示态输入
-- `metadata service + sync` 才是生产态方向
+- `catalog YAML` is the development/demo input
+- `metadata service + sync` is the production-oriented direction
 
 ## Evaluation
 
-当前测试包含两类：
+The project uses two kinds of tests:
 
-- 单元 / 集成测试
-- 数据驱动的 end-to-end eval
+- unit / integration tests
+- data-driven end-to-end eval cases
 
-end-to-end eval 位于：
+The end-to-end eval suite lives in:
 
 - [tests/evals/nl2dsl_cases.yaml](tests/evals/nl2dsl_cases.yaml)
 - [tests/test_end_to_end_evals.py](tests/test_end_to_end_evals.py)
 
-目前已经覆盖：
+Current coverage includes:
 
 - basic new query
 - follow-up patch
@@ -279,7 +279,7 @@ end-to-end eval 位于：
 - project memory injection
 - confirmation after restart
 
-运行：
+Run:
 
 ```bash
 ./.venv311/bin/pytest -q
@@ -287,23 +287,29 @@ end-to-end eval 位于：
 
 ## Docs Map
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): 当前真实架构、模块职责、依赖方向
-- [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md): 中文架构说明
-- [EVALUATION.md](EVALUATION.md): eval harness、golden cases、回归策略
-- [EVALUATION.zh-CN.md](EVALUATION.zh-CN.md): 中文评估说明
-- [MEMORY.md](MEMORY.md): session/project/user memory 设计
-- [MEMORY.zh-CN.md](MEMORY.zh-CN.md): 中文 memory 设计说明
-- [current-architecture.md](current-architecture.md): 更偏“目标态/演进态”的设计稿
-- [diagrams/architecture.md](diagrams/architecture.md): Mermaid 架构图
-- [diagrams/sequence.md](diagrams/sequence.md): 时序图
-- [diagrams/flowchart.md](diagrams/flowchart.md): 总体流程图
-- [TELEGRAM_TEST.md](TELEGRAM_TEST.md): Telegram 相关测试说明
+- [docs/README.md](docs/README.md): documentation index
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md): current architecture, module ownership, and dependency direction
+- [ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md): Chinese architecture document
+- [EVALUATION.md](docs/EVALUATION.md): eval harness, golden cases, and regression strategy
+- [EVALUATION.zh-CN.md](docs/EVALUATION.zh-CN.md): Chinese evaluation document
+- [MEMORY.md](docs/MEMORY.md): session/project/user memory design
+- [MEMORY.zh-CN.md](docs/MEMORY.zh-CN.md): Chinese memory design document
+- [docs/diagrams/architecture.md](docs/diagrams/architecture.md): Mermaid architecture diagrams
+- [docs/diagrams/architecture.zh-CN.md](docs/diagrams/architecture.zh-CN.md): Chinese Mermaid architecture diagrams
+- [docs/diagrams/sequence.md](docs/diagrams/sequence.md): sequence diagrams
+- [docs/diagrams/sequence.zh-CN.md](docs/diagrams/sequence.zh-CN.md): Chinese sequence diagrams
+- [docs/diagrams/flowchart.md](docs/diagrams/flowchart.md): high-level flowcharts
+- [docs/diagrams/flowchart.zh-CN.md](docs/diagrams/flowchart.zh-CN.md): Chinese high-level flowcharts
+- [docs/diagrams/matcher-sequence.md](docs/diagrams/matcher-sequence.md): matcher sequence details
+- [docs/diagrams/matcher-sequence.zh-CN.md](docs/diagrams/matcher-sequence.zh-CN.md): Chinese matcher sequence details
+- [TELEGRAM_TEST.md](docs/TELEGRAM_TEST.md): Telegram testing notes
+- [TELEGRAM_TEST.zh-CN.md](docs/TELEGRAM_TEST.zh-CN.md): Chinese Telegram testing notes
 
 ## Current Status
 
-当前主线能力已经具备：
+The main capabilities currently in place are:
 
-- `NL -> DSL` 主链路
+- `NL -> DSL` pipeline
 - turn-based query handling
 - confirmation flow
 - session/task persistence
@@ -312,7 +318,7 @@ end-to-end eval 位于：
 - async memory learning
 - end-to-end eval harness
 
-下一阶段更适合继续做：
+Good next steps:
 
 - richer `UserPattern / UserAlias / Preferences`
 - stronger memory categorization and retrieval

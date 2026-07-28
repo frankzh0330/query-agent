@@ -104,7 +104,7 @@ flowchart TD
 
 ### Layer 1：LLM Extraction
 
-主要文件：[service/llm_extractions.py](service/llm_extractions.py)
+主要文件：[service/llm_extractions.py](../service/llm_extractions.py)
 
 职责：
 
@@ -125,7 +125,7 @@ flowchart TD
 
 ### Layer 2：Matcher Resolution
 
-主要文件：[matcher/matcher_service.py](matcher/matcher_service.py) 及具体 matcher。
+主要文件：[matcher/matcher_service.py](../matcher/matcher_service.py) 及具体 matcher。
 
 职责：
 
@@ -140,7 +140,7 @@ flowchart TD
 
 ### Layer 3：Semantic DSL
 
-主要文件：[dsl/semantic_models.py](dsl/semantic_models.py)
+主要文件：[dsl/semantic_models.py](../dsl/semantic_models.py)
 
 职责：
 
@@ -149,7 +149,7 @@ flowchart TD
 
 ### Layer 4：Exec DSL
 
-主要文件：[dsl/renderer.py](dsl/renderer.py) 和 [dsl/validators.py](dsl/validators.py)
+主要文件：[dsl/renderer.py](../dsl/renderer.py) 和 [dsl/validators.py](../dsl/validators.py)
 
 职责：
 
@@ -162,13 +162,13 @@ Turn-based 行为是系统的一等公民，不是简单的 prompt 技巧。
 
 ### 核心模块
 
-- [service/session_models.py](service/session_models.py)
+- [service/session_models.py](../service/session_models.py)
   - `QueryState`
   - `SessionContext`
   - `TaskContext`
-- [service/followup_resolver.py](service/followup_resolver.py)
-- [service/query_state_merger.py](service/query_state_merger.py)
-- [service/task_manager.py](service/task_manager.py)
+- [service/followup_resolver.py](../service/followup_resolver.py)
+- [service/query_state_merger.py](../service/query_state_merger.py)
+- [service/task_manager.py](../service/task_manager.py)
 
 ### Turn 模式
 
@@ -212,8 +212,8 @@ Q5: 那美国呢
 
 主要文件：
 
-- [service/session_manager.py](service/session_manager.py)
-- [service/session_models.py](service/session_models.py)
+- [service/session_manager.py](../service/session_manager.py)
+- [service/session_models.py](../service/session_models.py)
 
 存储内容：
 
@@ -230,7 +230,7 @@ Q5: 那美国呢
 
 ### 2. Project Memory
 
-主要文件：[memory/long_term_memory.py](memory/long_term_memory.py)
+主要文件：[memory/long_term_memory.py](../memory/long_term_memory.py)
 
 存储内容：
 
@@ -247,7 +247,7 @@ Q5: 那美国呢
 
 ### 3. User Preference Signal
 
-主要文件：[memory/user_preference_store.py](memory/user_preference_store.py)
+主要文件：[memory/user_preference_store.py](../memory/user_preference_store.py)
 
 存储内容：
 
@@ -293,7 +293,7 @@ Session 和 Task 分开持久化：
 
 ## Async Memory Learning
 
-主要文件：[memory/memory_writer.py](memory/memory_writer.py)
+主要文件：[memory/memory_writer.py](../memory/memory_writer.py)
 
 职责：
 
@@ -341,6 +341,149 @@ Session 和 Task 分开持久化：
 
 这些组件让系统不只是一个 HTTP API，而是可以作为消息驱动 agent 运行。
 
+## 架构场景示例
+
+下面这些场景适合用来从端到端角度验证架构是否闭环。它们更偏行为说明，
+不是单个函数的 unit test。
+
+### 场景 1：首次查询
+
+```json
+POST /nl2dsl
+{
+  "text": "德国 app_launch 的 PV",
+  "project_id": 55
+}
+```
+
+预期行为：
+
+- 创建或恢复 session
+- 走完整 `new_query` 路径
+- 解析 event、metric、time、region
+- 返回 `status=success`
+- 持久化 `last_query_state`，供后续 turn 使用
+
+### 场景 2：Follow-Up Patch
+
+```json
+POST /nl2dsl
+{
+  "text": "换成 UV",
+  "project_id": 55,
+  "session_id": "abc-123"
+}
+```
+
+预期行为：
+
+- 识别为 `followup_patch`
+- 继承 event、region 等未显式修改字段
+- 只 patch metric 字段
+- 在 `field_sources` 中标记字段来源是 `explicit` 还是 `inherited`
+
+### 场景 3：纯时间 Follow-Up
+
+```text
+Q1: 德国 app_launch 的 PV
+Q2: 昨天
+```
+
+预期行为：
+
+- 保持 `event=app_launch`
+- 保持 `metric=pv`
+- 保持上一轮 region
+- 只修改 time range
+
+这也是为什么 `last_query_state` 必须是结构化状态，而不能只是普通聊天摘要。
+
+### 场景 4：确认流
+
+```json
+POST /nl2dsl
+{
+  "text": "看启动成功",
+  "project_id": 55
+}
+```
+
+如果 event 解析存在歧义，系统应返回：
+
+```json
+{
+  "status": "needs_confirmation",
+  "task_id": "xxx",
+  "candidates": {
+    "event": [
+      { "value": "app_launch", "score": 72.0 },
+      { "value": "app_cold_start_success", "score": 69.0 }
+    ]
+  }
+}
+```
+
+随后用户回复：
+
+```json
+POST /nl2dsl
+{
+  "text": "1",
+  "session_id": "abc-123"
+}
+```
+
+系统应恢复 pending task，应用用户确认的候选值，继续生成 DSL，并清理
+`pending_task_id`。
+
+### 场景 5：Project Memory 注入
+
+```text
+Project memory:
+在 project_55 中，activation 默认指 activation_success。
+
+User query:
+昨天 activation 的 PV
+```
+
+预期行为：
+
+- 只加载 `_global` 和 `project_55` 作用域的 memory
+- 选择与当前 query 相关的 project memory 片段
+- 在 LLM extraction 前注入这些片段
+- 将项目规则和用户偏好明确区分
+
+### 场景 6：User Preference Rerank
+
+```text
+User history:
+user_a 在 project_55 中经常选择 payment_submit。
+
+Current query:
+看 payment event 的 PV。
+```
+
+预期行为：
+
+- matcher recall 仍然先产生候选集
+- user preference 只在 recall 后生效
+- preference 可以轻微提升 `payment_submit`
+- preference 不能覆盖更强的显式语义匹配
+
+### 场景 7：重启恢复
+
+```text
+Turn 1: 模糊查询返回 needs_confirmation
+Process restarts
+Turn 2: 用户回复 "1"
+```
+
+预期行为：
+
+- session storage 恢复 `pending_task_id`
+- task storage 恢复未完成的确认任务
+- 用户确认回复继续完成查询，而不是被当作新的独立查询
+
 ## Validation 与 Debugging
 
 系统当前暴露了比较丰富的 explain / debug 信息：
@@ -363,8 +506,8 @@ Session 和 Task 分开持久化：
 
 主要文件：
 
-- [tests/evals/nl2dsl_cases.yaml](tests/evals/nl2dsl_cases.yaml)
-- [tests/test_end_to_end_evals.py](tests/test_end_to_end_evals.py)
+- [tests/evals/nl2dsl_cases.yaml](../tests/evals/nl2dsl_cases.yaml)
+- [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
 
 当前覆盖包括：
 
@@ -392,4 +535,58 @@ Session 和 Task 分开持久化：
 - 每个 event 多个 dimension/property
 - 强项目语义和业务约束
 
+## 演进路线
 
+之前的架构草稿把当前行为和未来优化方案混在了一起。其中有价值的方向保留在这里；
+本文件继续作为当前真实架构的主要说明。
+
+### User History Layer
+
+未来生产版本可以增加独立的 `UserHistoryService`，负责：
+
+- query history
+- user aliases
+- user preferences
+- user patterns
+
+推荐的存储分工是：
+
+- PostgreSQL：持久化 query history、user aliases、preference records
+- Redis：缓存热点 user context 和 preference
+- 可选 Vector DB：用于 semantic memory retrieval、few-shot selection、ambiguous-rule recall
+
+### User Context 应该在哪里生效
+
+用户历史不能替代 resolver，只能在受控位置发挥作用：
+
+- LLM extraction 前：注入选出的 alias、default、personalized few-shot examples
+- matcher recall 后：用 user pattern 做弱 rerank bias
+- 查询成功后：异步保存 query history，并更新聚合 pattern
+
+### 未来数据模型
+
+比较自然的未来模型包括：
+
+- `UserPreferences`：默认 metric、region、event、time range
+- `UserAlias`：用户自定义表达与标准 event / metric / dimension 的映射
+- `UserPattern`：聚合后的 top events、metrics、regions、dimensions、query frequency
+- `QueryHistory`：成功和失败 query trace，用于 replay、learning、evaluation
+
+### 重要约束
+
+个性化必须明确限制作用域：
+
+```text
+project_id + user_id
+```
+
+优先级仍应保持为：
+
+```text
+explicit user input
+  > session state
+  > project memory
+  > user history / preference signals
+```
+
+这样可以避免历史行为静默覆盖当前更清晰的查询，或者覆盖项目级业务规则。

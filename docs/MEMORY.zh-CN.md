@@ -45,9 +45,9 @@ Session memory 存当前会话里的短期状态：
 
 ### 在哪里
 
-- [service/session_models.py](service/session_models.py)
-- [service/session_manager.py](service/session_manager.py)
-- [service/task_manager.py](service/task_manager.py)
+- [service/session_models.py](../service/session_models.py)
+- [service/session_manager.py](../service/session_manager.py)
+- [service/task_manager.py](../service/task_manager.py)
 
 ### 为什么需要
 
@@ -88,7 +88,7 @@ Project memory 存项目级业务知识：
 
 ### 在哪里
 
-- [memory/long_term_memory.py](memory/long_term_memory.py)
+- [memory/long_term_memory.py](../memory/long_term_memory.py)
 - 运行时文件位于 `data/memory/project_{id}/`
 
 ### 为什么需要
@@ -143,7 +143,7 @@ User preference 存轻量的使用习惯，例如：
 
 ### 在哪里
 
-- [memory/user_preference_store.py](memory/user_preference_store.py)
+- [memory/user_preference_store.py](../memory/user_preference_store.py)
 - 运行时文件位于 `data/user_preferences/`
 
 ### 为什么需要
@@ -267,6 +267,8 @@ flowchart TD
 
 - 更丰富的 `UserAlias`
 - 更丰富的 `UserPattern`
+- 更丰富的 `UserPreferences`
+- 持久化 `QueryHistory`
 - 按 category 做 memory retrieval（如 `constraint > correction > preference`）
 - 超过简单计数的跨 session user memory
 
@@ -309,6 +311,28 @@ flowchart TD
 ## 建议下一步
 
 1. 加 category-aware 的 project memory retrieval
-2. 把 `UserAlias` 和 `UserPattern` 从简单计数里拆开
-3. 扩更多 project memory / user preference 的 eval case
-4. 增加 project memory 和 user preference 冲突时的处理策略
+2. 把 `UserAlias`、`UserPattern`、`UserPreferences` 从简单计数里拆开
+3. 增加持久化 `QueryHistory`，用于 replay、pattern aggregation、failure analysis
+4. 对长期 project memory retrieval 考虑 hybrid Markdown + embedding index
+5. 扩更多 project memory / user preference 的 eval case
+6. 增加 project memory 和 user preference 冲突时的处理策略
+
+## User Memory 演进方向
+
+未来 user memory 不应只停留在当前的轻量 usage counter。
+
+推荐拆分：
+
+- `UserAlias`：显式或学习到的别名，例如 “startup” -> `app_launch`
+- `UserPattern`：聚合后的 top events、metrics、dimensions、regions、query frequency
+- `UserPreferences`：稳定默认值，例如常用 metric、region、time range
+- `QueryHistory`：持久化 query trace，用于 replay、evaluation、pattern learning
+
+推荐存储：
+
+- PostgreSQL：持久化 user records 和 query history
+- Redis：缓存热点 per-user/project context
+- 可选 Vector DB：对长期 memory 和 examples 做 semantic recall
+
+即使引入这些能力，user memory 也应该弱于 explicit input、session state 和
+project memory。

@@ -59,9 +59,9 @@
 
 例子：
 
-- [tests/test_app_endpoints.py](tests/test_app_endpoints.py)
-- [tests/test_session_manager.py](tests/test_session_manager.py)
-- [tests/test_task_manager.py](tests/test_task_manager.py)
+- [tests/test_app_endpoints.py](../tests/test_app_endpoints.py)
+- [tests/test_session_manager.py](../tests/test_session_manager.py)
+- [tests/test_task_manager.py](../tests/test_task_manager.py)
 
 适合测：
 
@@ -79,8 +79,8 @@
 
 主要文件：
 
-- [tests/evals/nl2dsl_cases.yaml](tests/evals/nl2dsl_cases.yaml)
-- [tests/test_end_to_end_evals.py](tests/test_end_to_end_evals.py)
+- [tests/evals/nl2dsl_cases.yaml](../tests/evals/nl2dsl_cases.yaml)
+- [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
 
 这套 harness 更接近“golden cases”，不是单纯 unit test。
 

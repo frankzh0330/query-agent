@@ -1,3 +1,8 @@
+# 运行时序图
+
+[English](sequence.md) | [简体中文](sequence.zh-CN.md)
+
+```mermaid
 sequenceDiagram
     actor User
     participant TgAPI as Telegram Bot API
@@ -118,3 +123,4 @@ sequenceDiagram
     TgAPI->>User: 查询结果: EUTTP, pv, app_launch, 近7天
     deactivate TGGw
     end
+```

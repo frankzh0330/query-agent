@@ -1,6 +1,6 @@
 # Evaluation Strategy
 
-[English](EVALUATION.md) | [简体中文](EVALUATION.zh-CN.md)
+[English](EVALUATION.md) | [Chinese](EVALUATION.zh-CN.md)
 
 This document explains how `query-agent` is evaluated today, what the current end-to-end eval harness covers, and how to expand it safely as the agent evolves.
 
@@ -59,9 +59,9 @@ Purpose:
 
 Examples:
 
-- [tests/test_app_endpoints.py](tests/test_app_endpoints.py)
-- [tests/test_session_manager.py](tests/test_session_manager.py)
-- [tests/test_task_manager.py](tests/test_task_manager.py)
+- [tests/test_app_endpoints.py](../tests/test_app_endpoints.py)
+- [tests/test_session_manager.py](../tests/test_session_manager.py)
+- [tests/test_task_manager.py](../tests/test_task_manager.py)
 
 Good for:
 
@@ -79,8 +79,8 @@ Purpose:
 
 Main files:
 
-- [tests/evals/nl2dsl_cases.yaml](tests/evals/nl2dsl_cases.yaml)
-- [tests/test_end_to_end_evals.py](tests/test_end_to_end_evals.py)
+- [tests/evals/nl2dsl_cases.yaml](../tests/evals/nl2dsl_cases.yaml)
+- [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
 
 This harness is intentionally closer to “golden cases” than pure unit testing.
 
@@ -110,7 +110,7 @@ cases:
         filters: []
         turn_type: new_query
     steps:
-      - text: 对比 purchase
+      - text: Compare with purchase
         project_id: 55
         extraction:
           event_extractions: ["purchase"]
@@ -182,10 +182,10 @@ This is especially useful for turn-based systems, where the correctness lives in
 
 Examples:
 
-- “不是这个 event，换成支付成功”
-- “还是按国家看吧”
-- “和昨天比一下”
-- “继续看 UV”
+- "Not this event; change it to payment success"
+- "Use country breakdown instead"
+- "Compare with yesterday"
+- "Continue with UV"
 
 ### 2. Memory Cases
 

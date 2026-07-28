@@ -1,3 +1,8 @@
+# 架构图
+
+[English](architecture.md) | [简体中文](architecture.zh-CN.md)
+
+```mermaid
 graph TB
     subgraph Client["Client Layer"]
         TGUser["Telegram User"]
@@ -122,3 +127,4 @@ graph TB
     FastAPI -->|result JSON| TGGw
     TGGw -->|sendMessage| TgAPI
     TgAPI -->|查询结果| TGUser
+```

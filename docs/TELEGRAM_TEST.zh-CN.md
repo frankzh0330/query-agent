@@ -1,5 +1,7 @@
 # Telegram 测试说明
 
+[English](TELEGRAM_TEST.md) | [简体中文](TELEGRAM_TEST.zh-CN.md)
+
 ## 启动服务
 
 ### 1. 设置环境变量

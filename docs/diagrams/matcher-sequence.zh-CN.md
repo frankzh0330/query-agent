@@ -1,3 +1,8 @@
+# Matcher 时序图
+
+[English](matcher-sequence.md) | [简体中文](matcher-sequence.zh-CN.md)
+
+```mermaid
 %%{init: {'theme': 'default', 'themeVariables': {'fontSize': '20px', 'actorFontSize': '22px', 'participantFontSize': '20px', 'noteFontSize': '18px', 'sequenceNumberFontSize': '18px', 'messageFontSize': '20px'}}}%%
 sequenceDiagram
     participant API as FastAPI /nl2dsl
@@ -133,3 +138,4 @@ sequenceDiagram
     API->>API: Build resolver_explain dict with all matching details
     API->>API: Send Telegram progress notification to user
     end
+```

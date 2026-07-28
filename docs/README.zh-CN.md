@@ -1,6 +1,6 @@
 # Query Agent
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](../README.md) | [简体中文](README.zh-CN.md)
 
 `query-agent` 是一个面向数据查询场景的 NL2DSL Agent。它接收自然语言问题，解析出 `event / metric / time / region / group_by`，构建语义 DSL，渲染为可执行 DSL，并支持多轮会话、确认流、项目记忆、用户偏好重排和异步记忆学习。
 
@@ -268,8 +268,8 @@ query-agent/
 
 end-to-end eval 位于：
 
-- [tests/evals/nl2dsl_cases.yaml](tests/evals/nl2dsl_cases.yaml)
-- [tests/test_end_to_end_evals.py](tests/test_end_to_end_evals.py)
+- [tests/evals/nl2dsl_cases.yaml](../tests/evals/nl2dsl_cases.yaml)
+- [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
 
 目前已经覆盖：
 
@@ -287,17 +287,23 @@ end-to-end eval 位于：
 
 ## 文档导航
 
+- [README.md](README.md): docs 目录索引
 - [ARCHITECTURE.md](ARCHITECTURE.md): 英文架构说明
 - [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md): 当前真实架构、模块职责、依赖方向
 - [EVALUATION.md](EVALUATION.md): eval harness、golden cases、回归策略
 - [EVALUATION.zh-CN.md](EVALUATION.zh-CN.md): 中文评估说明
 - [MEMORY.md](MEMORY.md): session/project/user memory 设计
 - [MEMORY.zh-CN.md](MEMORY.zh-CN.md): 中文 memory 设计说明
-- [current-architecture.md](current-architecture.md): 更偏目标态/演进态的设计稿
 - [diagrams/architecture.md](diagrams/architecture.md): Mermaid 架构图
+- [diagrams/architecture.zh-CN.md](diagrams/architecture.zh-CN.md): 中文 Mermaid 架构图
 - [diagrams/sequence.md](diagrams/sequence.md): 时序图
+- [diagrams/sequence.zh-CN.md](diagrams/sequence.zh-CN.md): 中文时序图
 - [diagrams/flowchart.md](diagrams/flowchart.md): 总体流程图
+- [diagrams/flowchart.zh-CN.md](diagrams/flowchart.zh-CN.md): 中文总体流程图
+- [diagrams/matcher-sequence.md](diagrams/matcher-sequence.md): matcher 时序细节
+- [diagrams/matcher-sequence.zh-CN.md](diagrams/matcher-sequence.zh-CN.md): 中文 matcher 时序细节
 - [TELEGRAM_TEST.md](TELEGRAM_TEST.md): Telegram 相关测试说明
+- [TELEGRAM_TEST.zh-CN.md](TELEGRAM_TEST.zh-CN.md): 中文 Telegram 测试说明
 
 ## 当前状态
 

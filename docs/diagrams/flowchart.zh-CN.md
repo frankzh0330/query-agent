@@ -1,3 +1,8 @@
+# 端到端流程图
+
+[English](flowchart.md) | [简体中文](flowchart.zh-CN.md)
+
+```mermaid
 flowchart TD
     Start(("User sends query message")) --> Channel{"Channel?"}
 
@@ -88,3 +93,4 @@ flowchart TD
 
     CallerCheck -->|HTTP| ReturnHTTP["Return NL2DSLResponse<br/>extraction_json, semantic,<br/>exec_dsl, explain, session_id"]
     ReturnHTTP --> Stop3(("End"))
+```

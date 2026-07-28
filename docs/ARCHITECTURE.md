@@ -1,6 +1,6 @@
 # Architecture Overview
 
-[English](ARCHITECTURE.md) | [简体中文](ARCHITECTURE.zh-CN.md)
+[English](ARCHITECTURE.md) | [Chinese](ARCHITECTURE.zh-CN.md)
 
 This document summarizes the current architecture of `query-agent`, the responsibility of each major module, and the intended dependency direction between layers.
 
@@ -105,7 +105,7 @@ flowchart TD
 
 ### Layer 1: LLM Extraction
 
-Owned by [service/llm_extractions.py](service/llm_extractions.py).
+Owned by [service/llm_extractions.py](../service/llm_extractions.py).
 
 Responsibilities:
 
@@ -126,7 +126,7 @@ Output:
 
 ### Layer 2: Matcher Resolution
 
-Owned by [matcher/matcher_service.py](matcher/matcher_service.py) and concrete matchers.
+Owned by [matcher/matcher_service.py](../matcher/matcher_service.py) and concrete matchers.
 
 Responsibilities:
 
@@ -141,7 +141,7 @@ Important detail:
 
 ### Layer 3: Semantic DSL
 
-Owned by [dsl/semantic_models.py](dsl/semantic_models.py).
+Owned by [dsl/semantic_models.py](../dsl/semantic_models.py).
 
 Responsibilities:
 
@@ -150,7 +150,7 @@ Responsibilities:
 
 ### Layer 4: Exec DSL
 
-Owned by [dsl/renderer.py](dsl/renderer.py) and [dsl/validators.py](dsl/validators.py).
+Owned by [dsl/renderer.py](../dsl/renderer.py) and [dsl/validators.py](../dsl/validators.py).
 
 Responsibilities:
 
@@ -163,13 +163,13 @@ Turn-based behavior is a first-class part of the architecture, not a prompt tric
 
 ### Core Building Blocks
 
-- [service/session_models.py](service/session_models.py)
+- [service/session_models.py](../service/session_models.py)
   - `QueryState`
   - `SessionContext`
   - `TaskContext`
-- [service/followup_resolver.py](service/followup_resolver.py)
-- [service/query_state_merger.py](service/query_state_merger.py)
-- [service/task_manager.py](service/task_manager.py)
+- [service/followup_resolver.py](../service/followup_resolver.py)
+- [service/query_state_merger.py](../service/query_state_merger.py)
+- [service/task_manager.py](../service/task_manager.py)
 
 ### Turn Modes
 
@@ -196,11 +196,11 @@ flowchart TD
 This supports queries like:
 
 ```text
-Q1: 德国 app_launch 的 PV
-Q2: 昨天
-Q3: 改成 UV
-Q4: 再按渠道拆一下
-Q5: 那美国呢
+Q1: Show PV for app_launch in Germany
+Q2: Yesterday
+Q3: Change it to UV
+Q4: Break it down by channel
+Q5: What about the US?
 ```
 
 without forcing the user to restate all fields on every turn.
@@ -213,8 +213,8 @@ The project now effectively has three memory layers.
 
 Owned by:
 
-- [service/session_manager.py](service/session_manager.py)
-- [service/session_models.py](service/session_models.py)
+- [service/session_manager.py](../service/session_manager.py)
+- [service/session_models.py](../service/session_models.py)
 
 Stores:
 
@@ -231,7 +231,7 @@ Purpose:
 
 ### 2. Project Memory
 
-Owned by [memory/long_term_memory.py](memory/long_term_memory.py).
+Owned by [memory/long_term_memory.py](../memory/long_term_memory.py).
 
 Stores:
 
@@ -248,7 +248,7 @@ Important detail:
 
 ### 3. User Preference Signal
 
-Owned by [memory/user_preference_store.py](memory/user_preference_store.py).
+Owned by [memory/user_preference_store.py](../memory/user_preference_store.py).
 
 Stores:
 
@@ -294,7 +294,7 @@ This allows:
 
 ## Async Memory Learning
 
-Owned by [memory/memory_writer.py](memory/memory_writer.py).
+Owned by [memory/memory_writer.py](../memory/memory_writer.py).
 
 Responsibilities:
 
@@ -342,6 +342,151 @@ Responsibilities:
 
 These components let the agent run as more than a plain HTTP API.
 
+## Architecture Scenarios
+
+The following scenarios are useful when validating the architecture end to end.
+They are intentionally written as behavior-level examples rather than unit-test
+details.
+
+### Scenario 1: First Query
+
+```json
+POST /nl2dsl
+{
+  "text": "Show PV for app_launch in Germany",
+  "project_id": 55
+}
+```
+
+Expected behavior:
+
+- creates or restores a session
+- runs the full `new_query` path
+- resolves event, metric, time, and region
+- returns `status=success`
+- persists `last_query_state` for later turns
+
+### Scenario 2: Follow-Up Patch
+
+```json
+POST /nl2dsl
+{
+  "text": "Change it to UV",
+  "project_id": 55,
+  "session_id": "abc-123"
+}
+```
+
+Expected behavior:
+
+- detects `followup_patch`
+- keeps inherited fields such as event and region
+- applies only the metric patch
+- records field sources as `explicit` or `inherited`
+
+### Scenario 3: Time-Only Follow-Up
+
+```text
+Q1: Show PV for app_launch in Germany
+Q2: Yesterday
+```
+
+Expected behavior:
+
+- keeps `event=app_launch`
+- keeps `metric=pv`
+- keeps the previous region
+- changes only the time range
+
+This is the canonical reason `last_query_state` must be structured instead of a
+plain text chat summary.
+
+### Scenario 4: Confirmation Flow
+
+```json
+POST /nl2dsl
+{
+  "text": "Show startup success",
+  "project_id": 55
+}
+```
+
+If event resolution is ambiguous, the system should return:
+
+```json
+{
+  "status": "needs_confirmation",
+  "task_id": "xxx",
+  "candidates": {
+    "event": [
+      { "value": "app_launch", "score": 72.0 },
+      { "value": "app_cold_start_success", "score": 69.0 }
+    ]
+  }
+}
+```
+
+Then a reply such as:
+
+```json
+POST /nl2dsl
+{
+  "text": "1",
+  "session_id": "abc-123"
+}
+```
+
+should restore the pending task, apply the confirmed candidate, continue DSL
+generation, and clear `pending_task_id`.
+
+### Scenario 5: Project Memory Injection
+
+```text
+Project memory:
+In project_55, activation means activation_success by default.
+
+User query:
+Show activation PV yesterday
+```
+
+Expected behavior:
+
+- loads only memory scoped to `_global` and `project_55`
+- selects relevant project memory snippets
+- injects those snippets before LLM extraction
+- keeps this rule separate from user preference
+
+### Scenario 6: User Preference Rerank
+
+```text
+User history:
+user_a often selects payment_submit in project_55.
+
+Current query:
+Show payment event PV.
+```
+
+Expected behavior:
+
+- matcher recall still produces the candidate set
+- user preference applies only after recall
+- preference can nudge `payment_submit` upward
+- preference must not override a stronger explicit semantic match
+
+### Scenario 7: Restart Recovery
+
+```text
+Turn 1: ambiguous query returns needs_confirmation
+Process restarts
+Turn 2: user replies "1"
+```
+
+Expected behavior:
+
+- session storage restores `pending_task_id`
+- task storage restores the unresolved confirmation task
+- the confirmation reply completes the query instead of starting a new query
+
 ## Validation and Debugging
 
 The system exposes rich explain/debug information:
@@ -364,8 +509,8 @@ The project uses both regular tests and data-driven end-to-end evals.
 
 Owned by:
 
-- [tests/evals/nl2dsl_cases.yaml](tests/evals/nl2dsl_cases.yaml)
-- [tests/test_end_to_end_evals.py](tests/test_end_to_end_evals.py)
+- [tests/evals/nl2dsl_cases.yaml](../tests/evals/nl2dsl_cases.yaml)
+- [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
 
 Current coverage includes:
 
@@ -392,3 +537,62 @@ This matters because real deployments may have:
 - tens of thousands of events
 - multiple dimensions/properties per event
 - project-specific vocabularies and constraints
+
+## Evolution Roadmap
+
+A previous architecture draft mixed current behavior with a future optimization
+plan. The useful direction from that draft is preserved here as a roadmap, while
+this document remains the source of truth for the current system.
+
+### User History Layer
+
+A future production version can add a dedicated `UserHistoryService` around:
+
+- query history
+- user aliases
+- user preferences
+- user patterns
+
+The intended storage split is:
+
+- PostgreSQL for durable query history, user aliases, and preference records
+- Redis for hot user context and preference caches
+- optional vector database for semantic memory retrieval, few-shot selection, and ambiguous-rule recall
+
+### Where User Context Should Apply
+
+User history should not replace the resolver. It should apply at controlled
+points:
+
+- before LLM extraction: inject selected aliases, defaults, and personalized few-shot examples
+- after matcher recall: apply weak rerank bias from user patterns
+- after successful queries: save history asynchronously and update aggregated patterns
+
+### Future Data Models
+
+The likely future model set is:
+
+- `UserPreferences`: default metric, region, event, or time range
+- `UserAlias`: user-defined phrases mapped to canonical events, metrics, or dimensions
+- `UserPattern`: aggregated top events, metrics, regions, dimensions, and query frequency
+- `QueryHistory`: successful and failed query traces for replay, learning, and evaluation
+
+### Important Constraint
+
+Personalization should stay bounded by explicit scope:
+
+```text
+project_id + user_id
+```
+
+The priority order should remain:
+
+```text
+explicit user input
+  > session state
+  > project memory
+  > user history / preference signals
+```
+
+This prevents historical behavior from silently overriding a clearer current
+query or a project-level business rule.

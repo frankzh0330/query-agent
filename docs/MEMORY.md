@@ -1,6 +1,6 @@
 # Memory Architecture
 
-[English](MEMORY.md) | [简体中文](MEMORY.zh-CN.md)
+[English](MEMORY.md) | [Chinese](MEMORY.zh-CN.md)
 
 This document explains the memory design in `query-agent`, why the project needs more than one kind of memory, and how the current implementation maps to that model.
 
@@ -42,18 +42,18 @@ Session memory stores the short-lived state of the current conversation:
 
 ### Where It Lives
 
-- [service/session_models.py](service/session_models.py)
-- [service/session_manager.py](service/session_manager.py)
-- [service/task_manager.py](service/task_manager.py)
+- [service/session_models.py](../service/session_models.py)
+- [service/session_manager.py](../service/session_manager.py)
+- [service/task_manager.py](../service/task_manager.py)
 
 ### Why It Exists
 
 It solves turn-based continuity:
 
 ```text
-Q1: 德国 app_launch 的 PV
-Q2: 昨天
-Q3: 改成 UV
+Q1: Show PV for app_launch in Germany
+Q2: Yesterday
+Q3: Change it to UV
 ```
 
 Without session memory, the agent would have to re-infer all fields every turn.
@@ -79,13 +79,13 @@ Project memory stores project-scoped business knowledge:
 
 Examples:
 
-- “在 project_55 中，激活默认映射 activation_success”
-- “这个项目里 country 应优先映射 profile.country”
-- “某类查询默认排除 internal traffic”
+- "In project_55, activation should map to activation_success by default"
+- "In this project, country should prefer profile.country"
+- "Some query types should exclude internal traffic by default"
 
 ### Where It Lives
 
-- [memory/long_term_memory.py](memory/long_term_memory.py)
+- [memory/long_term_memory.py](../memory/long_term_memory.py)
 - runtime files under `data/memory/project_{id}/`
 
 ### Why It Exists
@@ -140,7 +140,7 @@ Examples:
 
 ### Where It Lives
 
-- [memory/user_preference_store.py](memory/user_preference_store.py)
+- [memory/user_preference_store.py](../memory/user_preference_store.py)
 - runtime files under `data/user_preferences/`
 
 ### Why It Exists
@@ -181,7 +181,7 @@ Consider:
 
 ```text
 User history: often checks payment_success
-Current query: 看注册完成
+Current query: Show registration completion
 ```
 
 If preference is too strong, the system may drift toward payment-related events.
@@ -202,7 +202,7 @@ Bad use:
 Consider this rule:
 
 ```text
-在 project_55 中，“激活”默认指 activation_success
+In project_55, activation should mean activation_success by default
 ```
 
 This is not:
@@ -266,6 +266,8 @@ Not fully implemented yet:
 
 - richer `UserAlias`
 - richer `UserPattern`
+- richer `UserPreferences`
+- durable `QueryHistory`
 - explicit category-aware memory retrieval (`constraint > correction > preference`)
 - cross-session user memory beyond simple preference counts
 
@@ -309,6 +311,29 @@ So “AI retrieval/summarization is unnecessary” is only true for short-term s
 ## Recommended Next Steps
 
 1. Add category-aware project memory retrieval
-2. Introduce `UserAlias` and `UserPattern` separately from raw counts
-3. Expand eval cases for project memory and user preference behavior
-4. Add conflict-resolution policy when project memory and user preference disagree
+2. Introduce `UserAlias`, `UserPattern`, and `UserPreferences` separately from raw counts
+3. Add durable `QueryHistory` for replay, pattern aggregation, and failure analysis
+4. Consider a hybrid Markdown + embedding index for long-term project memory retrieval
+5. Expand eval cases for project memory and user preference behavior
+6. Add conflict-resolution policy when project memory and user preference disagree
+
+## User Memory Evolution
+
+The future user memory layer should be more structured than today's lightweight
+usage counters.
+
+Recommended split:
+
+- `UserAlias`: explicit or learned aliases such as “startup” -> `app_launch`
+- `UserPattern`: aggregated top events, metrics, dimensions, regions, and query frequency
+- `UserPreferences`: stable defaults such as preferred metric, region, or time range
+- `QueryHistory`: durable query traces for replay, evaluation, and pattern learning
+
+Recommended storage:
+
+- PostgreSQL for durable user records and query history
+- Redis for hot per-user/project context
+- optional vector database for semantic recall over long-term memory and examples
+
+Even with these additions, user memory should remain weaker than explicit input,
+session state, and project memory.
