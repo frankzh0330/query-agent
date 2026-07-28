@@ -295,13 +295,9 @@ Run:
 - [MEMORY.md](docs/MEMORY.md): session/project/user memory design
 - [MEMORY.zh-CN.md](docs/MEMORY.zh-CN.md): Chinese memory design document
 - [docs/diagrams/architecture.md](docs/diagrams/architecture.md): Mermaid architecture diagrams
-- [docs/diagrams/architecture.zh-CN.md](docs/diagrams/architecture.zh-CN.md): Chinese Mermaid architecture diagrams
 - [docs/diagrams/sequence.md](docs/diagrams/sequence.md): sequence diagrams
-- [docs/diagrams/sequence.zh-CN.md](docs/diagrams/sequence.zh-CN.md): Chinese sequence diagrams
 - [docs/diagrams/flowchart.md](docs/diagrams/flowchart.md): high-level flowcharts
-- [docs/diagrams/flowchart.zh-CN.md](docs/diagrams/flowchart.zh-CN.md): Chinese high-level flowcharts
 - [docs/diagrams/matcher-sequence.md](docs/diagrams/matcher-sequence.md): matcher sequence details
-- [docs/diagrams/matcher-sequence.zh-CN.md](docs/diagrams/matcher-sequence.zh-CN.md): Chinese matcher sequence details
 - [TELEGRAM_TEST.md](docs/TELEGRAM_TEST.md): Telegram testing notes
 - [TELEGRAM_TEST.zh-CN.md](docs/TELEGRAM_TEST.zh-CN.md): Chinese Telegram testing notes
 

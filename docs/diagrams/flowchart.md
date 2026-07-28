@@ -1,7 +1,5 @@
 # End-To-End Flowchart
 
-[English](flowchart.md) | [Chinese](flowchart.zh-CN.md)
-
 ```mermaid
 flowchart TD
     Start(("User sends query")) --> Channel{"Channel?"}

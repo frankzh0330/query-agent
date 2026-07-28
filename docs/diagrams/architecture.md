@@ -1,7 +1,5 @@
 # Architecture Diagram
 
-[English](architecture.md) | [Chinese](architecture.zh-CN.md)
-
 ```mermaid
 graph TB
     subgraph Client["Client Layer"]

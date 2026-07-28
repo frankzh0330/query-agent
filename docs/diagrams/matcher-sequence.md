@@ -1,7 +1,5 @@
 # Matcher Sequence
 
-[English](matcher-sequence.md) | [Chinese](matcher-sequence.zh-CN.md)
-
 ```mermaid
 sequenceDiagram
     participant API as FastAPI /nl2dsl

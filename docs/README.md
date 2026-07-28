@@ -21,10 +21,6 @@ This folder collects the project documentation that used to live at the reposito
 ## Diagrams
 
 - [diagrams/architecture.md](diagrams/architecture.md): Mermaid architecture diagrams
-- [diagrams/architecture.zh-CN.md](diagrams/architecture.zh-CN.md): Chinese Mermaid architecture diagrams
 - [diagrams/sequence.md](diagrams/sequence.md): sequence diagrams
-- [diagrams/sequence.zh-CN.md](diagrams/sequence.zh-CN.md): Chinese sequence diagrams
 - [diagrams/flowchart.md](diagrams/flowchart.md): high-level flowchart
-- [diagrams/flowchart.zh-CN.md](diagrams/flowchart.zh-CN.md): Chinese high-level flowchart
 - [diagrams/matcher-sequence.md](diagrams/matcher-sequence.md): matcher sequence details
-- [diagrams/matcher-sequence.zh-CN.md](diagrams/matcher-sequence.zh-CN.md): Chinese matcher sequence details

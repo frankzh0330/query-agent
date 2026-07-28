@@ -295,13 +295,9 @@ end-to-end eval 位于：
 - [MEMORY.md](MEMORY.md): session/project/user memory 设计
 - [MEMORY.zh-CN.md](MEMORY.zh-CN.md): 中文 memory 设计说明
 - [diagrams/architecture.md](diagrams/architecture.md): Mermaid 架构图
-- [diagrams/architecture.zh-CN.md](diagrams/architecture.zh-CN.md): 中文 Mermaid 架构图
 - [diagrams/sequence.md](diagrams/sequence.md): 时序图
-- [diagrams/sequence.zh-CN.md](diagrams/sequence.zh-CN.md): 中文时序图
 - [diagrams/flowchart.md](diagrams/flowchart.md): 总体流程图
-- [diagrams/flowchart.zh-CN.md](diagrams/flowchart.zh-CN.md): 中文总体流程图
 - [diagrams/matcher-sequence.md](diagrams/matcher-sequence.md): matcher 时序细节
-- [diagrams/matcher-sequence.zh-CN.md](diagrams/matcher-sequence.zh-CN.md): 中文 matcher 时序细节
 - [TELEGRAM_TEST.md](TELEGRAM_TEST.md): Telegram 相关测试说明
 - [TELEGRAM_TEST.zh-CN.md](TELEGRAM_TEST.zh-CN.md): 中文 Telegram 测试说明
 

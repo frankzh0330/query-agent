@@ -1,7 +1,5 @@
 # Runtime Sequence
 
-[English](sequence.md) | [Chinese](sequence.zh-CN.md)
-
 ```mermaid
 sequenceDiagram
     actor User
