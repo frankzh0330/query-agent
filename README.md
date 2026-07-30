@@ -2,6 +2,8 @@
 
 [English](README.md) | [Chinese](docs/README.zh-CN.md)
 
+Formatted documentation: [query-agent.mintlify.app](https://query-agent.mintlify.app/)
+
 `query-agent` is a data-query-oriented NL2DSL agent. It accepts natural language questions, extracts `event / metric / time / region / group_by`, builds a canonical semantic DSL, renders an executable DSL, and supports multi-turn sessions, confirmation flows, project memory, user preference reranking, and asynchronous memory learning.
 
 The project is no longer a single-turn `NL -> DSL` demo. It is evolving into a controlled data agent with:
@@ -287,6 +289,7 @@ Run:
 
 ## Docs Map
 
+- [Formatted Docs](https://query-agent.mintlify.app/): hosted Mintlify documentation
 - [docs/README.md](docs/README.md): documentation index
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md): current architecture, module ownership, and dependency direction
 - [ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md): Chinese architecture document
