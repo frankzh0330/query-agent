@@ -252,7 +252,7 @@ When adding a new eval case:
 1. Prefer YAML when the new behavior is mostly a scenario, not a new algorithm.
 2. Add unit tests as well if you introduce new pure logic.
 3. Keep the expected assertion focused on stable fields.
-4. Avoid asserting full `exec_dsl` strings unless necessary.
+4. Avoid asserting full SQL strings unless necessary.
 5. Prefer semantic assertions over surface formatting assertions.
 
 ## Long-Term Direction

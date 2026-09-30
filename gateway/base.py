@@ -36,6 +36,6 @@ class BaseGateway(ABC):
         """发送响应"""
         pass
 
-    def format_response(self, nl2dsl_result: Dict, query_result: Any = None) -> str:
+    def format_response(self, nl2sql_result: Dict) -> str:
         """格式化响应文本（子类可覆盖以适配不同渠道）"""
-        return str(nl2dsl_result)
+        return str(nl2sql_result)

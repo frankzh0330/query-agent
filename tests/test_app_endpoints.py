@@ -73,7 +73,7 @@ def _high_confidence_service() -> MatcherService:
         metric_matcher=FakeMatcher({
             "销售额": _mr("revenue", 100.0),
             "订单量": _mr("order_count", 100.0),
-            "客单价": _mr("avg_order_amount", 100.0),
+            "客单价": _mr("avg_order_value", 100.0),
         }),
         column_matcher=_fake_column_matcher(),
     )

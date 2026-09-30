@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 class AgentWorker:
     """
-    Agent Worker：从请求队列取出消息 → 执行 nl2dsl + execute_query → 返回结果。
+    Agent Worker：从请求队列取出消息 → 执行 NL2SQL（生成并静态校验 SQL）→ 返回结果。
 
     设计要点：
     - 同步的 extract_llm() 通过 asyncio.to_thread() 包装，避免阻塞事件循环
@@ -45,7 +45,7 @@ class AgentWorker:
         result = await orchestrator.process(req, service, service.schema, notify_fn=_send_telegram_notification)
         logger.debug("Worker nl2sql done: status=%s, session=%s", result.get("status"), result.get("session_id"))
 
-        # early_exit / needs_confirmation 场景：无 SQL 可执行，直接返回
+        # early_exit / needs_confirmation 场景：无 SQL 产出，直接返回
         if result.get("status") != "success":
             return {
                 "nl2sql": result,

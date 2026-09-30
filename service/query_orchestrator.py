@@ -73,7 +73,7 @@ class QueryOrchestrator:
         """主入口：路由到三条处理路径
 
         Args:
-            req: NL2DSLRequest
+            req: NL2SQLRequest
             service: MatcherService
             catalog: 兼容参数（SQL 版 schema 挂在 service.schema 上）
             notify_fn: async callable(chat_id, message) for Telegram notifications

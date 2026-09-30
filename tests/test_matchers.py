@@ -273,7 +273,7 @@ class TestSchemaLoader:
 
     def test_joins_loaded(self, schema):
         # YAML 1.1 会把裸 on 解析为布尔，condition key 必须可用
-        assert len(schema.joins) == 2
+        assert len(schema.joins) == 5
         assert schema.joins[0]["condition"] == "orders.user_id = users.id"
 
     def test_metrics_expr(self, schema):
@@ -291,3 +291,27 @@ class TestSchemaLoader:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestEnumNormalization:
+    """schema enum_values：过滤值的确定性规范化"""
+
+    @pytest.fixture
+    def schema(self):
+        return load_sql_schema("catalog")
+
+    @pytest.mark.parametrize("raw,expected,method", [
+        ("credit_card", "credit_card", "exact"),
+        ("credit card", "credit_card", "normalized"),
+        ("Credit-Card", "credit_card", "normalized"),
+        ("Gold", "gold", "normalized"),
+        ("cancelled", "canceled", "fuzzy"),
+        ("vip", "vip", "unmatched"),
+    ])
+    def test_normalize(self, schema, raw, expected, method):
+        col = "users.vip_level" if raw in ("Gold", "vip") else (
+            "orders.status" if raw == "cancelled" else "payments.payment_type")
+        assert schema.normalize_enum_value(col, raw) == (expected, method)
+
+    def test_non_enum_column_untouched(self, schema):
+        assert schema.normalize_enum_value("orders.amount", "100") == ("100", "not_enum")

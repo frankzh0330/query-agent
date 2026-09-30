@@ -449,7 +449,7 @@ POST /nl2sql
 }
 ```
 
-should restore the pending task, apply the confirmed candidate, continue DSL
+should restore the pending task, apply the confirmed candidate, continue SQL
 generation, and clear `pending_task_id`.
 
 ### Scenario 5: Project Memory Injection

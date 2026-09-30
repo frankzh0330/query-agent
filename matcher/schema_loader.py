@@ -33,6 +33,36 @@ class SQLSchema:
     metric_alias_lookup: Dict[str, str] = field(default_factory=dict)
     join_graph: Dict[str, List[Dict]] = field(default_factory=dict)  # table -> [{peer, condition}]
 
+    def normalize_enum_value(self, qualified_column: str, value):
+        """把自然语言取值规范化为列声明的枚举值（确定性，不依赖 LLM）
+
+        返回 (value, method)：
+          method = "not_enum"   列未声明 enum_values，原样返回
+                 = "exact"      已是规范值
+                 = "normalized" 大小写/空格/连字符差异（"Credit Card" -> "credit_card"）
+                 = "fuzzy"      近似匹配（RapidFuzz >= 90）
+                 = "unmatched"  没有对应枚举值，原样返回（调用方可据此告警）
+        """
+        enums = (self.columns.get(qualified_column) or {}).get("enum_values") or []
+        if not enums or not isinstance(value, str):
+            return value, "not_enum"
+        if value in enums:
+            return value, "exact"
+
+        def _key(v: str) -> str:
+            return "".join(ch for ch in v.lower() if ch.isalnum())
+
+        by_key = {_key(e): e for e in enums}
+        k = _key(value)
+        if k in by_key:
+            return by_key[k], "normalized"
+        from rapidfuzz import fuzz, process
+
+        best = process.extractOne(k, list(by_key.keys()), scorer=fuzz.ratio)
+        if best and best[1] >= 90:
+            return by_key[best[0]], "fuzzy"
+        return value, "unmatched"
+
     def columns_of_table(self, table: str) -> Dict[str, Dict]:
         return self.tables.get(table, {}).get("columns", {})
 
@@ -101,6 +131,7 @@ def load_sql_schema(base_dir: str = "catalog") -> SQLSchema:
                 "table": t_name,
                 "column": c_name,
                 "type": c_info.get("type", "String"),
+                "enum_values": list(c_info.get("enum_values", []) or []),
                 "aliases": list(dict.fromkeys(aliases)),
             }
 
