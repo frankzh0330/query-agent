@@ -689,3 +689,59 @@ class TestWindowDemoteToOrder:
         gen_intent = gen_mock.call_args.args[1]
         assert gen_intent["order_by"]["limit"] == 5
         assert gen_intent["window"] is None
+
+
+# ==================== Tests: graceful failures ====================
+
+class TestGracefulFailures:
+
+    def test_sql_generation_failure_is_early_exit_not_500(self, client):
+        """校验/修复循环耗尽时返回可读的 early_exit，而不是抛 500"""
+        intent = SQLIntentJson(
+            metric_extractions=[Extraction(text="销售额")],
+            time_extractions=[Extraction(text="近7天")],
+        )
+        boom = mock.patch(
+            "service.query_orchestrator.generate_sql",
+            new_callable=mock.AsyncMock,
+            side_effect=ValueError("SQL validation failed after 3 rounds: missing_filter: x"),
+        )
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with boom:
+                resp = client.post("/nl2sql", json={"text": "近7天销售额", "project_id": 55})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "early_exit"
+        assert body["sql"] == ""
+        assert "missing_filter" in body["message"]
+        assert body["explain"]["sql_generation"]["generation_failed"]
+
+    def test_unresolved_filter_column_asks_instead_of_guessing(self, client):
+        """捏造的过滤列（user_type）不得被模糊匹配成某个真实列"""
+        from service.llm_extractions import FilterExtraction
+
+        intent = SQLIntentJson(
+            metric_extractions=[Extraction(text="销售额")],
+            filter_extractions=[FilterExtraction(text="新用户", column="user_type", op="=", value="new")],
+        )
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql() as gen:
+                resp = client.post("/nl2sql", json={"text": "新用户的销售额", "project_id": 55})
+
+        body = resp.json()
+        assert body["status"] == "early_exit"
+        assert "新用户" in body["message"]
+        gen.assert_not_called()
+
+
+    def test_extraction_parse_failure_is_early_exit_not_500(self, client):
+        """LLM 对寒暄回了非 JSON 文本 → extract 抛 ValueError，不应 500"""
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock,
+                        side_effect=ValueError("LLM SQLIntentJson 输出不合法: Expecting value")):
+            resp = client.post("/nl2sql", json={"text": "hello there", "project_id": 55})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "early_exit"
+        assert body["sql"] == ""

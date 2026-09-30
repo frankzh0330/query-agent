@@ -48,6 +48,7 @@ class FollowupPatchResult:
     resolver_explain: Dict[str, Any]
     patch_hints: Dict[str, Any]
     confirmation_needed: Optional[tuple[str, Any]] = None
+    unresolved_filters: Optional[list] = None
 
 
 # ==================== 编排器 ====================
@@ -96,7 +97,17 @@ class QueryOrchestrator:
         total_start = time.time()
 
         layer1_start = time.time()
-        extraction_json = await extract_llm_async(req.text, session_context=session_context)
+        try:
+            extraction_json = await extract_llm_async(req.text, session_context=session_context)
+        except ValueError as e:
+            # LLM 没返回合法 JSON（如对寒暄回了一段话）：不 500，返回可读提示
+            logger.warning("Layer1 extraction failed: %s", str(e)[:200])
+            self.session.add_message(ctx.session_id, "user", req.text, metadata={"error": "extraction_failed"})
+            return self._make_response(
+                extraction_json={}, status="early_exit", session_id=ctx.session_id,
+                message="没能从您的输入中识别出查询意图，请换个说法（例如：revenue by region last 7 days）",
+                explain={"extraction_error": str(e)[:200]},
+            )
         timing["layer1_llm_extraction_s"] = round(time.time() - layer1_start, 3)
         logger.debug("Layer1: user=%s, intent=%s", req.text,
                       json.dumps(extraction_json.model_dump(), ensure_ascii=False))
@@ -170,6 +181,10 @@ class QueryOrchestrator:
             service, [e.text for e in extraction_json.column_extractions], column_explain,
         )
         filters = self._resolve_filters(service, extraction_json.filter_extractions, column_explain)
+        if column_explain.get("filters_unresolved"):
+            return self._unresolved_filters_response(
+                req.text, extraction_json, ctx, column_explain["filters_unresolved"], {"columns": column_explain},
+            )
 
         # window / order 意图（含方向词的 window 文本降级走全局 TopN 解析）
         window = None
@@ -260,6 +275,9 @@ class QueryOrchestrator:
                 query_state, service, join_error, resolver_explain,
             )
 
+        if gen_explain.get("generation_failed"):
+            return self._generation_failed_response(req.text, extraction_json, ctx, gen_explain, resolver_explain)
+
         timing["total_s"] = round(time.time() - total_start, 3)
         resolver_explain["sql_generation"] = gen_explain
 
@@ -303,6 +321,11 @@ class QueryOrchestrator:
             project_id=req.project_id, user_id=ctx.user_id,
         )
 
+        if patch_result.unresolved_filters:
+            return self._unresolved_filters_response(
+                req.text, extraction_json, ctx, patch_result.unresolved_filters, patch_result.resolver_explain,
+            )
+
         if patch_result.confirmation_needed:
             field_name, resolved = patch_result.confirmation_needed
             return await self._create_followup_confirmation(
@@ -319,6 +342,10 @@ class QueryOrchestrator:
                 req, ctx, extraction_json, decision, prev_qs,
                 merged_state, service, join_error, patch_result.resolver_explain,
             )
+
+        if gen_explain.get("generation_failed"):
+            return self._generation_failed_response(
+                req.text, extraction_json, ctx, gen_explain, patch_result.resolver_explain)
 
         self.session.add_message(ctx.session_id, "user", req.text,
                                   metadata={"turn_mode": "followup_patch", "patch": patch_result.patch})
@@ -393,6 +420,9 @@ class QueryOrchestrator:
                 session_id=ctx.session_id, message=hint_msg,
                 task_id=task.task_id,
             )
+
+        if gen_explain.get("generation_failed"):
+            return self._generation_failed_response(task.raw_query, task.extraction, ctx, gen_explain)
 
         self.session.add_message(ctx.session_id, "user", task.raw_query)
         self.session.add_message(ctx.session_id, "user", user_input, metadata={"confirmed": task.user_selection})
@@ -564,11 +594,16 @@ class QueryOrchestrator:
             "order_by": order_by,
         }
 
-        sql, gen_explain = await generate_sql(
-            query_text, intent, service.to_schema_prompt(),
-            list(service.schema.tables.keys()),
-            analysis_context=build_analysis_context(service.schema),
-        )
+        try:
+            sql, gen_explain = await generate_sql(
+                query_text, intent, service.to_schema_prompt(),
+                list(service.schema.tables.keys()),
+                analysis_context=build_analysis_context(service.schema),
+            )
+        except ValueError as e:
+            # 校验/修复循环耗尽：不向上抛 500，交给调用方转成可读的失败响应
+            logger.warning("SQL generation failed: %s", e)
+            return "", {"generation_failed": str(e), "join_explain": join_explain}, None
         gen_explain["join_explain"] = join_explain
         return sql, gen_explain, None
 
@@ -663,23 +698,59 @@ class QueryOrchestrator:
         return resolved, entries
 
     def _resolve_filters(self, service, filter_extractions, explain_sink: dict) -> list[dict]:
-        """filter_extractions → 结构化 filters（column 走 matcher 解析）"""
+        """filter_extractions → 结构化 filters
+
+        - column 只接受高置信匹配（exact/fuzzy，score>=80）。低置信/无匹配不再取 recall top1
+          静默猜列（LLM 可能编造列，如 "user_type" 会被模糊匹配成 orders.user_id），
+          而是记入 explain_sink["filters_unresolved"]，由调用方向用户澄清。
+        - value 按列声明的 enum_values 规范化（"credit card" -> "credit_card"）。
+        """
         filters: list[dict] = []
         entries: list[dict] = []
+        unresolved: list[dict] = []
         for fe in filter_extractions:
             col_text = fe.column or fe.text
             r = service.resolve_with_candidates(MatcherType.COLUMN, [Extraction(text=col_text)])
-            qualified = r.value or (r.candidates[0]["value"] if r.candidates else None)
+            confident = bool(r.value) and not r.needs_confirmation and r.method in ("exact", "fuzzy")
+            qualified = r.value if confident else None
             entry = {"text": fe.text, "column_text": col_text, "column": qualified,
                      "op": fe.op, "value": fe.value}
-            if qualified and fe.value is not None:
-                filters.append({"column": qualified, "op": fe.op, "value": fe.value})
-            else:
+            if not confident:
                 entry["dropped"] = True
+                unresolved.append({
+                    "text": fe.text, "column_text": col_text,
+                    "candidates": [c["value"] for c in r.candidates[:3]],
+                })
+            elif fe.value is None:
+                entry["dropped"] = True
+            else:
+                value = fe.value
+                if fe.op in ("=", "!="):
+                    value, enum_method = service.schema.normalize_enum_value(qualified, value)
+                    if enum_method not in ("not_enum", "exact"):
+                        entry["value_normalized"] = {"from": fe.value, "to": value, "method": enum_method}
+                filters.append({"column": qualified, "op": fe.op, "value": value})
             entries.append(entry)
         if entries:
             explain_sink["filters"] = entries
+        if unresolved:
+            explain_sink["filters_unresolved"] = unresolved
         return filters
+
+    def _unresolved_filters_response(self, text, extraction_json, ctx, unresolved: list[dict], resolver_explain=None) -> dict:
+        """过滤列无法可靠解析 → 澄清（不静默猜列）。early_exit 通道，网关会把 message 回给用户。"""
+        parts = []
+        for u in unresolved:
+            hint = f"（相近的列: {', '.join(u['candidates'])}）" if u["candidates"] else ""
+            parts.append(f"'{u['text']}'{hint}")
+        msg = ("无法把以下过滤条件对应到已知的列，请换个说法或直接使用列名: "
+               + "; ".join(parts))
+        self.session.add_message(ctx.session_id, "user", text, metadata={"error": "unresolved_filter_column"})
+        return self._make_response(
+            extraction_json=extraction_json.model_dump(), status="early_exit",
+            session_id=ctx.session_id, message=msg,
+            explain={"resolver_explain": resolver_explain or {}, "filters_unresolved": unresolved},
+        )
 
     # ==================== Follow-up Patch ====================
 
@@ -787,6 +858,7 @@ class QueryOrchestrator:
         return FollowupPatchResult(
             patch=patch, resolver_explain=resolver_explain,
             patch_hints=decision.patch_hints, confirmation_needed=confirmation,
+            unresolved_filters=column_explain.get("filters_unresolved"),
         )
 
     # ==================== 状态组装 / 偏好 ====================
@@ -883,6 +955,16 @@ class QueryOrchestrator:
         lines = ["未能识别您的选择，请回复编号或名称:"]
         lines.append(self._format_candidates_message(candidates))
         return "\n".join(lines)
+
+    def _generation_failed_response(self, text, extraction_json, ctx, gen_explain: dict, resolver_explain=None) -> dict:
+        reason = gen_explain.get("generation_failed", "")
+        self.session.add_message(ctx.session_id, "user", text, metadata={"error": "sql_generation_failed"})
+        return self._make_response(
+            extraction_json=extraction_json.model_dump() if hasattr(extraction_json, "model_dump") else extraction_json,
+            status="early_exit", session_id=ctx.session_id,
+            message=f"无法生成通过校验的 SQL，请换个说法再试。原因: {reason}",
+            explain={"resolver_explain": resolver_explain or {}, "sql_generation": gen_explain},
+        )
 
     @staticmethod
     def _make_response(**kwargs) -> dict:
