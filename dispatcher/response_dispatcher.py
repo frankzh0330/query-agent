@@ -49,7 +49,7 @@ class ResponseDispatcher:
                 response_text = gateway.format_response(result.nl2sql_result)
                 await gateway.send_response(msg.chat_id, {"text": response_text})
             else:
-                error_msg = f"处理失败: {result.error or '未知错误'}"
+                error_msg = f"Failed to process: {result.error or 'unknown error'}"
                 await gateway.send_response(msg.chat_id, {"text": error_msg})
 
         except Exception as e:

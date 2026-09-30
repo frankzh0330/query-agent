@@ -39,14 +39,14 @@ Gateway
 
 ## 核心亮点
 
-- **确定性实体解析**：表/列/指标名由倒排索引 + RapidFuzz 对 schema 目录解析（带分数与候选），LLM 从不发明实体名
-- **确认流即护栏**：低置信实体（40-80 分）触发显式用户确认而非静默猜测；join 路径缺失同样升级确认
+- **确定性实体解析**：表/列/指标名由 IDF 加权倒排召回（判别性 token 主导）+ edit-distance typo 探测 + RapidFuzz 重排对 schema 目录解析（带分数与候选），LLM 从不发明实体名
+- **确认流即护栏**：低置信实体触发显式用户确认而非静默猜测——阈值按实体类型校准（metric 更严：auto-accept 90 分，因为指标错则数字全错），并列守卫在 top1/top2 分差 <10 时即使过线也进确认；join 路径缺失同样升级确认
 - **Join 由 schema 配置**：join 关系来自元数据，不由 LLM 猜测
 - **Turn-based 多轮**：`last_query_state` + follow-up 检测 + 字段级 patch merge（状态机，不是聊天回放）
 - **接地（grounded）的 SQL 生成**：生成 prompt 固定已解析的表/列/指标名、join 条件与时间谓词，LLM 只组装查询结构
 - **sqlglot 校验**：单条只读语句、表白名单、默认 LIMIT 注入，失败带错误信息修复重试（上限 2 轮）
 - **AST 后置分析**（`sql_ast_analyzer.py`）：列存在性（别名解析）、实体保真断言（已解析的表/指标表达式/过滤谓词必须出现在 SQL 中，对抗语义漂移）、join 边与 join 键与 schema 声明一致性、静态成本分析（est_rows 扫描量估算、事实表全表扫描检测）——分析错误同样回灌修复循环
-- **Cross-encoder 重排**（`reranker.py`，`RERANKER_ENABLED=true`）：歧义匹配（40-80 确认带或候选并列）时的受限 LLM 终选——只能从已有候选中选、不得发明新值；明确胜出（relevance≥85 且 margin≥15）则静默采纳，否则确认流照常但候选更优排序；生产可替换为本地 bge-reranker 模型
+- **Cross-encoder 重排**（`reranker.py`，`RERANKER_ENABLED=true`）：歧义匹配（确认带或候选并列）时的受限 LLM 终选——只能从已有候选中选、不得发明新值；明确胜出（relevance≥85 且 margin≥15）则静默采纳，否则确认流照常但候选更优排序；生产可替换为本地 bge-reranker 模型
 - 会话持久化（JSONL append-only，重启恢复）与待确认任务持久化（幂等确认）
 - 异步记忆学习：成功查询可回写纠正/偏好/约束记忆
 - 端到端 eval：新查询、follow-up、确认、记忆注入、重启恢复
@@ -75,7 +75,7 @@ Q2 继承了 Q1 的指标/时间/分组——每轮只抽取和合并变化的�
 ### 1. 分层生成
 
 - **Layer 1（LLM 抽取）** 只切分意图片段——从不给出表名或列名
-- **Layer 2（matcher）** 把片段解析为规范 `table` / `table.column` / `metric_id`（带分数）：≥ 80 直接用，40-80 触发确认，< 40 丢弃或回退。用户不提表名时从指标表达式或列归属投票推断主表
+- **Layer 2（matcher）** 把片段解析为规范 `table` / `table.column` / `metric_id`（带分数）：auto-accept 阈值按类型校准（metric 90 / table·column 80），确认带内触发用户确认，top1/top2 分差 <10 并列时即使过线也确认，< 40 丢弃或回退；召回为 IDF 加权（BM25-lite）并对零命中 token 做 edit-distance-1 探测；跨实体同名别名冲突绝不静默 first-wins——有基表上下文时按 join 距离消歧，否则进确认流。用户不提表名时从指标归属表或列归属投票推断主表
 - **Layer 3（SQL 生成）** 是一次"接地"的 LLM 调用：prompt 固定表名、列名、指标表达式、join 条件和时间谓词，LLM 只组装结构（GROUP BY / JOIN / 用 `LIMIT n BY` 做分组排名）
 - **校验**（sqlglot，`dialect="clickhouse"`）强制单条只读语句、表白名单、默认 LIMIT；失败带错误反馈修复
 

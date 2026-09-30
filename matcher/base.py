@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import zlib
 from collections import defaultdict
 from dataclasses import dataclass
@@ -35,6 +36,10 @@ DEFAULT_SYNONYM_MAP = {
 }
 
 TIME_LIKE_WORDS = {"今天", "昨天", "近7天", "最近7天", "过去7天"}
+
+# 召回增强配置
+_TYPO_MIN_TOKEN_LEN = 4   # 只对 ≥4 字符的零命中 token 做 edit-distance-1 探测
+_TYPO_WEIGHT = 0.75       # typo 探测命中的 token 权重折减
 
 
 # =========================
@@ -115,8 +120,10 @@ class BaseMatcher:
         self.id_to_doc: Dict[int, Dict[str, Any]] = {}
         self.name_to_id: Dict[str, int] = {}
 
-        # exact alias: normalized_alias -> id
+        # exact alias: normalized_alias -> id（首注册者）
         self.exact_alias_map: Dict[str, int] = {}
+        # exact 冲突：normalized_alias -> 所有命中该别名的 doc id（如 amount 在 orders/payments 两列）
+        self.exact_alias_collisions: Dict[str, List[int]] = {}
 
         # 倒排索引: token -> list[id]
         self.token_to_ids: Dict[str, List[int]] = {}
@@ -155,8 +162,14 @@ class BaseMatcher:
             if not norm_alias:
                 continue
 
-            # exact alias map
-            self.exact_alias_map.setdefault(norm_alias, doc_id)
+            # exact alias map（冲突别名单独记录，查询时暴露歧义而非静默 first-wins）
+            existing = self.exact_alias_map.get(norm_alias)
+            if existing is None:
+                self.exact_alias_map[norm_alias] = doc_id
+            elif existing != doc_id:
+                coll = self.exact_alias_collisions.setdefault(norm_alias, [existing])
+                if doc_id not in coll:
+                    coll.append(doc_id)
 
             # 保存 normalized aliases 用于 rerank
             self.id_to_norm_aliases[doc_id].append(norm_alias)
@@ -201,6 +214,23 @@ class BaseMatcher:
                 matched=None,
                 score=0.0,
                 explain={"method": "empty_query", "query": query},
+            )
+
+        # 0. exact 冲突优先：同一别名命中多个实体（如 amount / time / region）
+        collision_ids = self.exact_alias_collisions.get(norm_query)
+        if collision_ids:
+            return MatchResult(
+                matched=None,
+                score=100.0,
+                explain={
+                    "method": "exact_alias_collision",
+                    "query": query,
+                    "normalized_query": norm_query,
+                    "collision_candidates": [
+                        {"name": self._get_name_by_id(d), "score": 100.0}
+                        for d in collision_ids
+                    ],
+                },
             )
 
         # 1. exact alias 命中
@@ -300,9 +330,20 @@ class BaseMatcher:
     # =========================
 
     def _recall_candidates(self, expanded_tokens: List[str]) -> Tuple[List[int], Dict[str, Any]]:
-        """从倒排索引召回候选"""
-        hit_counts: Dict[int, int] = defaultdict(int)
+        """从倒排索引召回候选（IDF 加权 + typo 容忍）
+
+        与朴素命中计数的两点差异：
+        - IDF 加权（BM25-lite）：df 高的泛化 token（如 table/amount/id）降权，
+          判别性 token（如 freight）主导排序——多表时命中数打平，稀有 token 胜出
+        - typo 容忍：零命中且长度达标的 token 做 edit-distance-1 词表探测
+          （'orde tablez' -> order/table），权重打 75 折；模糊容忍不再只存在于重排段
+        """
+        hit_scores: Dict[int, float] = defaultdict(float)
+        raw_counts: Dict[int, int] = defaultdict(int)
         token_hits = []
+        typo_matched: Dict[str, str] = {}
+
+        n_docs = max(1, len(self.id_to_doc))
 
         for token in expanded_tokens:
             token = normalize(token)
@@ -310,34 +351,62 @@ class BaseMatcher:
                 continue
 
             ids = self.token_to_ids.get(token, [])
+            weight_factor = 1.0
+            if not ids and len(token) >= _TYPO_MIN_TOKEN_LEN:
+                probed = self._probe_typo_token(token)
+                if probed:
+                    typo_matched[token] = probed
+                    ids = self.token_to_ids.get(probed, [])
+                    weight_factor = _TYPO_WEIGHT
+
             token_hits.append((token, len(ids)))
+            if not ids:
+                continue
 
+            df = len(ids)
+            idf = math.log(1.0 + n_docs / (1.0 + df))
+            weight = idf * weight_factor
             for doc_id in ids:
-                hit_counts[doc_id] += 1
+                hit_scores[doc_id] += weight
+                raw_counts[doc_id] += 1
 
-        if not hit_counts:
+        if not hit_scores:
             return [], {
                 "token_hits": token_hits,
+                "typo_matched": typo_matched,
                 "candidate_count": 0,
                 "top_candidates": [],
             }
 
-        ranked = sorted(hit_counts.items(), key=lambda x: (-x[1], x[0]))
+        ranked = sorted(hit_scores.items(), key=lambda x: (-x[1], x[0]))
         candidate_ids = [doc_id for doc_id, _ in ranked[:self.max_candidates]]
 
         explain = {
             "token_hits": token_hits,
+            "typo_matched": typo_matched,
             "candidate_count": len(candidate_ids),
             "top_candidates": [
                 {
                     "id": doc_id,
                     "name": self._get_name_by_id(doc_id),
-                    "hit_count": cnt,
+                    "hit_count": raw_counts[doc_id],
+                    "score": round(score, 3),
                 }
-                for doc_id, cnt in ranked[:10]
+                for doc_id, score in ranked[:10]
             ],
         }
         return candidate_ids, explain
+
+    def _probe_typo_token(self, token: str) -> Optional[str]:
+        """零命中 token 的 edit-distance-1 词表探测（词表遍历，规模到万级词时换 deletes-1 索引）"""
+        from rapidfuzz.distance import Levenshtein
+
+        for vocab in sorted(self.token_to_ids):
+            if len(vocab) < _TYPO_MIN_TOKEN_LEN or abs(len(vocab) - len(token)) > 1:
+                continue
+            if Levenshtein.distance(token, vocab, score_cutoff=1) <= 1:
+                return vocab
+        return None
 
     def _rerank(self, query: str, candidate_ids: List[int]) -> Optional[Tuple[int, float, Dict[str, Any]]]:
         """RapidFuzz 重排"""

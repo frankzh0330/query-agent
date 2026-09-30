@@ -130,13 +130,15 @@ flowchart TD
 主要文件：[matcher/matcher_service.py](../matcher/matcher_service.py) 及具体 matcher
 （[table_matcher.py](../matcher/table_matcher.py)、[column_matcher.py](../matcher/column_matcher.py)、
 [sql_metric_matcher.py](../matcher/sql_metric_matcher.py)、[time_matcher.py](../matcher/time_matcher.py)），
-全部构建在 [matcher/base.py](../matcher/base.py)（倒排索引 + RapidFuzz + 同义词）之上，
+全部构建在 [matcher/base.py](../matcher/base.py)（IDF 加权倒排索引 + edit-distance typo 探测 + RapidFuzz 重排 + 同义词）之上，
 元数据来自 [matcher/schema_loader.py](../matcher/schema_loader.py)。
 
 职责：
 
 - 解析 `table / table.column / metric_id / time_range`，带分数与候选
-- 阈值策略（确定性，不依赖 LLM）：≥ 80 直接用，40-80 触发确认，< 40 丢弃/回退
+- 阈值策略（确定性，不依赖 LLM），按实体类型校准：metric ≥ 90 直接用（指标错则数字全错），table/column ≥ 80；确认带内触发用户确认，< 40 丢弃/回退；并列守卫在 top1/top2 分差 <10 时即使过线也进确认
+- 召回为 IDF 加权（BM25-lite）：命中数打平时判别性 token 胜过泛化 token（table/amount/id）；零命中且 ≥4 字符的 token 做 edit-distance-1 词表探测（'orde tablez' -> orders），权重 0.75 折
+- exact 别名冲突（同一别名挂多个实体，如 amount 在 orders/payments、time 在三张表）建索引时检测、查询时暴露：两路列冲突且有基表上下文时按 join 图距离确定性消歧（orders 语境下 region -> users.region）；3 路超泛化词或距离并列升级确认流并给出全部候选——绝不静默 first-wins
 - 用户不提表名时推断主表（从指标表达式或列归属投票）
 - 从声明式 `joins:` 配置推断 join 步骤；路径缺失升级为确认流
 
@@ -153,6 +155,8 @@ flowchart TD
 
 - 用已解析实体组装生成 prompt：主表、指标表达式、限定列、过滤条件、
   ClickHouse 时间谓词、join 条件、window/order 意图
+- window 意图兜底：L1 截断窗口短语时（如只抽到 "in each region"，"top 3" 留在原句），
+  用完整查询文本重试解析，确定性找回 limit 与分组（explain 记录 `recovered_from_full_text`）
 - LLM 只组装结构（GROUP BY / JOIN / `LIMIT n BY` 分组排名），实体名由 prompt 固定
 - 修复循环：校验失败的错误信息回灌下一轮（最多额外 2 轮）
 
@@ -532,6 +536,15 @@ Turn 2: 用户回复 "1"
 
 这套 harness 更接近“golden cases”，而不是单纯 unit test。
 
+pytest harness 对 LLM 抽取和 SQL 生成做了 mock，评测的是 matcher 解析、状态合并、确认流以及传给 SQL 生成的入参，离线几秒即可跑完。
+带 `xfail` 的 case 断言的是已知局限下的*正确行为*（strict，一旦修复会强制去掉标记）。
+
+### Live LLM Eval
+
+[scripts/live_eval.py](../scripts/live_eval.py) 用真实 LLM 重放同一批 case，输出每条 case 的通过情况、SQL 静态校验结果、
+解析出的指标表达式是否出现在 SQL 中，以及延迟。它测的是 mock 版测不到的部分（抽取和 SQL 质量）。
+LLM 输出每次会有波动，所以结果只是一次采样，不是稳定的准确率；"SQL 有效"也不等于"SQL 正确"。
+
 ## Schema 与 Metadata
 
 仓库里的 [catalog/sql_schema.yaml](../catalog/sql_schema.yaml) 是 demo/development 态输入
@@ -548,6 +561,45 @@ Turn 2: 用户回复 "1"
 - 数万级表和列
 - 每个列多个业务别名
 - 强项目语义和业务约束
+
+## 过滤值解析
+
+像 "paid by credit card" 这样的过滤条件要解析两部分：**列**（`payments.payment_type`）和**值**（`credit_card`）。
+LLM 只负责摘录用户原话，所以抽出来的值（`credit card`）和库里存的值往往不一致。
+这一步出错会得到"能通过静态校验，但查不到数据或查错数据"的 SQL，真实 LLM eval 里就暴露过（见 [Evaluation 策略](#evaluation-策略)）。
+
+### 本项目当前做法
+
+- **列**：[orchestrator](../service/query_orchestrator.py) 只接受高置信匹配（score >= 80）的过滤列。低置信或未匹配的列不再从召回列表里取 top1 去猜，
+  而是返回 `early_exit` 并列出相近的列，让用户换个说法。（此前被捏造出的 `user_type` 会被模糊匹配成 `orders.user_id`。）
+- **值**：列可以在 [catalog/sql_schema.yaml](../catalog/sql_schema.yaml) 中声明 `enum_values`。
+  `SQLSchema.normalize_enum_value()` 用确定性规则把抽出的值映射成声明值：精确匹配，其次忽略大小写/空格/连字符
+  （`Credit-Card` -> `credit_card`），再其次 RapidFuzz >= 90（`cancelled` -> `canceled`）。完全匹配不上的值原样透传，
+  并记录在 `explain` 中，不阻断查询。
+
+### 为什么手写 enum 不能扩展
+
+`enum_values` 只适合低基数且稳定的列（`status`、`payment_type`、`vip_level`）。
+高基数或会变化的列（品牌、城市、商品名）不适用，真实数仓也没人能为每一列手写并维护取值列表。它是 demo 规模下的取舍。
+
+### 生产系统的常见做法
+
+| 做法 | 思路 | 参考 |
+|---|---|---|
+| 缓存高频取值 + 模糊匹配 | 按基数/类型筛出可搜索的文本列，缓存最高频的取值，用编辑距离匹配过滤条件，并用 LLM 生成同义词和缩写 | [SQLGenie (ACL 2025 Industry)](https://aclanthology.org/2025.acl-industry.71.pdf) |
+| 给全部取值建索引 | LSH 加语义向量，分层检索，只把相关的取值子集交给 LLM（离线建索引，在线检索） | [CHESS](https://scalingintelligence.stanford.edu/pubs/CHESSpaper.pdf)、[XiYan-SQL](https://arxiv.org/pdf/2411.08599)、[DeepEye-SQL](https://arxiv.org/pdf/2510.17586) |
+| prompt 里放样例值 | 低基数分类列放 3-5 个代表值 | [DexterSQL](https://arxiv.org/pdf/2608.11889) |
+| 语义层维护别名 | 由人维护指标、维度和取值的别名/同义词，并配黄金查询回归测试 | [Semantic Layers Make Enterprise Text-to-SQL Safer](https://datalakehousehub.com/blog/2026-05-semantic-layers-text-to-sql/)、[dbt: Semantic Layer vs. Text-to-SQL](https://docs.getdbt.com/blog/semantic-layer-vs-text-to-sql-2026) |
+
+实际往往组合使用：低基数列用样例值或缓存列表，高基数列用取值索引，业务词汇放在语义层。
+
+公开资料对运维细节说得很少（取值随时间变化如何刷新、歧义值如何和用户确认）。这些应视为待设计的问题，不能当作行业既定做法。
+
+### 本项目的演进方向
+
+把手写的 `enum_values` 换成从数仓同步的取值（每个符合条件的列取 distinct/top-K，与 metadata 同步使用同一个刷新周期），
+保留 `normalize_enum_value()` 作为确定性的第一道处理，对高基数列再加 embedding 或 LSH 取值索引。
+有歧义或匹配不上的值应走确认流，而不是原样透传。
 
 ## 演进路线
 

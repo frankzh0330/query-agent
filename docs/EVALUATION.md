@@ -1,6 +1,8 @@
-# Evaluation Strategy
+---
+title: "Evaluation Strategy"
+---
 
-[English](EVALUATION.md) | [Chinese](EVALUATION.zh-CN.md)
+[Chinese version](https://github.com/frankzh0330/query-agent/blob/master/docs/EVALUATION.zh-CN.md)
 
 This document explains how `query-agent` is evaluated today, what the current end-to-end eval harness covers, and how to expand it safely as the agent evolves.
 
@@ -59,9 +61,9 @@ Purpose:
 
 Examples:
 
-- [tests/test_app_endpoints.py](../tests/test_app_endpoints.py)
-- [tests/test_session_manager.py](../tests/test_session_manager.py)
-- [tests/test_task_manager.py](../tests/test_task_manager.py)
+- [tests/test_app_endpoints.py](https://github.com/frankzh0330/query-agent/blob/master/tests/test_app_endpoints.py)
+- [tests/test_session_manager.py](https://github.com/frankzh0330/query-agent/blob/master/tests/test_session_manager.py)
+- [tests/test_task_manager.py](https://github.com/frankzh0330/query-agent/blob/master/tests/test_task_manager.py)
 
 Good for:
 
@@ -79,10 +81,42 @@ Purpose:
 
 Main files:
 
-- [tests/evals/nl2sql_cases.yaml](../tests/evals/nl2sql_cases.yaml)
-- [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
+- [tests/evals/nl2sql_cases.yaml](https://github.com/frankzh0330/query-agent/blob/master/tests/evals/nl2sql_cases.yaml)
+- [tests/test_end_to_end_evals.py](https://github.com/frankzh0330/query-agent/blob/master/tests/test_end_to_end_evals.py)
 
 This harness is intentionally closer to “golden cases” than pure unit testing.
+
+## Current Case Inventory (45 cases, 9 groups)
+
+Cases in [tests/evals/nl2sql_cases.yaml](https://github.com/frankzh0330/query-agent/blob/master/tests/evals/nl2sql_cases.yaml) are grouped by capability:
+
+| Group | Count | Covers |
+|---|---|---|
+| `s*` single table | 7 | aggregation, alias hits (gmv/aov), time defaults |
+| `j*` joins | 6 | auto-join for dimension columns, multi-join |
+| `m*` multi-hop joins | 3 | payments→orders→users style paths (known gaps, see below) |
+| `t*` time expressions | 6 | last week/month/quarter, today, time column on non-orders tables |
+| `f*` filters | 5 | enum value normalization (`credit card` → `credit_card`), hallucinated columns |
+| `a*` ambiguity | 3 | same-named columns, low-confidence tables |
+| `w*` window / TopN | 3 | global top-K vs per-group ranking (`LIMIT n BY`) |
+| `u*` follow-ups | 9 | time/metric/group/filter/window patches, confirmation, restart recovery, new-topic rejection, memory injection |
+| `b*` negative | 3 | unknown metric/group-by, no-extraction |
+
+### Strict xfail = known-gap map
+
+Cases whose *correct* behavior is asserted but not yet implemented carry an `xfail` field (strict). A fix flips them to failure until the marker is removed, so the gap list can never silently rot. Current gaps (5): multi-hop join inference (`m01-03`), silently dropped unknown group-by (`b01`), unsupported time expressions falling back silently (`t05`). Closed so far: `b02` (per-type thresholds), `a01/a02` (exact-alias collisions now surface as confirmation, or resolve deterministically via join distance when a base-table context exists).
+
+## Live Eval (real LLM, no mocks)
+
+[scripts/live_eval.py](https://github.com/frankzh0330/query-agent/blob/master/scripts/live_eval.py) reuses the same YAML expectations but runs the real LLM for extraction and SQL generation — measuring what the mocked pytest eval cannot: extraction quality and SQL quality. Cases that require a forced mock are skipped automatically.
+
+```bash
+./.venv311/bin/python scripts/live_eval.py            # all runnable cases
+./.venv311/bin/python scripts/live_eval.py -k s0 -k j0
+./.venv311/bin/python scripts/live_eval.py --out eval_results/run.json
+```
+
+Latest run (per-type thresholds + IDF recall + tie guard): **34/34 regular cases pass, 35/35 generated SQL valid (sqlglot), 34/34 metric expressions faithfully used, avg latency ~7.4s**; `a01` passes live thanks to the tie guard.
 
 ## Current E2E Eval Format
 
@@ -227,7 +261,7 @@ It is mainly a regression harness for agent behavior and orchestration.
 
 ## Running Evals
 
-Run only the end-to-end harness:
+Run only the end-to-end harness (set `EVAL_IGNORE_XFAIL=1` to see the real status of known-gap cases):
 
 ```bash
 ./.venv311/bin/pytest -q tests/test_end_to_end_evals.py

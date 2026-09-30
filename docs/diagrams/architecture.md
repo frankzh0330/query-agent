@@ -1,4 +1,6 @@
-# Architecture Diagram
+---
+title: "Architecture Diagram"
+---
 
 ```mermaid
 graph TB

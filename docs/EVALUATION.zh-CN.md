@@ -84,6 +84,37 @@
 
 这套 harness 更接近“golden cases”，不是单纯 unit test。
 
+## 用例清单（45 条，9 组）
+
+[tests/evals/nl2sql_cases.yaml](../tests/evals/nl2sql_cases.yaml) 按能力分组：
+
+| 组 | 数量 | 覆盖 |
+|---|---|---|
+| `s*` 单表 | 7 | 聚合、别名命中（gmv/aov）、时间默认 |
+| `j*` join | 6 | 维表列自动 join、多重 join |
+| `m*` 多跳 join | 3 | payments→orders→users 型路径（已知边界） |
+| `t*` 时间表达 | 6 | last week/month/quarter、today、非 orders 表时间列 |
+| `f*` 过滤 | 5 | 枚举值归一（credit card → credit_card）、幻觉列 |
+| `a*` 歧义 | 3 | 同名列、低置信表名 |
+| `w*` 窗口/TopN | 3 | 全局 TopK vs 分组排名（LIMIT n BY） |
+| `u*` follow-up | 9 | 时间/指标/分组/过滤/窗口 patch、确认、重启恢复、新话题不误判、记忆注入 |
+| `b*` 负例 | 3 | 未知指标/分组列、无抽取信号 |
+
+### strict xfail = 已知边界地图
+
+断言"正确行为"但当前未实现的用例带 `xfail` 字段（strict）。修复后自动翻红提醒移除标记，边界清单不会悄悄烂掉。当前 5 个：多跳 join 推断（m01-03）、未知 group_by 静默丢弃（b01）、不支持的时间表达静默回退（t05）。已关闭：b02（按类型阈值）、a01/a02（exact 别名冲突现在暴露为确认流，或有基表上下文时按 join 距离确定性消歧）。
+
+## Live Eval（真实 LLM，无 mock）
+
+[scripts/live_eval.py](../scripts/live_eval.py) 复用同一套 YAML 断言，但抽取与 SQL 生成走真实 LLM——度量 mock 测不到的抽取质量与 SQL 质量；依赖强制 mock 的用例自动跳过。
+
+```bash
+./.venv311/bin/python scripts/live_eval.py            # 全部可跑用例
+./.venv311/bin/python scripts/live_eval.py --out eval_results/run.json
+```
+
+最近一轮（按类型阈值 + IDF 召回 + 并列守卫）：**常规 34/34 通过、SQL 语法 35/35、指标口径保真 34/34、平均延迟 ~7.4s**；a01 在 live 下由并列守卫翻绿。
+
 ## 当前 E2E Eval 格式
 
 每条 case 使用 YAML 描述，可包含：

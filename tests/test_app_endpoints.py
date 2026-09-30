@@ -43,6 +43,15 @@ COLUMN_MAP = {
     "金额": ("orders.amount", 100.0),
     "会员等级": ("users.vip_level", 100.0),
     "状态": ("orders.status", 100.0),
+    # English mentions (schema is English-only now)
+    "region": ("users.region", 100.0),
+    "area": ("users.region", 100.0),
+    "category": ("products.category", 100.0),
+    "categories": ("products.category", 100.0),
+    "product category": ("products.category", 100.0),
+    "channel": ("orders.channel", 100.0),
+    "vip level": ("users.vip_level", 100.0),
+    "payment type": ("payments.payment_type", 100.0),
 }
 
 
@@ -74,6 +83,10 @@ def _high_confidence_service() -> MatcherService:
             "销售额": _mr("revenue", 100.0),
             "订单量": _mr("order_count", 100.0),
             "客单价": _mr("avg_order_value", 100.0),
+            "revenue": _mr("revenue", 100.0),
+            "sales": _mr("revenue", 100.0),
+            "order count": _mr("order_count", 100.0),
+            "average order value": _mr("avg_order_value", 100.0),
         }),
         column_matcher=_fake_column_matcher(),
     )
@@ -383,7 +396,7 @@ class TestNL2SQLEarlyExit:
         body = resp.json()
         assert body["status"] == "early_exit"
         assert body["message"]
-        assert "表" in body["message"] or "指标" in body["message"]
+        assert "table" in body["message"].lower() or "metric" in body["message"].lower()
 
     def test_nl2sql_early_exit_records_message(self, client):
         import app as app_module
@@ -745,3 +758,106 @@ class TestGracefulFailures:
         body = resp.json()
         assert body["status"] == "early_exit"
         assert body["sql"] == ""
+
+
+class TestWindowFullTextRecovery:
+    """L1 把窗口短语截断（limit 留在原句）时，用完整查询文本兜底解析"""
+
+    def test_truncated_window_fragment_recovered_from_full_text(self, client):
+        # L1 只抽到 "in each region"（没有 top 3），完整查询里有
+        intent = SQLIntentJson(
+            metric_extractions=[Extraction(text="revenue")],
+            group_by_extractions=[Extraction(text="categories")],
+            window_extractions=[Extraction(text="in each region")],
+        )
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql() as gen_mock:
+                resp = client.post("/nl2sql", json={
+                    "text": "Top 3 categories by revenue in each region",
+                    "project_id": 55,
+                })
+
+        body = resp.json()
+        assert body["status"] == "success"
+        assert body["resolved_intent"]["window"] == {"group_by": "users.region", "limit": 3}
+        # explain 记录了兜底来源
+        assert body["explain"]["resolver_explain"]["columns_parse"]["window"]["recovered_from_full_text"] is True
+
+        gen_intent = gen_mock.call_args.args[1]
+        assert gen_intent["window"] == {"group_by": "users.region", "limit": 3}
+
+
+class TestColumnCollisionConfirmation:
+    """同名列 exact 冲突 → 确认流 → 回复编号后生成 SQL（a01/a02 端到端）"""
+
+    @staticmethod
+    def _real_column_service():
+        """真实 ColumnMatcher（冲突逻辑在 base.py）+ fake 指标层"""
+        return _make_service(metric_matcher=FakeMatcher({
+            "revenue": _mr("revenue", 100.0),
+            "order count": _mr("order_count", 100.0),
+        }))
+
+    def test_detail_column_collision_confirms_then_reply(self, client):
+        # 无表名无指标：bare "amount" 无法消歧 → 确认
+        intent = SQLIntentJson(column_extractions=[Extraction(text="amount")])
+        svc = self._real_column_service()
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with mock.patch("app.get_matcher_service", return_value=svc):
+                resp1 = client.post("/nl2sql", json={"text": "Show the amount of recent records", "project_id": 55})
+
+        body1 = resp1.json()
+        assert body1["status"] == "needs_confirmation"
+        assert "detail_column" in body1["candidates"]
+        values = [c["value"] for c in body1["candidates"]["detail_column"]]
+        assert set(values) == {"orders.amount", "payments.amount"}
+
+        # 回复 1 → 确认所选列，推断基表，生成 SQL
+        with _mock_generate_sql() as gen_mock:
+            resp2 = client.post("/nl2sql", json={
+                "text": "1", "project_id": 55, "session_id": body1["session_id"],
+            })
+        body2 = resp2.json()
+        assert body2["status"] == "success"
+        chosen = values[0]
+        assert chosen in body2["resolved_intent"]["detail_columns"]
+        assert body2["explain"]["turn_explain"]["confirmed_fields"]["detail_column"] == chosen
+        gen_intent = gen_mock.call_args.args[1]
+        assert gen_intent["detail_columns"] == [chosen]
+
+    def test_group_by_time_collision_confirms(self, client):
+        intent = SQLIntentJson(
+            metric_extractions=[Extraction(text="order count")],
+            group_by_extractions=[Extraction(text="time")],
+        )
+        svc = self._real_column_service()
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with mock.patch("app.get_matcher_service", return_value=svc):
+                resp = client.post("/nl2sql", json={"text": "Number of orders by time", "project_id": 55})
+
+        body = resp.json()
+        assert body["status"] == "needs_confirmation"
+        assert "group_by_column" in body["candidates"]
+        assert len(body["candidates"]["group_by_column"]) == 3
+
+    def test_region_with_metric_context_auto_resolves(self, client):
+        """revenue 语境下 region 由距离消歧，不打断（j01 场景）"""
+        intent = SQLIntentJson(
+            metric_extractions=[Extraction(text="revenue")],
+            group_by_extractions=[Extraction(text="region")],
+        )
+        svc = self._real_column_service()
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with mock.patch("app.get_matcher_service", return_value=svc):
+                with _mock_generate_sql():
+                    resp = client.post("/nl2sql", json={"text": "Revenue by region", "project_id": 55})
+
+        body = resp.json()
+        assert body["status"] == "success"
+        assert body["resolved_intent"]["group_by"] == ["users.region"]
+        assert body["explain"]["resolver_explain"]["columns_parse"]["columns"][0]["method"] == \
+            "exact_collision_distance_resolved"

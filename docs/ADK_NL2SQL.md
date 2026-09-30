@@ -1,11 +1,13 @@
-# Google ADK NL2SQL: A Study Comparison
+---
+title: "Google ADK NL2SQL: A Study Comparison"
+---
 
 This document studies how Google builds natural-language-to-SQL agents with
 the Agent Development Kit, and compares that design against the one already
 implemented in this repository.
 
 It exists for learning. Nothing in the running service depends on it. The
-companion code skeleton lives in [examples/adk_nl2sql/](../examples/adk_nl2sql/).
+companion code skeleton lives in [examples/adk_nl2sql/](https://github.com/frankzh0330/query-agent/tree/master/examples/adk_nl2sql).
 
 Primary sources:
 
@@ -202,7 +204,7 @@ adk eval --config_file_path examples/adk_nl2sql/eval/test_config.json --print_de
 ```
 
 Trajectory scoring is the idea worth stealing. This repo's
-[EVALUATION.md](EVALUATION.md) already argues for asserting on semantic fields
+[EVALUATION.md](/EVALUATION) already argues for asserting on semantic fields
 rather than full `exec_dsl` strings — same instinct, applied to output. ADK
 applies it to *behaviour*: two runs can produce identical text while one of
 them skipped validation entirely, and only trajectory scoring catches that.
@@ -233,13 +235,13 @@ sandboxes:
 
 ## Reading order for the skeleton
 
-1. [examples/adk_nl2sql/agent.py](../examples/adk_nl2sql/agent.py) — pipeline
+1. [examples/adk_nl2sql/agent.py](https://github.com/frankzh0330/query-agent/blob/master/examples/adk_nl2sql/agent.py) — pipeline
    shape, state handoff, why four stages instead of one
-2. [examples/adk_nl2sql/prompts.py](../examples/adk_nl2sql/prompts.py) — one job
+2. [examples/adk_nl2sql/prompts.py](https://github.com/frankzh0330/query-agent/blob/master/examples/adk_nl2sql/prompts.py) — one job
    per prompt, schema as data
-3. [examples/adk_nl2sql/tools.py](../examples/adk_nl2sql/tools.py) —
+3. [examples/adk_nl2sql/tools.py](https://github.com/frankzh0330/query-agent/blob/master/examples/adk_nl2sql/tools.py) —
    deterministic guardrails, confirmation thresholds
-4. [examples/adk_nl2sql/eval/](../examples/adk_nl2sql/eval/) — evalset format,
+4. [examples/adk_nl2sql/eval/](https://github.com/frankzh0330/query-agent/tree/master/examples/adk_nl2sql/eval) — evalset format,
    negative cases
 
 The skeleton needs `pip install google-adk`, deliberately kept out of

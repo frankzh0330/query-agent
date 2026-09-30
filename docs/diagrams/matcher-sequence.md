@@ -1,4 +1,6 @@
-# Matcher Sequence
+---
+title: "Matcher Sequence"
+---
 
 ```mermaid
 sequenceDiagram
@@ -31,7 +33,7 @@ sequenceDiagram
         Pipeline-->>Matcher: score=100, method=exact_alias_match
     else No exact match
         Pipeline->>Pipeline: Stage 2 tokenize + synonym expansion
-        Pipeline->>Index: Stage 3 inverted-index recall
+        Pipeline->>Index: Stage 3 IDF-weighted inverted-index recall<br/>(+ edit-distance typo probing for zero-hit tokens)
         Index-->>Pipeline: candidate document IDs
         Pipeline->>Fuzz: Stage 4 fuzzy rerank
         Fuzz-->>Pipeline: sorted candidates
@@ -42,7 +44,7 @@ sequenceDiagram
         end
     end
     Matcher-->>MS: ResolvedResult with candidates and explain
-    MS->>MS: threshold policy: >=80 accept, 40-80 confirm, <40 drop
+    MS->>MS: per-type thresholds (metric 90 / table·column 80)<br/>+ tie guard (top1-top2 margin <10 -> confirm)
     end
 
     rect rgb(255, 243, 224)
