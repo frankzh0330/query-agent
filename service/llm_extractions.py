@@ -175,7 +175,7 @@ class Extraction(BaseModel):
 class FilterExtraction(BaseModel):
     """过滤条件抽取：column/value 为自然语言片段，由 matcher 解析"""
     text: str
-    column: Optional[str] = None   # 如 "会员等级"（待 ColumnMatcher 解析）
+    column: Optional[str] = None   # attribute phrase as the user said it, e.g. "membership level" (resolved by ColumnMatcher)
     op: str = "="                  # = | != | > | < | >= | <= | in | like
     value: Optional[str] = None    # 如 "vip"（LLM 直接给出或从 text 截取）
 
@@ -195,60 +195,66 @@ class SQLIntentJson(BaseModel):
 # ==================== Prompt ====================
 
 FEW_SHOT_EXAMPLES = r"""
-示例:
-近7天各地区的销售额 -> {"metric_extractions":[{"text":"销售额"}],"group_by_extractions":[{"text":"地区"}],"time_extractions":[{"text":"近7天"}]}
-VIP用户的订单量 -> {"metric_extractions":[{"text":"订单量"}],"filter_extractions":[{"text":"VIP用户","column":"会员等级","op":"=","value":"vip"}]}
-订单表前10条金额大于100的记录 -> {"table_extractions":[{"text":"订单表"}],"column_extractions":[{"text":"金额"}],"filter_extractions":[{"text":"金额大于100","column":"金额","op":">","value":"100"}]}
-每个地区销售额前3的会员 -> {"metric_extractions":[{"text":"销售额"}],"window_extractions":[{"text":"每个地区前3"}]}
-客单价最高的前5 -> {"metric_extractions":[{"text":"客单价"}],"order_extractions":[{"text":"最高的前5"}]}
+Examples (copy the user's own wording into "text"; never translate):
+revenue by region for the last 7 days -> {"metric_extractions":[{"text":"revenue"}],"group_by_extractions":[{"text":"region"}],"time_extractions":[{"text":"last 7 days"}]}
+orders from gold members -> {"metric_extractions":[{"text":"orders"}],"filter_extractions":[{"text":"gold members","column":"membership level","op":"=","value":"gold"}]}
+revenue paid by credit card -> {"metric_extractions":[{"text":"revenue"}],"filter_extractions":[{"text":"paid by credit card","column":"payment method","op":"=","value":"credit card"}]}
+new users in the last 30 days -> {"metric_extractions":[{"text":"new users"}],"time_extractions":[{"text":"last 30 days"}]}
+list orders over 100 -> {"table_extractions":[{"text":"orders"}],"filter_extractions":[{"text":"over 100","column":"amount","op":">","value":"100"}]}
+top 3 categories by revenue per region -> {"metric_extractions":[{"text":"revenue"}],"group_by_extractions":[{"text":"category"}],"window_extractions":[{"text":"top 3 per region"}]}
+top 5 by average order value -> {"metric_extractions":[{"text":"average order value"}],"order_extractions":[{"text":"top 5 by average order value"}]}
 """
 
-_BASE_SYSTEM_PROMPT = r"""你是"抽取器"。只做：从用户问题中抽取 SQL 查询意图的原文片段（extractions）。
-注意：你不生成 SQL，不翻译名字——表名/指标名/列名的解析由下游 matcher 完成，你只负责切分和归类。
+_BASE_SYSTEM_PROMPT = r"""You are an "extractor". Your only job: pull the verbatim phrases that express SQL query intent out of the user's question (extractions).
+You do NOT generate SQL and you do NOT translate or normalize names: table / metric / column names are resolved downstream by matchers. You only split and classify.
 
-抽取规则：
-- table_extractions：用户明确提到的表
-  - 订单/订单表/下单 → 抽取原文
-  - 用户/会员 → 抽取原文
-  - 只有明确提到表或表相关描述才抽取，不要猜测
+Language rule: the user may write English or Chinese. Copy the user's own words into "text" (and "column"). Never translate, never switch languages, never output a column name the user did not say.
 
-- metric_extractions：业务指标（通常是聚合值）
-  - 销售额/营收/GMV → "销售额"
-  - 订单量/单量/订单数 → "订单量"
-  - 客单价 → "客单价"
-  - 用户数/买家数 → "用户数"
+Extraction rules:
+- table_extractions: tables the user explicitly mentions ("orders", "users", "products", "payments", "reviews", "sellers")
+  - Only extract when a table (or a phrase clearly naming one) is mentioned. Do not guess.
 
-- column_extractions：普通列（非指标、用于明细展示或隐含过滤分组）
-  - "订单号"、"金额"、"状态"、"地区"、"品类" → 抽取原文
+- metric_extractions: business metrics (usually aggregated values)
+  - "revenue", "GMV", "sales" -> as written
+  - "number of orders", "order count" -> as written
+  - "average order value", "AOV", "refund rate", "average rating", "new users" -> as written
+  - A metric phrase is a METRIC, never a filter: "new users" is a metric, not user_type = new.
 
-- filter_extractions：过滤条件
-  - "VIP用户" → {"text":"VIP用户","column":"会员等级","op":"=","value":"vip"}
-  - "金额大于100" → {"text":"金额大于100","column":"金额","op":">","value":"100"}
-  - "状态是已支付" → {"text":"状态是已支付","column":"状态","op":"=","value":"已支付"}
-  - op 只能是: = | != | > | < | >= | <= | in | like
-  - column 抽原文（如"会员等级"），value 给规范化值（如"vip"、"100"）
+- column_extractions: plain columns (not metrics; used for detail listing or implicit grouping/filtering)
+  - "order id", "amount", "status", "region", "category" -> as written
 
-- group_by_extractions：分组维度
-  - "各地区"、"按渠道拆"、"每个品类" → 抽取维度原文（"地区"、"渠道"、"品类"）
+- filter_extractions: filter conditions
+  - "orders from gold members" -> {"text":"gold members","column":"membership level","op":"=","value":"gold"}
+  - "amount over 100" -> {"text":"amount over 100","column":"amount","op":">","value":"100"}
+  - "paid orders" -> {"text":"paid orders","column":"status","op":"=","value":"paid"}
+  - op must be one of: = | != | > | < | >= | <= | in | like
+  - "column" must be the attribute phrase the user used (e.g. "membership level", "payment method"); do not invent column names such as user_type or is_new.
+  - "value" is the value as the user said it (lower-case is fine); value normalization is done downstream.
+  - If you cannot name the attribute from the user's words, do not emit a filter.
 
-- time_extractions：时间范围
-  - 近7天/最近7天 → "近7天"；昨天 → "昨天"；本周 → "本周"；本月 → "本月"
+- group_by_extractions: grouping dimensions
+  - "by region", "per channel", "for each category" -> the dimension phrase ("region", "channel", "category")
 
-- order_extractions：显式排序/TopN（针对全结果集）
-  - "销售额最高的前5"、"按金额从大到小" → 抽取原文
+- time_extractions: time range, verbatim
+  - "last 7 days", "yesterday", "this week", "last month", "past 14 days"
 
-- window_extractions：分组内排名（每个X内的前N）
-  - "每个地区前3"、"每个品类销售额第一" → 抽取原文
-  - 注意区分："销售额前5"（全局 TopN → order_extractions）vs "每个地区前3"（分组内 → window_extractions）
+- order_extractions: explicit ordering / TopN over the whole result
+  - "top 5 by revenue", "highest average order value" -> verbatim
+
+- window_extractions: ranking within each group (top N per X)
+  - "top 3 per region", "each category top 5" -> verbatim
+  - Distinguish: "top 5 categories by revenue" (global TopN -> order_extractions) vs "top 3 per region" (within group -> window_extractions)
 
 """ + FEW_SHOT_EXAMPLES
 
+
+
 # Prompt-based 专用 prompt（含格式指令）
 _BASE_SYSTEM_PROMPT_TEXT = _BASE_SYSTEM_PROMPT + r"""
-输出要求：
-- 不要输出任何解释文字
-- 不要使用 Markdown 代码块（不要出现 ```）
-- 直接输出 JSON，必须以 { 开头，以 } 结尾
+Output requirements:
+- No explanatory text
+- No Markdown code fences (no ```)
+- Output raw JSON only, starting with { and ending with }
 """
 
 
@@ -258,7 +264,7 @@ EXTRACT_INTENT_TOOL = {
     "type": "function",
     "function": {
         "name": "extract_sql_intent",
-        "description": "从用户自然语言查询中抽取 SQL 查询意图片段",
+        "description": "Extract the verbatim SQL-query-intent phrases from the user question (do not translate)",
         "parameters": {
             "type": "object",
             "properties": {
@@ -269,7 +275,7 @@ EXTRACT_INTENT_TOOL = {
                         "properties": {"text": {"type": "string"}},
                         "required": ["text"],
                     },
-                    "description": "表抽取，如 订单表、用户表",
+                    "description": "Tables mentioned, e.g. orders, users",
                 },
                 "metric_extractions": {
                     "type": "array",
@@ -278,7 +284,7 @@ EXTRACT_INTENT_TOOL = {
                         "properties": {"text": {"type": "string"}},
                         "required": ["text"],
                     },
-                    "description": "业务指标抽取，如 销售额、订单量、客单价",
+                    "description": "Business metrics, e.g. revenue, number of orders, average order value (a metric phrase such as 'new users' is never a filter)",
                 },
                 "column_extractions": {
                     "type": "array",
@@ -287,7 +293,7 @@ EXTRACT_INTENT_TOOL = {
                         "properties": {"text": {"type": "string"}},
                         "required": ["text"],
                     },
-                    "description": "普通列抽取，如 订单号、地区、品类",
+                    "description": "Plain columns, e.g. order id, region, category",
                 },
                 "filter_extractions": {
                     "type": "array",
@@ -301,7 +307,7 @@ EXTRACT_INTENT_TOOL = {
                         },
                         "required": ["text"],
                     },
-                    "description": "过滤条件抽取，如 VIP用户、金额大于100",
+                    "description": "Filters, e.g. gold members, amount over 100. 'column' must be the attribute phrase the user used; never invent column names",
                 },
                 "group_by_extractions": {
                     "type": "array",
@@ -310,7 +316,7 @@ EXTRACT_INTENT_TOOL = {
                         "properties": {"text": {"type": "string"}},
                         "required": ["text"],
                     },
-                    "description": "分组维度抽取，如 地区、渠道、品类",
+                    "description": "Grouping dimensions, e.g. region, channel, category",
                 },
                 "time_extractions": {
                     "type": "array",
@@ -319,7 +325,7 @@ EXTRACT_INTENT_TOOL = {
                         "properties": {"text": {"type": "string"}},
                         "required": ["text"],
                     },
-                    "description": "时间范围抽取，如 近7天、昨天、本月",
+                    "description": "Time range, verbatim, e.g. last 7 days, yesterday, this month",
                 },
                 "order_extractions": {
                     "type": "array",
@@ -328,7 +334,7 @@ EXTRACT_INTENT_TOOL = {
                         "properties": {"text": {"type": "string"}},
                         "required": ["text"],
                     },
-                    "description": "全局排序/TopN 抽取，如 销售额最高的前5",
+                    "description": "Global ordering / TopN, e.g. top 5 by revenue",
                 },
                 "window_extractions": {
                     "type": "array",
@@ -337,7 +343,7 @@ EXTRACT_INTENT_TOOL = {
                         "properties": {"text": {"type": "string"}},
                         "required": ["text"],
                     },
-                    "description": "分组内排名抽取，如 每个地区前3",
+                    "description": "Ranking within each group, e.g. top 3 per region",
                 },
             },
             "required": [],

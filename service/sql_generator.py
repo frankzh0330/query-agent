@@ -66,6 +66,29 @@ _WINDOW_PATTERNS = [
     re.compile(r"[各每](?P<group>.+?)(?:的)?前\s*(?P<limit>\d+)"),
 ]
 
+# 英文形式（仅当文本不含中文时启用，见 parse_window_text / parse_order_text）
+_EN_WINDOW_PATTERNS = [
+    # "top 3 per region" / "top 3 for each category"
+    # 允许 N 与介词之间夹名词短语： "top 3 categories in each region"
+    re.compile(r"(?:top|first)\s+(?P<limit>\d+)\s+(?:[a-z_]+\s+){0,3}?(?:per|for each|in each|within each)\s+(?P<group>[a-z_ ]+?)\s*$", re.I),
+    re.compile(r"(?:top|first)\s+(?P<limit>\d+)\s+(?:per|by)\s+(?P<group>[a-z_ ]+?)\s*$", re.I),
+    # "each region top 3" / "per category, first 5"
+    re.compile(r"(?:per|for each|in each|within each|each|every)\s+(?P<group>[a-z_ ]+?)\s*,?\s*(?:top|first)\s+(?P<limit>\d+)", re.I),
+]
+
+# (pattern, direction)；顺序敏感：先带 "by/of" 的完整形式，再退化形式
+_EN_ORDER_PATTERNS = [
+    # 允许 N 与 by 之间夹名词短语： "top 5 product categories by revenue"
+    (re.compile(r"(?:top|first|highest|best)\s+(?P<limit>\d+)\s+(?:[a-z_]+\s+){0,3}?(?:by|of|in)\s+(?P<metric>[a-z_ ]+)", re.I), "DESC"),
+    (re.compile(r"(?:bottom|lowest|worst|last)\s+(?P<limit>\d+)\s+(?:[a-z_]+\s+){0,3}?(?:by|of|in)\s+(?P<metric>[a-z_ ]+)", re.I), "ASC"),
+    (re.compile(r"(?P<metric>[a-z_ ]+?)\s*,?\s*(?:top|first)\s+(?P<limit>\d+)", re.I), "DESC"),
+    (re.compile(r"(?P<metric>[a-z_ ]+?)\s*,?\s*(?:bottom|last)\s+(?P<limit>\d+)", re.I), "ASC"),
+    (re.compile(r"(?:highest|largest|biggest|most)\s+(?P<metric>[a-z_ ]+)(?P<limit>)", re.I), "DESC"),
+    (re.compile(r"(?:lowest|smallest|least)\s+(?P<metric>[a-z_ ]+)(?P<limit>)", re.I), "ASC"),
+]
+
+_CJK = re.compile(r"[一-龥]")
+
 _ORDER_PATTERNS = [
     # "销售额最高的前5" / "按销售额从高到低前5" / "金额最大的3个"
     re.compile(r"(?P<metric>.+?)(?:最高|最大|最多|从高到低|从大到小|降序)(?:的)?前?\s*(?P<limit>\d+)?"),
@@ -80,7 +103,8 @@ def parse_window_text(text: str) -> Optional[Dict[str, Any]]:
 
     捕获组含方向词（最高/最低等）说明是全局 TopN 誤入 window 通道 → 返回 None 交由 order 路径
     """
-    for pat in _WINDOW_PATTERNS:
+    patterns = _WINDOW_PATTERNS if _CJK.search(text or "") else _EN_WINDOW_PATTERNS
+    for pat in patterns:
         m = pat.search(text or "")
         if m:
             group = m.group("group").strip()
@@ -96,6 +120,18 @@ def parse_window_text(text: str) -> Optional[Dict[str, Any]]:
 
 def parse_order_text(text: str) -> Optional[Dict[str, Any]]:
     """'销售额最高的前5' → {"metric_text": "销售额", "limit": 5, "direction": "DESC"}"""
+    if text and not _CJK.search(text):
+        for pat, direction in _EN_ORDER_PATTERNS:
+            m = pat.search(text.strip())
+            if m and m.group("metric").strip():
+                return {
+                    "metric_text": m.group("metric").strip(),
+                    "limit": int(m.group("limit")) if m.group("limit") else None,
+                    "direction": direction,
+                    "raw": text,
+                }
+        return None
+
     for idx, pat in enumerate(_ORDER_PATTERNS):
         m = pat.search(text or "")
         if m and m.group("metric").strip():

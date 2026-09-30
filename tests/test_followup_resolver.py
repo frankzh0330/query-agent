@@ -55,3 +55,42 @@ class TestDetectFollowup:
         decision = detect_followup("查询 orders 表的明细数据", sample_query_state)
         assert decision.is_followup is False
         assert decision.mode == "new_query"
+
+
+class TestDetectFollowupEnglish:
+
+    def test_time_only_followup(self, sample_query_state):
+        decision = detect_followup("What about yesterday?", sample_query_state)
+        assert decision.is_followup is True
+        assert decision.mode == "followup_patch"
+
+    def test_bare_time_term(self, sample_query_state):
+        decision = detect_followup("Yesterday?", sample_query_state)
+        assert decision.is_followup is True
+        assert decision.reason == "time_only_term"
+        assert decision.patch_hints == {}
+
+    def test_instead_phrase(self, sample_query_state):
+        assert detect_followup("Show the number of orders instead", sample_query_state).is_followup is True
+
+    def test_only_filter(self, sample_query_state):
+        assert detect_followup("Only paid orders", sample_query_state).is_followup is True
+
+    def test_break_down_by(self, sample_query_state):
+        assert detect_followup("Also break it down by channel", sample_query_state).is_followup is True
+
+    def test_top_n(self, sample_query_state):
+        assert detect_followup("Top 3 per region", sample_query_state).is_followup is True
+
+    def test_short_new_query_is_not_followup(self, sample_query_state):
+        """业务词不构成追问线索：短的新查询必须仍判为新查询"""
+        decision = detect_followup("Revenue by region", sample_query_state)
+        assert decision.is_followup is False
+        assert decision.mode == "new_query"
+
+    def test_long_new_query_is_not_followup(self, sample_query_state):
+        decision = detect_followup("Average rating by product category for the last 30 days", sample_query_state)
+        assert decision.is_followup is False
+
+    def test_no_previous_state(self):
+        assert detect_followup("What about yesterday?", None).reason == "no_previous_state"

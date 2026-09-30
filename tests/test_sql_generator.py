@@ -61,3 +61,59 @@ class TestTimeRangeToChExpr:
 
     def test_no_time_column_returns_empty(self):
         assert time_range_to_ch_expr({"type": "last_n_days", "n": 7}, "") == ""
+
+
+class TestEnglishWindowAndOrder:
+    def test_window_per_group(self):
+        w = parse_window_text("top 3 per region")
+        assert w["group_text"] == "region"
+        assert w["limit"] == 3
+
+    def test_window_each_group_first(self):
+        w = parse_window_text("each category top 5")
+        assert w["group_text"] == "category"
+        assert w["limit"] == 5
+
+    def test_window_no_match(self):
+        assert parse_window_text("whatever") is None
+
+    def test_order_top_n_by_metric(self):
+        o = parse_order_text("top 5 by average order value")
+        assert o["metric_text"] == "average order value"
+        assert o["limit"] == 5
+        assert o["direction"] == "DESC"
+
+    def test_order_bottom_n(self):
+        o = parse_order_text("bottom 3 by refund rate")
+        assert o["direction"] == "ASC"
+        assert o["limit"] == 3
+
+    def test_order_lowest_without_limit(self):
+        o = parse_order_text("lowest average rating")
+        assert o["direction"] == "ASC"
+        assert o["limit"] is None
+        assert o["metric_text"] == "average rating"
+
+
+class TestEnglishVerbatimSentences:
+    """LLM 常把整句原话放进 window/order_extractions（名词短语夹在 N 与介词之间）"""
+
+    def test_window_with_noun_phrase(self):
+        w = parse_window_text("Top 3 categories in each region")
+        assert w["group_text"] == "region"
+        assert w["limit"] == 3
+
+    def test_window_top_n_by_group(self):
+        w = parse_window_text("top 3 by region")
+        assert w["group_text"] == "region"
+
+    def test_order_with_noun_phrase(self):
+        o = parse_order_text("Top 5 product categories by revenue")
+        assert o["metric_text"] == "revenue"
+        assert o["limit"] == 5
+        assert o["direction"] == "DESC"
+
+    def test_order_bottom_with_noun_phrase(self):
+        o = parse_order_text("Bottom 3 channels by refund rate")
+        assert o["metric_text"] == "refund rate"
+        assert o["direction"] == "ASC"

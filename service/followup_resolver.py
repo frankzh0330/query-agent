@@ -1,6 +1,7 @@
 """Turn-based follow-up query detection."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,6 +38,28 @@ _TIME_ONLY_TERMS = {
     "本月": {"time_range": {"type": "last_n_days", "n": 30}},
     "这个月": {"time_range": {"type": "last_n_days", "n": 30}},
 }
+
+
+# ---- English cues ------------------------------------------------------------
+# 只用"结构性线索"（修改上一轮的措辞），不按业务词（revenue/region…）猜：
+# 业务词会把 "Revenue by region" 这类短的新查询误判为追问。
+_EN_FOLLOWUP_RE = re.compile(
+    r"^(what|how) about\b"
+    r"|^(and|also|now|then|but|same|instead|only|just|exclude|excluding|without|filter)\b"
+    r"|^(by|per|group by|split by|break (it )?down by|broken down by)\b"
+    r"|^(top|bottom|first)\s+\d+\b"
+    r"|^(compare|compared)\b"
+    r"|\binstead\b|\bcompared? (to|with)\b|\bvs\.?\b|\bversus\b"
+    r"|\bbreak (it )?down\b",
+    re.IGNORECASE,
+)
+
+_EN_TIME_ONLY_TERMS = {
+    "today", "yesterday", "this week", "last week", "this month", "last month",
+}
+
+def _strip_trailing_punct(text: str) -> str:
+    return re.sub(r"[\s?.!,]+$", "", text.strip().lower())
 
 
 @dataclass
@@ -98,6 +121,28 @@ def detect_followup(
             patch_hints=_TIME_ONLY_TERMS[normalized],
             reason="time_only_term",
             matched_signals=["time_only_term"],
+            normalized_text=normalized,
+        )
+
+    if _strip_trailing_punct(normalized) in _EN_TIME_ONLY_TERMS:
+        return FollowupDecision(
+            mode="followup_patch",
+            confidence=0.95,
+            is_followup=True,
+            patch_hints={},
+            reason="time_only_term",
+            matched_signals=["time_only_term"],
+            normalized_text=normalized,
+        )
+
+    if _EN_FOLLOWUP_RE.search(normalized):
+        return FollowupDecision(
+            mode="followup_patch",
+            confidence=0.9,
+            is_followup=True,
+            patch_hints={},
+            reason="followup_phrase_en",
+            matched_signals=["followup_phrase_en"],
             normalized_text=normalized,
         )
 
