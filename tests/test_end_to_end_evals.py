@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -15,10 +16,21 @@ from service.llm_extractions import Extraction, FilterExtraction, SQLIntentJson
 from service.session_models import QueryState
 
 
-def _load_cases() -> list[dict]:
+def _load_cases() -> list:
+    """加载 golden cases；带 xfail 字段的 case 以 strict xfail 标记（断言的仍是"正确行为"）
+
+    EVAL_IGNORE_XFAIL=1 时忽略标记，用于查看这些 case 的真实结果。
+    """
     path = Path(__file__).parent / "evals" / "nl2sql_cases.yaml"
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return data.get("cases", [])
+    ignore_xfail = os.getenv("EVAL_IGNORE_XFAIL") == "1"
+    params = []
+    for case in data.get("cases", []):
+        marks = []
+        if case.get("xfail") and not ignore_xfail:
+            marks.append(pytest.mark.xfail(reason=case["xfail"], strict=True))
+        params.append(pytest.param(case, id=case["name"], marks=marks))
+    return params
 
 
 # ==================== LLM 抽取 mock ====================
@@ -68,41 +80,21 @@ class FakeMatcher:
         return MatchResult(matched=None, score=0.0, explain={})
 
 
-COLUMN_MAP = {
-    "地区": ("users.region", 100.0),
-    "品类": ("products.category", 100.0),
-    "渠道": ("orders.channel", 100.0),
-    "金额": ("orders.amount", 100.0),
-    "会员等级": ("users.vip_level", 100.0),
-}
-
-
 def _build_service(name: str) -> MatcherService:
+    """matcher 场景
+
+    real                 — 真实 MatcherService（倒排索引 + RapidFuzz），评测 schema 别名 + 匹配逻辑
+    low_confidence_table — 真实 service + 假 table matcher，稳定复现确认流（55 分，介于确认带内）
+    """
     svc = MatcherService(catalog_path="catalog")
 
-    if name == "high_confidence":
-        svc.table_matcher = FakeMatcher({
-            "订单表": _mr("orders", 100.0),
-            "订单": _mr("orders", 100.0),
-            "商品表": _mr("products", 100.0),
-        })
-        svc.metric_matcher = FakeMatcher({
-            "销售额": _mr("revenue", 100.0),
-            "订单量": _mr("order_count", 100.0),
-        })
-        svc.column_matcher = FakeMatcher(
-            {text: _mr(v, s) for text, (v, s) in COLUMN_MAP.items()}
-        )
+    if name == "real":
         return svc
 
     if name == "low_confidence_table":
         svc.table_matcher = FakeMatcher({
-            "商品表": _mr(None, 55.0, candidates=[("products", 55.0), ("orders", 48.0)]),
+            "products table": _mr(None, 55.0, candidates=[("products", 55.0), ("orders", 48.0)]),
         })
-        svc.metric_matcher = FakeMatcher({"销售额": _mr("revenue", 100.0)})
-        svc.column_matcher = FakeMatcher(
-            {text: _mr(v, s) for text, (v, s) in COLUMN_MAP.items()}
-        )
         return svc
 
     raise ValueError(f"unknown resolver scenario: {name}")
@@ -134,7 +126,7 @@ def eval_client(tmp_path):
     import app as app_module
 
     _rebind_runtime(str(tmp_path / "data"))
-    app_module._matcher_service = _build_service("high_confidence")
+    app_module._matcher_service = _build_service("real")
 
     with TestClient(app_module.app) as c:
         yield c
@@ -178,10 +170,16 @@ def _seed_setup(case: dict) -> str | None:
 
 
 def _assert_expectations(body: dict, expect: dict, gen_mock: mock.AsyncMock | None) -> None:
-    assert body["status"] == expect["status"]
+    if "status" in expect:
+        assert body["status"] == expect["status"]
+    if "status_not" in expect:
+        assert body["status"] != expect["status_not"]
 
     if "turn_mode" in expect:
         assert body["explain"]["turn_explain"]["mode"] == expect["turn_mode"]
+
+    if "message_contains" in expect:
+        assert expect["message_contains"] in (body.get("message") or "")
 
     if "candidates_contains" in expect:
         assert expect["candidates_contains"] in (body.get("candidates") or {})
@@ -197,14 +195,27 @@ def _assert_expectations(body: dict, expect: dict, gen_mock: mock.AsyncMock | No
         assert resolved["metrics"] == intent_expect["metrics"]
     if "group_by" in intent_expect:
         assert resolved["group_by"] == intent_expect["group_by"]
+    if "group_by_contains" in intent_expect:
+        assert intent_expect["group_by_contains"] in resolved["group_by"]
     if "time_n" in intent_expect:
         assert resolved["time_range"]["n"] == intent_expect["time_n"]
+    if "time_type" in intent_expect:
+        assert resolved["time_range"]["type"] == intent_expect["time_type"]
+    if "order_direction" in intent_expect:
+        assert resolved["order_by"]["direction"] == intent_expect["order_direction"]
+    if "order_limit" in intent_expect:
+        assert resolved["order_by"]["limit"] == intent_expect["order_limit"]
     if "window_group" in intent_expect:
         assert resolved["window"]["group_by"] == intent_expect["window_group"]
     if "window_limit" in intent_expect:
         assert resolved["window"]["limit"] == intent_expect["window_limit"]
     if "filter_column" in intent_expect:
         assert resolved["filters"][0]["column"] == intent_expect["filter_column"]
+    if "filter_value" in intent_expect:
+        assert resolved["filters"][0]["value"] == intent_expect["filter_value"]
+
+    if "time_expr_contains" in expect:
+        assert expect["time_expr_contains"] in gen_mock.call_args.args[1]["time_expr"]
 
     if "sql_intent_contains_join" in expect:
         # SQL 生成入参应包含推断出的 join
@@ -215,7 +226,7 @@ def _assert_expectations(body: dict, expect: dict, gen_mock: mock.AsyncMock | No
         )
 
 
-@pytest.mark.parametrize("case", _load_cases(), ids=lambda case: case["name"])
+@pytest.mark.parametrize("case", _load_cases())
 def test_nl2sql_end_to_end_eval_cases(eval_client, case):
     import app as app_module
 
@@ -225,7 +236,7 @@ def test_nl2sql_end_to_end_eval_cases(eval_client, case):
     for step in case["steps"]:
         if step.get("restart_before"):
             _rebind_runtime(str(data_root))
-            app_module._matcher_service = _build_service("high_confidence")
+            app_module._matcher_service = _build_service("real")
 
         request_body = {
             "text": step["text"],

@@ -31,3 +31,6 @@ Thumbs.db
 # Other
 *.log
 .pytest_cache/
+
+# Live eval reports
+eval_results/

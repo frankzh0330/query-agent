@@ -1,23 +1,31 @@
-# NL2SQL 端到端 golden cases
+# NL2SQL end-to-end golden cases (English, e-commerce demo schema)
 #
-# 每条 case:
-#   setup:       可选 last_query_state（多轮前置）/ project_memory（记忆注入前置）
-#   steps:       每步 text + extraction（mock LLM 抽取）+ resolver（mock matcher 场景）
-#   expect:      status / turn_mode / resolved_intent 关键字段
+# Each case:
+#   setup:   optional last_query_state (multi-turn precondition) / project_memory
+#   steps:   text + extraction (mocked LLM extraction, i.e. what an ideal extractor emits)
+#            + resolver (matcher scenario) + expect
+#   expect:  status / turn_mode / resolved_intent fields (see _assert_expectations)
+#   live_skip: excluded from scripts/live_eval.py (the case relies on a forced mock extraction)
+#   xfail:   the *correct* behaviour is asserted; the case is a known gap of the
+#            current implementation and the value is the reason. strict=True, so a
+#            fix flips it to a failure until the marker is removed.
 #
-# SQL 生成（generate_sql）在 harness 中统一 mock，评测对象是：
-#   意图解析 → matcher 解析 → 状态合并 → 确认流 → SQL 生成入参
+# The matcher scenario `real` uses the real MatcherService over catalog/sql_schema.yaml.
+# SQL generation (generate_sql) is mocked: the evaluated stages are
+#   intent parsing -> matcher resolution -> state merging -> confirmation flow -> SQL-gen inputs
+#
+# Categories: single-table (S), single-hop join (J), multi-hop (M), time (T),
+#             filters (F), ambiguity (A), window/order (W), follow-up (U), boundary (B)
 
 cases:
-  - name: basic_new_query
+  # ---------------------------------------------------------------- S: single table
+  - name: s01_revenue_last_7_days
     steps:
-      - text: 查询近7天订单表的销售额
-        project_id: 55
+      - text: What was the revenue in the last 7 days?
         extraction:
-          table_extractions: ["订单表"]
-          metric_extractions: ["销售额"]
-          time_extractions: ["近7天"]
-        resolver: high_confidence
+          metric_extractions: ["revenue"]
+          time_extractions: ["last 7 days"]
+        resolver: real
         expect:
           status: success
           turn_mode: new_query
@@ -26,127 +34,553 @@ cases:
             metrics: ["revenue"]
             time_n: 7
 
-  - name: basic_new_query_with_join
+  - name: s02_aov_yesterday
     steps:
-      - text: 近7天各地区的订单表订单量
-        project_id: 55
+      - text: Average order value yesterday
         extraction:
-          table_extractions: ["订单表"]
-          metric_extractions: ["订单量"]
-          group_by_extractions: ["地区"]
-          time_extractions: ["近7天"]
-        resolver: high_confidence
+          metric_extractions: ["average order value"]
+          time_extractions: ["yesterday"]
+        resolver: real
         expect:
           status: success
-          turn_mode: new_query
+          resolved_intent:
+            tables: ["orders"]
+            metrics: ["avg_order_value"]
+            time_type: yesterday
+
+  - name: s03_order_count_this_month
+    steps:
+      - text: How many orders did we get this month?
+        extraction:
+          metric_extractions: ["number of orders"]
+          time_extractions: ["this month"]
+        resolver: real
+        expect:
+          status: success
           resolved_intent:
             tables: ["orders"]
             metrics: ["order_count"]
-            group_by: ["users.region"]
-          sql_intent_contains_join: users
+            time_type: this_month
 
-  - name: followup_change_time
-    setup:
-      last_query_state:
-        project_id: 55
-        tables: ["orders"]
-        metrics: ["revenue"]
-        time_range:
-          type: last_n_days
-          n: 7
-        group_by: ["users.region"]
-        filters: []
-        turn_type: new_query
+  - name: s04_buyers_by_channel
     steps:
-      - text: 昨天
-        project_id: 55
+      - text: Unique buyers by channel over the last 30 days
         extraction:
-          time_extractions: ["昨天"]
-        resolver: high_confidence
+          metric_extractions: ["unique buyers"]
+          group_by_extractions: ["channel"]
+          time_extractions: ["last 30 days"]
+        resolver: real
         expect:
           status: success
-          turn_mode: followup_patch
+          resolved_intent:
+            tables: ["orders"]
+            metrics: ["buyer_count"]
+            group_by: ["orders.channel"]
+            time_n: 30
+
+  - name: s05_cancel_rate_by_channel
+    steps:
+      - text: Cancellation rate per traffic source
+        extraction:
+          metric_extractions: ["cancellation rate"]
+          group_by_extractions: ["traffic source"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            tables: ["orders"]
+            metrics: ["cancel_rate"]
+            group_by: ["orders.channel"]
+
+  - name: s06_alias_gmv
+    steps:
+      - text: GMV last 7 days
+        extraction:
+          metric_extractions: ["GMV"]
+          time_extractions: ["last 7 days"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            metrics: ["revenue"]
+
+  - name: s07_alias_aov
+    steps:
+      - text: What is our AOV?
+        extraction:
+          metric_extractions: ["AOV"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            tables: ["orders"]
+            metrics: ["avg_order_value"]
+
+  # ---------------------------------------------------------------- J: single-hop join
+  - name: j01_revenue_by_region
+    steps:
+      - text: Revenue by region in the last 7 days
+        extraction:
+          metric_extractions: ["revenue"]
+          group_by_extractions: ["region"]
+          time_extractions: ["last 7 days"]
+        resolver: real
+        expect:
+          status: success
           resolved_intent:
             tables: ["orders"]
             metrics: ["revenue"]
-            time_n: 1
+            group_by: ["users.region"]
+          sql_intent_contains_join: users
 
-  - name: followup_change_metric
+  - name: j02_revenue_by_category
+    steps:
+      - text: Revenue by product category
+        extraction:
+          metric_extractions: ["revenue"]
+          group_by_extractions: ["product category"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            tables: ["orders"]
+            metrics: ["revenue"]
+            group_by: ["products.category"]
+          sql_intent_contains_join: products
+
+  - name: j03_revenue_by_payment_method
+    steps:
+      - text: Revenue by payment method
+        extraction:
+          metric_extractions: ["revenue"]
+          group_by_extractions: ["payment method"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            group_by: ["payments.payment_type"]
+          sql_intent_contains_join: payments
+
+  - name: j04_avg_rating_by_channel
+    steps:
+      - text: Average rating by acquisition channel
+        extraction:
+          metric_extractions: ["average rating"]
+          group_by_extractions: ["acquisition channel"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            tables: ["reviews"]
+            metrics: ["avg_rating"]
+            group_by: ["orders.channel"]
+          sql_intent_contains_join: orders
+
+  - name: j05_orders_by_vip_level
+    steps:
+      - text: Number of orders by membership level
+        extraction:
+          metric_extractions: ["number of orders"]
+          group_by_extractions: ["membership level"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            group_by: ["users.vip_level"]
+          sql_intent_contains_join: users
+
+  - name: j06_multiple_joins
+    steps:
+      - text: Revenue by region and product category
+        extraction:
+          metric_extractions: ["revenue"]
+          group_by_extractions: ["region", "product category"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            group_by: ["users.region", "products.category"]
+          sql_intent_contains_join: users
+
+  # ---------------------------------------------------------------- M: multi-hop joins
+  - name: m01_payment_amount_by_region
+    xfail: "single-hop join inference: payments -> orders -> users is not resolved; the user is asked to pick the bridge table instead"
+    steps:
+      - text: Total payment amount by region
+        extraction:
+          metric_extractions: ["payment amount"]
+          group_by_extractions: ["region"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            tables: ["payments"]
+            group_by: ["users.region"]
+
+  - name: m02_revenue_by_seller_region
+    xfail: "single-hop join inference: orders -> products -> sellers is not resolved; the user is asked to pick a bridge table (candidates include dead-end ones)"
+    steps:
+      - text: Revenue by seller region
+        extraction:
+          metric_extractions: ["revenue"]
+          group_by_extractions: ["seller region"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            tables: ["orders"]
+            group_by: ["sellers.region"]
+
+  - name: m03_avg_rating_by_category
+    xfail: "single-hop join inference: reviews -> orders -> products is not resolved; the user is asked to pick the bridge table instead"
+    steps:
+      - text: Average rating by product category
+        extraction:
+          metric_extractions: ["average rating"]
+          group_by_extractions: ["product category"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            tables: ["reviews"]
+            group_by: ["products.category"]
+
+  # ---------------------------------------------------------------- T: time expressions
+  - name: t01_last_week
+    steps:
+      - text: Revenue last week
+        extraction:
+          metric_extractions: ["revenue"]
+          time_extractions: ["last week"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            time_type: last_week
+
+  - name: t02_last_month
+    steps:
+      - text: Revenue last month
+        extraction:
+          metric_extractions: ["revenue"]
+          time_extractions: ["last month"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            time_type: last_month
+
+  - name: t03_past_14_days
+    steps:
+      - text: Orders in the past 14 days
+        extraction:
+          metric_extractions: ["number of orders"]
+          time_extractions: ["past 14 days"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            time_n: 14
+
+  - name: t04_today
+    steps:
+      - text: Revenue today
+        extraction:
+          metric_extractions: ["revenue"]
+          time_extractions: ["today"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            time_type: today
+
+  - name: t05_last_quarter
+    xfail: "unsupported time expressions silently fall back to the default (last 7 days)"
+    steps:
+      - text: Revenue last quarter
+        extraction:
+          metric_extractions: ["revenue"]
+          time_extractions: ["last quarter"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            time_type: last_quarter
+
+  - name: t06_time_on_non_orders_table
+    steps:
+      - text: New users in the last 30 days
+        extraction:
+          metric_extractions: ["new users"]
+          time_extractions: ["last 30 days"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            tables: ["users"]
+            metrics: ["new_user_count"]
+            time_n: 30
+          time_expr_contains: users.registered_at
+
+  # ---------------------------------------------------------------- F: filters / enum values
+  - name: f01_filter_paid_orders
+    steps:
+      - text: Revenue of paid orders
+        extraction:
+          metric_extractions: ["revenue"]
+          filter_extractions:
+            - {text: "paid orders", column: "status", op: "=", value: "paid"}
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            tables: ["orders"]
+            filter_column: orders.status
+
+  - name: f02_filter_gold_members
+    steps:
+      - text: Orders from gold members
+        extraction:
+          metric_extractions: ["number of orders"]
+          filter_extractions:
+            - {text: "gold members", column: "membership level", op: "=", value: "gold"}
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            filter_column: users.vip_level
+          sql_intent_contains_join: users
+
+  - name: f03_filter_credit_card
+    steps:
+      - text: Revenue paid by credit card
+        extraction:
+          metric_extractions: ["revenue"]
+          filter_extractions:
+            - {text: "credit card", column: "payment method", op: "=", value: "credit_card"}
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            filter_column: payments.payment_type
+            filter_value: credit_card       # "credit card" is normalized to the declared enum value
+          sql_intent_contains_join: payments
+
+  - name: f04_enum_value_spelling_variant
+    steps:
+      - text: Cancelled orders last week
+        extraction:
+          metric_extractions: ["number of orders"]
+          filter_extractions:
+            - {text: "cancelled orders", column: "status", op: "=", value: "cancelled"}
+          time_extractions: ["last week"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            filter_column: orders.status
+            filter_value: canceled
+
+  - name: f05_hallucinated_filter_column_is_not_guessed
+    # Regression guard for the matcher/orchestrator only: the mocked extraction forces a bogus
+    # filter column. The real LLM no longer emits one (see prompt rules), so live_eval skips it.
+    live_skip: "needs a forced hallucinated extraction"
+    steps:
+      - text: Revenue from new users
+        extraction:
+          metric_extractions: ["revenue"]
+          filter_extractions:
+            - {text: "new users", column: "user_type", op: "=", value: "new"}
+        resolver: real
+        expect:
+          status: early_exit              # must ask, not silently filter on orders.user_id
+          message_contains: "new users"
+
+  # ---------------------------------------------------------------- A: ambiguity
+  - name: a01_ambiguous_amount_column
+    xfail: "same-named columns resolve first-wins at score 100; ambiguity is not surfaced"
+    steps:
+      - text: Show the amount of recent records
+        extraction:
+          column_extractions: ["amount"]
+        resolver: real
+        expect:
+          status: needs_confirmation
+
+  - name: a02_ambiguous_time_column
+    xfail: "same-named columns resolve first-wins at score 100; ambiguity is not surfaced"
+    steps:
+      - text: Number of orders by time
+        extraction:
+          metric_extractions: ["number of orders"]
+          group_by_extractions: ["time"]
+        resolver: real
+        expect:
+          status: needs_confirmation
+
+  - name: a03_low_confidence_table_confirmation
+    steps:
+      - text: Revenue from the products table
+        extraction:
+          table_extractions: ["products table"]
+          metric_extractions: ["revenue"]
+        resolver: low_confidence_table
+        expect:
+          status: needs_confirmation
+          candidates_contains: tables
+
+  # ---------------------------------------------------------------- W: window / order
+  - name: w01_top5_categories_by_revenue
+    steps:
+      - text: Top 5 product categories by revenue
+        extraction:
+          metric_extractions: ["revenue"]
+          group_by_extractions: ["product category"]
+          order_extractions: ["top 5 by revenue"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            group_by: ["products.category"]
+            order_direction: DESC
+            order_limit: 5
+
+  - name: w02_bottom3_channels_by_refund_rate
+    steps:
+      - text: Bottom 3 channels by refund rate
+        extraction:
+          metric_extractions: ["refund rate"]
+          group_by_extractions: ["channel"]
+          order_extractions: ["bottom 3 by refund rate"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            metrics: ["refund_rate"]
+            order_direction: ASC
+            order_limit: 3
+
+  - name: w03_top3_categories_per_region
+    steps:
+      - text: Top 3 categories by revenue in each region
+        extraction:
+          metric_extractions: ["revenue"]
+          group_by_extractions: ["product category"]
+          window_extractions: ["top 3 per region"]
+        resolver: real
+        expect:
+          status: success
+          resolved_intent:
+            window_group: users.region
+            window_limit: 3
+
+  # ---------------------------------------------------------------- U: multi-turn follow-ups
+  - name: u01_followup_change_time
     setup:
-      last_query_state:
+      last_query_state: &base_state
         project_id: 55
         tables: ["orders"]
         metrics: ["revenue"]
-        time_range:
-          type: last_n_days
-          n: 7
+        time_range: {type: last_n_days, n: 7}
         group_by: ["users.region"]
         filters: []
         turn_type: new_query
     steps:
-      - text: 改成订单量
-        project_id: 55
+      - text: What about yesterday?
         extraction:
-          metric_extractions: ["订单量"]
-        resolver: high_confidence
+          time_extractions: ["yesterday"]
+        resolver: real
         expect:
           status: success
           turn_mode: followup_patch
           resolved_intent:
-            tables: ["orders"]
+            metrics: ["revenue"]
+            group_by: ["users.region"]
+            time_type: yesterday
+
+  - name: u02_followup_change_metric
+    setup:
+      last_query_state: *base_state
+    steps:
+      - text: Show the number of orders instead
+        extraction:
+          metric_extractions: ["number of orders"]
+        resolver: real
+        expect:
+          status: success
+          turn_mode: followup_patch
+          resolved_intent:
             metrics: ["order_count"]
+            group_by: ["users.region"]
+            time_n: 7
 
-  - name: followup_add_window_rank
+  - name: u03_followup_add_group_by
     setup:
-      last_query_state:
-        project_id: 55
-        tables: ["orders"]
-        metrics: ["revenue"]
-        time_range:
-          type: last_n_days
-          n: 7
-        group_by: ["users.region"]
-        filters: []
-        turn_type: new_query
+      last_query_state: *base_state
     steps:
-      - text: 每个地区前3
-        project_id: 55
+      - text: Also break it down by channel
         extraction:
-          window_extractions: ["每个地区前3"]
-        resolver: high_confidence
+          group_by_extractions: ["channel"]
+        resolver: real
         expect:
           status: success
           turn_mode: followup_patch
           resolved_intent:
-            tables: ["orders"]
+            metrics: ["revenue"]
+            group_by_contains: orders.channel
+
+  - name: u04_followup_add_filter
+    setup:
+      last_query_state: *base_state
+    steps:
+      - text: Only paid orders
+        extraction:
+          filter_extractions:
+            - {text: "paid orders", column: "status", op: "=", value: "paid"}
+        resolver: real
+        expect:
+          status: success
+          turn_mode: followup_patch
+          resolved_intent:
+            metrics: ["revenue"]
+            filter_column: orders.status
+
+  - name: u05_followup_add_window_rank
+    setup:
+      last_query_state: *base_state
+    steps:
+      - text: Top 3 per region
+        extraction:
+          window_extractions: ["top 3 per region"]
+        resolver: real
+        expect:
+          status: success
+          turn_mode: followup_patch
+          resolved_intent:
             metrics: ["revenue"]
             window_group: users.region
             window_limit: 3
 
-  - name: followup_confirmation_flow
+  - name: u06_followup_confirmation_flow
     setup:
       last_query_state:
         project_id: 55
         tables: ["orders"]
         metrics: ["revenue"]
-        time_range:
-          type: last_n_days
-          n: 7
+        time_range: {type: last_n_days, n: 7}
         group_by: ["orders.channel"]
         filters: []
         turn_type: new_query
     steps:
-      - text: 对比商品表
-        project_id: 55
+      - text: Compare with the products table
         extraction:
-          table_extractions: ["商品表"]
+          table_extractions: ["products table"]
         resolver: low_confidence_table
         expect:
           status: needs_confirmation
           turn_mode: followup_patch
           candidates_contains: tables
       - text: "1"
-        project_id: 55
         expect:
           status: success
           turn_mode: confirmation
@@ -154,43 +588,17 @@ cases:
             tables: ["products"]
             metrics: ["revenue"]
 
-  - name: project_memory_context_injected
-    setup:
-      project_memory:
-        project_id: 55
-        entries:
-          - filename: aliases.md
-            content: |
-              在本项目口语里，"大单" 指金额大于 1000 的订单。
+  - name: u07_confirmation_after_restart
     steps:
-      - text: 看大单数据
-        project_id: 55
+      - text: Revenue from the products table
         extraction:
-          metric_extractions: ["销售额"]
-          filter_extractions: [{"text": "大单", "column": "金额", "op": ">", "value": "1000"}]
-        resolver: high_confidence
-        assert_memory_contains: "大单"
-        expect:
-          status: success
-          turn_mode: new_query
-          resolved_intent:
-            tables: ["orders"]
-            metrics: ["revenue"]
-            filter_column: orders.amount
-
-  - name: confirmation_after_restart
-    steps:
-      - text: 商品表的销售额
-        project_id: 55
-        extraction:
-          table_extractions: ["商品表"]
-          metric_extractions: ["销售额"]
+          table_extractions: ["products table"]
+          metric_extractions: ["revenue"]
         resolver: low_confidence_table
         expect:
           status: needs_confirmation
           candidates_contains: tables
       - text: "1"
-        project_id: 55
         restart_before: true
         expect:
           status: success
@@ -198,3 +606,74 @@ cases:
           resolved_intent:
             tables: ["products"]
             metrics: ["revenue"]
+
+  - name: u08_new_topic_is_not_followup
+    setup:
+      last_query_state: *base_state
+    steps:
+      - text: Cancellation rate by traffic source for the last 30 days
+        extraction:
+          metric_extractions: ["cancellation rate"]
+          group_by_extractions: ["traffic source"]
+          time_extractions: ["last 30 days"]
+        resolver: real
+        expect:
+          status: success
+          turn_mode: new_query
+          resolved_intent:
+            metrics: ["cancel_rate"]
+            group_by: ["orders.channel"]
+            time_n: 30
+
+  - name: u09_project_memory_context_injected
+    setup:
+      project_memory:
+        project_id: 55
+        entries:
+          - filename: aliases.md
+            content: |
+              In this project, "big orders" means orders with amount greater than 1000.
+    steps:
+      - text: Show me big orders
+        extraction:
+          table_extractions: ["orders"]
+          filter_extractions:
+            - {text: "big orders", column: "order amount", op: ">", value: "1000"}
+        resolver: real
+        assert_memory_contains: "big orders"
+        expect:
+          status: success
+          turn_mode: new_query
+          resolved_intent:
+            tables: ["orders"]
+            filter_column: orders.amount
+
+  # ---------------------------------------------------------------- B: boundary / must-not-hallucinate
+  - name: b01_unknown_group_by_column
+    xfail: "an unmatched group-by is silently dropped instead of surfacing an error"
+    steps:
+      - text: Revenue by shoe size
+        extraction:
+          metric_extractions: ["revenue"]
+          group_by_extractions: ["shoe size"]
+        resolver: real
+        expect:
+          status_not: success
+
+  - name: b02_unknown_metric
+    xfail: "fuzzy matching accepts 'customer lifetime value' as avg_order_value (85.5 >= 80 auto-accept threshold): wrong answer, no confirmation"
+    steps:
+      - text: What is the customer lifetime value?
+        extraction:
+          metric_extractions: ["customer lifetime value"]
+        resolver: real
+        expect:
+          status_not: success
+
+  - name: b03_no_extractions
+    steps:
+      - text: Hello there
+        extraction: {}
+        resolver: real
+        expect:
+          status_not: success

@@ -59,3 +59,27 @@ def sample_intent_json():
 @pytest.fixture
 def sample_intent_no_signal():
     return SQLIntentJson()
+
+
+@pytest.fixture(autouse=True)
+def _no_background_memory_llm(monkeypatch):
+    """orchestrator 每次成功查询都会后台触发 memory judge（真实 LLM 调用）。
+
+    测试/eval 必须离线、确定，且不能往 data/memory 写运行产物 → 对全局 orchestrator 的
+    MemoryWriter 实例打桩（只 patch 实例，不影响 test_memory_writer 直接构造的对象）。
+    """
+    import sys
+
+    app_module = sys.modules.get("app")
+    if app_module is None:
+        try:
+            import app as app_module  # noqa: F811
+        except Exception:
+            yield
+            return
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(app_module.orchestrator.memory, "maybe_save", _noop)
+    yield
