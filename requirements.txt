@@ -17,8 +17,9 @@ openai>=1.30.0
 jieba==0.42.1
 rapidfuzz==3.14.3
 
-# Scheduling
-apscheduler>=3.10.0
+# SQL Parsing / Validation
+sqlglot>=25.0.0
+
 
 # Message Bus (optional, for Redis mode)
 redis>=5.0.0

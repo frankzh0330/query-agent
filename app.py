@@ -16,16 +16,14 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from service.bearer_service import execute_query
 from service.session_manager import SessionManager
-from service.session_models import QueryState
 from service.task_manager import TaskManager
 from memory.memory_writer import MemoryWriter
 from memory.storage.memory_file import TaskStorage
 from memory.user_preference_store import UserPreferenceStore
 from service.query_orchestrator import QueryOrchestrator
 
-app = FastAPI(title="query-agent: NL to Semantic DSL")
+app = FastAPI(title="query-agent: NL to ClickHouse SQL")
 logger = logging.getLogger(__name__)
 
 # ====================
@@ -56,7 +54,7 @@ def get_matcher_service() -> "MatcherService":
 # 请求/响应模型
 # ====================
 
-class NL2DSLRequest(BaseModel):
+class NL2SQLRequest(BaseModel):
     text: str
     project_id: int = Field(default=55)
     session_id: str | None = None
@@ -64,10 +62,10 @@ class NL2DSLRequest(BaseModel):
     chat_id: str | None = None
 
 
-class NL2DSLResponse(BaseModel):
+class NL2SQLResponse(BaseModel):
     extraction_json: Dict[str, Any]
-    semantic: Dict[str, Any]
-    exec_dsl: Dict[str, Any]
+    sql: str
+    resolved_intent: Dict[str, Any]
     explain: Dict[str, Any]
     session_id: str | None = None
     status: str = "success"
@@ -76,14 +74,9 @@ class NL2DSLResponse(BaseModel):
     candidates: Dict[str, Any] | None = None
 
 
-class BearerQueryRequest(BaseModel):
-    exec_dsl: Dict[str, Any]
-
-
-class BearerQueryResponse(BaseModel):
-    result: Dict[str, Any]
-    success: bool
-    error: Optional[str] = None
+# 兼容旧端点名
+NL2DSLRequest = NL2SQLRequest
+NL2DSLResponse = NL2SQLResponse
 
 
 # ====================
@@ -107,24 +100,13 @@ async def _send_telegram_notification(chat_id: str, message: str) -> None:
 # HTTP 端点
 # ====================
 
-@app.post("/nl2dsl", response_model=NL2DSLResponse)
-async def nl2dsl(req: NL2DSLRequest) -> NL2DSLResponse:
-    """NL 转 DSL 接口"""
+@app.post("/nl2sql", response_model=NL2SQLResponse)
+@app.post("/nl2dsl", response_model=NL2SQLResponse, include_in_schema=False)
+async def nl2sql(req: NL2SQLRequest) -> NL2SQLResponse:
+    """NL → ClickHouse SQL 接口"""
     service = get_matcher_service()
-    catalog = service.catalog
-    result = await orchestrator.process(req, service, catalog, notify_fn=_send_telegram_notification)
-    return NL2DSLResponse(**result)
-
-
-@app.post("/query/bearer", response_model=BearerQueryResponse)
-async def query_bearer(req: BearerQueryRequest):
-    """执行 Bearer 查询接口"""
-    try:
-        result = await execute_query(req.exec_dsl)
-        return BearerQueryResponse(result=result, success=True)
-    except Exception as e:
-        logger.error("Bearer query failed: %s", e)
-        return BearerQueryResponse(result={}, success=False, error=str(e))
+    result = await orchestrator.process(req, service, service.schema, notify_fn=_send_telegram_notification)
+    return NL2SQLResponse(**result)
 
 
 @app.get("/sessions")

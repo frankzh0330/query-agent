@@ -51,7 +51,7 @@ Session memory stores the short-lived state of the current conversation:
 It solves turn-based continuity:
 
 ```text
-Q1: Show PV for app_launch in Germany
+Q1: Revenue by region for the last 7 days
 Q2: Yesterday
 Q3: Change it to UV
 ```
@@ -98,8 +98,8 @@ This knowledge is:
 
 This is especially important when real metadata is large, for example:
 
-- ~40K events
-- many properties per event
+- tens of thousands of tables and columns
+- many business aliases per column
 - overlapping natural-language expressions
 
 In that environment, project semantics matter as much as raw matching.
@@ -279,11 +279,11 @@ Example:
 
 ```json
 {
-  "event": "app_launch",
-  "metric": "pv",
+  "tables": ["orders"],
+  "metrics": ["revenue"],
   "time_range": {"type": "last_n_days", "n": 7},
-  "region_filter": ["ROW"],
-  "group_by": ["country"]
+  "group_by": ["users.region"],
+  "window": {"group_by": "users.region", "limit": 3}
 }
 ```
 
@@ -324,7 +324,7 @@ usage counters.
 
 Recommended split:
 
-- `UserAlias`: explicit or learned aliases such as “startup” -> `app_launch`
+- `UserAlias`: explicit or learned aliases such as “orders” -> `orders` table
 - `UserPattern`: aggregated top events, metrics, dimensions, regions, and query frequency
 - `UserPreferences`: stable defaults such as preferred metric, region, or time range
 - `QueryHistory`: durable query traces for replay, evaluation, and pattern learning

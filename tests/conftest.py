@@ -6,7 +6,7 @@ from memory.long_term_memory import LongTermMemory
 from service.session_manager import SessionManager
 from service.task_manager import TaskManager
 from service.session_models import QueryState
-from service.llm_extractions import Extraction, ExtractionsJson
+from service.llm_extractions import Extraction, SQLIntentJson
 
 
 @pytest.fixture
@@ -38,30 +38,24 @@ def task_manager(task_storage):
 def sample_query_state():
     return QueryState(
         project_id=55,
-        event="app_launch",
-        metric="pv",
+        tables=["orders"],
+        metrics=["revenue"],
         time_range={"type": "last_n_days", "n": 7},
-        region_filter=["ROW"],
-        group_by=["country"],
+        group_by=["users.region"],
         filters=[],
     )
 
 
 @pytest.fixture
-def sample_extractions_json():
-    return ExtractionsJson(
-        metric_extractions=[Extraction(text="PV")],
+def sample_intent_json():
+    return SQLIntentJson(
+        metric_extractions=[Extraction(text="销售额")],
         time_extractions=[Extraction(text="近7天")],
-        event_extractions=[Extraction(text="app_launch")],
-        region_filter=["ROW"],
-        group_by_extractions=[Extraction(text="country")],
+        table_extractions=[Extraction(text="订单表")],
+        group_by_extractions=[Extraction(text="地区")],
     )
 
 
 @pytest.fixture
-def sample_extractions_no_event():
-    return ExtractionsJson(
-        metric_extractions=[Extraction(text="PV")],
-        event_extractions=[],
-        region_filter=["ROW"],
-    )
+def sample_intent_no_signal():
+    return SQLIntentJson()

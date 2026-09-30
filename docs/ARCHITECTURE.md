@@ -21,10 +21,10 @@ This document summarizes the current architecture of `query-agent`, the responsi
 │   task_manager.py · followup_resolver.py                    │
 │   query_state_merger.py                                     │
 ├──────────────────────────────────────────────────────────────┤
-│                     NL2DSL Pipeline                         │
+│                     NL2SQL Pipeline                         │
 │   llm_extractions.py                                        │
-│   matcher_service.py + matchers                             │
-│   semantic_models.py · renderer.py · validators.py          │
+│   matcher_service.py + table/column/metric matchers         │
+│   sql_generator.py · sql_validator.py                       │
 ├──────────────────────────────────────────────────────────────┤
 │                     Memory Layer                            │
 │   long_term_memory.py · memory_writer.py                    │
@@ -53,7 +53,8 @@ server.py
             ├─ service/query_state_merger.py
             ├─ service/llm_extractions.py
             ├─ matcher/*
-            ├─ dsl/*
+            ├─ service/sql_generator.py
+            ├─ service/sql_validator.py
             └─ memory/*
 ```
 
@@ -70,22 +71,23 @@ Guidelines:
 
 ```mermaid
 flowchart TD
-    U["User"] --> API["POST /nl2dsl"]
+    U["User"] --> API["POST /nl2sql"]
     API --> ORC["QueryOrchestrator.process()"]
     ORC --> S["SessionManager.create_or_get"]
     S --> C["Enhanced Context"]
-    C --> L1["LLM Extraction"]
-    L1 --> L2["Matcher Resolution"]
+    C --> L1["LLM Intent Extraction"]
+    L1 --> L2["Matcher Resolution<br/>(table / column / metric / time)"]
     L2 --> T{"Turn Logic"}
-    T -->|new_query| D1["Semantic DSL"]
+    T -->|new_query| S1["QueryState"]
     T -->|followup_patch| M["QueryState Merge"]
-    M --> D1
+    M --> S1
     T -->|needs_confirmation| K["TaskManager"]
     K --> R["User Reply"]
-    R --> D1
-    D1 --> D2["Exec DSL Render"]
-    D2 --> V["Validation"]
-    V --> O["Response"]
+    R --> S1
+    S1 --> J["Join Inference (schema config)"]
+    J --> G["LLM SQL Generation<br/>(ClickHouse, grounded)"]
+    G --> V["sqlglot Validation"]
+    V --> O["ClickHouse SQL"]
     V --> ML["Async MemoryWriter"]
 ```
 
@@ -101,7 +103,7 @@ flowchart TD
     DISP --> TG
 ```
 
-## NL2DSL Pipeline
+## NL2SQL Pipeline
 
 ### Layer 1: LLM Extraction
 
@@ -122,40 +124,50 @@ Input:
 
 Output:
 
-- `ExtractionsJson`
+- `SQLIntentJson` (table / metric / column / filter / group_by / time / order / window fragments)
 
 ### Layer 2: Matcher Resolution
 
-Owned by [matcher/matcher_service.py](../matcher/matcher_service.py) and concrete matchers.
+Owned by [matcher/matcher_service.py](../matcher/matcher_service.py) and concrete matchers
+([table_matcher.py](../matcher/table_matcher.py), [column_matcher.py](../matcher/column_matcher.py),
+[sql_metric_matcher.py](../matcher/sql_metric_matcher.py), [time_matcher.py](../matcher/time_matcher.py)),
+built on [matcher/base.py](../matcher/base.py) (inverted index + RapidFuzz + synonyms) over
+[matcher/schema_loader.py](../matcher/schema_loader.py) metadata.
 
 Responsibilities:
 
-- resolve `metric / event / dimension / time`
-- return score, candidates, and `needs_confirmation`
-- keep resolution deterministic and inspectable
+- resolve `table / table.column / metric_id / time_range` with scores and candidates
+- threshold policy (deterministic, no LLM): score >= 80 accept, 40-80 confirm, < 40 drop/fallback
+- infer the main table when the user does not name one (metric expression or column ownership)
+- infer join steps from declarative `joins:` config; missing paths escalate to confirmation
 
 Important detail:
 
 - user preference is applied **after recall** as a small rerank signal
 - matcher itself remains the main semantic resolver
 
-### Layer 3: Semantic DSL
+### Layer 3: SQL Generation
 
-Owned by [dsl/semantic_models.py](../dsl/semantic_models.py).
-
-Responsibilities:
-
-- express canonical query intent
-- separate query semantics from downstream execution format
-
-### Layer 4: Exec DSL
-
-Owned by [dsl/renderer.py](../dsl/renderer.py) and [dsl/validators.py](../dsl/validators.py).
+Owned by [service/sql_generator.py](../service/sql_generator.py).
 
 Responsibilities:
 
-- render executable payload
-- validate region and consistency constraints
+- assemble the generation prompt from resolved entities: base table, metric expressions,
+  qualified columns, filters, time predicate (ClickHouse syntax), join conditions, window/order intent
+- call the LLM to produce one ClickHouse SELECT; entity names are pinned by the prompt, the LLM
+  assembles structure only (GROUP BY / JOIN / `LIMIT n BY` grouped ranking)
+- repair loop: failed validation feeds the error back into the next round (max 2 extra rounds)
+
+### Layer 4: Validation
+
+Owned by [service/sql_validator.py](../service/sql_validator.py) (sqlglot, `dialect="clickhouse"`).
+
+Responsibilities:
+
+- single read-only statement (SELECT / WITH only)
+- all table references must be in the schema whitelist
+- default LIMIT injection
+- deterministic guardrails, independent of the LLM
 
 ## Turn-Based Querying
 
@@ -184,10 +196,10 @@ The system distinguishes:
 ```mermaid
 flowchart TD
     Q["Incoming text"] --> D["detect_followup()"]
-    D -->|new_query| N["Run full NL2DSL path"]
+    D -->|new_query| N["Run full NL2SQL path"]
     D -->|followup_patch| P["Extract patch"]
     P --> M["merge_query_state()"]
-    M --> S["Semantic DSL"]
+    M --> S["SQL Generation"]
     D -->|confirmation_reply| T["TaskManager / pending task"]
 ```
 
@@ -324,10 +336,9 @@ Responsibilities:
 Responsibilities:
 
 - application lifespan
-- matcher service initialization
+- matcher service initialization (schema loading + index build)
 - bus / worker / dispatcher wiring
 - Telegram gateway startup
-- catalog scheduler startup
 - session periodic cleanup (5 min interval, 60 min expiry)
 
 ### `gateway/*`, `ingress/*`, `bus/*`, `worker/*`, `dispatcher/*`
@@ -351,9 +362,9 @@ details.
 ### Scenario 1: First Query
 
 ```json
-POST /nl2dsl
+POST /nl2sql
 {
-  "text": "Show PV for app_launch in Germany",
+  "text": "Revenue by region for the last 7 days",
   "project_id": 55
 }
 ```
@@ -362,16 +373,18 @@ Expected behavior:
 
 - creates or restores a session
 - runs the full `new_query` path
-- resolves event, metric, time, and region
+- resolves metric / time / group-by column, infers the main table (`revenue -> orders`),
+  and infers the join to `users` for `users.region`
+- generates and validates ClickHouse SQL
 - returns `status=success`
 - persists `last_query_state` for later turns
 
 ### Scenario 2: Follow-Up Patch
 
 ```json
-POST /nl2dsl
+POST /nl2sql
 {
-  "text": "Change it to UV",
+  "text": "Change to order count",
   "project_id": 55,
   "session_id": "abc-123"
 }
@@ -380,22 +393,22 @@ POST /nl2dsl
 Expected behavior:
 
 - detects `followup_patch`
-- keeps inherited fields such as event and region
-- applies only the metric patch
+- keeps inherited fields such as tables and time range
+- applies only the metrics patch
 - records field sources as `explicit` or `inherited`
 
 ### Scenario 3: Time-Only Follow-Up
 
 ```text
-Q1: Show PV for app_launch in Germany
+Q1: Revenue by region for the last 7 days
 Q2: Yesterday
 ```
 
 Expected behavior:
 
-- keeps `event=app_launch`
-- keeps `metric=pv`
-- keeps the previous region
+- keeps `tables=[orders]`
+- keeps `metrics=[revenue]`
+- keeps the previous group-by
 - changes only the time range
 
 This is the canonical reason `last_query_state` must be structured instead of a
@@ -404,23 +417,23 @@ plain text chat summary.
 ### Scenario 4: Confirmation Flow
 
 ```json
-POST /nl2dsl
+POST /nl2sql
 {
-  "text": "Show startup success",
+  "text": "Show revenue for the product table",
   "project_id": 55
 }
 ```
 
-If event resolution is ambiguous, the system should return:
+If table resolution is ambiguous, the system should return:
 
 ```json
 {
   "status": "needs_confirmation",
   "task_id": "xxx",
   "candidates": {
-    "event": [
-      { "value": "app_launch", "score": 72.0 },
-      { "value": "app_cold_start_success", "score": 69.0 }
+    "tables": [
+      { "value": "products", "score": 55.0 },
+      { "value": "orders", "score": 48.0 }
     ]
   }
 }
@@ -429,7 +442,7 @@ If event resolution is ambiguous, the system should return:
 Then a reply such as:
 
 ```json
-POST /nl2dsl
+POST /nl2sql
 {
   "text": "1",
   "session_id": "abc-123"
@@ -509,7 +522,7 @@ The project uses both regular tests and data-driven end-to-end evals.
 
 Owned by:
 
-- [tests/evals/nl2dsl_cases.yaml](../tests/evals/nl2dsl_cases.yaml)
+- [tests/evals/nl2sql_cases.yaml](../tests/evals/nl2sql_cases.yaml)
 - [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
 
 Current coverage includes:
@@ -572,9 +585,9 @@ points:
 
 The likely future model set is:
 
-- `UserPreferences`: default metric, region, event, or time range
-- `UserAlias`: user-defined phrases mapped to canonical events, metrics, or dimensions
-- `UserPattern`: aggregated top events, metrics, regions, dimensions, and query frequency
+- `UserPreferences`: default metric, table, filter values, or time range
+- `UserAlias`: user-defined phrases mapped to canonical tables, columns, or metrics
+- `UserPattern`: aggregated top tables, metrics, columns, and query frequency
 - `QueryHistory`: successful and failed query traces for replay, learning, and evaluation
 
 ### Important Constraint

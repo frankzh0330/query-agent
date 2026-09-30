@@ -2,15 +2,14 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md)
 
-`query-agent` 是一个面向数据查询场景的 NL2DSL Agent。它接收自然语言问题，解析出 `event / metric / time / region / group_by`，构建语义 DSL，渲染为可执行 DSL，并支持多轮会话、确认流、项目记忆、用户偏好重排和异步记忆学习。
+`query-agent` 是一个面向 ClickHouse 的 **NL2SQL Data Agent**。它接收自然语言问题，抽取查询意图片段（`table / metric / column / filter / time / group_by / order / window`），用确定性 matcher 把片段解析为 schema 规范实体，并生成经过校验的 ClickHouse SQL——同时支持多轮会话、歧义实体的确认流、项目记忆和用户偏好重排。
 
-这个项目已经不只是一个单轮 `NL -> DSL` Demo，而是一个更接近真实 Data Agent 的系统：
+这个项目不是一个普通的 text2sql demo，而是一个受控的 Data Agent：
 
 - 支持 HTTP 和 Telegram 两种入口
 - 支持 turn-based follow-up 和 confirmation
 - 支持 Session Memory、Project Memory、User Preference Signal
 - 支持 Direct / Redis 两种消息总线模式
-- 支持项目级 catalog 定时同步
 - 支持 end-to-end eval 样例集
 
 ## 总览
@@ -19,12 +18,12 @@
 
 ```text
 Natural Language
-  -> LLM Extraction
-  -> Matcher Resolution
-  -> QueryState / Turn Logic
-  -> Semantic DSL
-  -> Exec DSL
-  -> Validation
+  -> LLM 意图抽取 (Layer 1)
+  -> 确定性实体解析 (Layer 2: 表 / 列 / 指标 / 时间)
+  -> QueryState / Turn 逻辑
+  -> 基于已解析实体的 LLM SQL 生成 (Layer 3)
+  -> sqlglot 校验 (只读 / 表白名单 / 自动 LIMIT)
+  -> ClickHouse SQL
 ```
 
 系统运行链路：
@@ -34,72 +33,72 @@ Gateway
   -> Ingress
   -> Message Bus
   -> Agent Worker
-  -> NL2DSL Pipeline
+  -> NL2SQL Pipeline
   -> Dispatcher
 ```
 
-## 亮点
+## 核心亮点
 
-- 分层 NL2DSL Pipeline：extraction、matching、semantic DSL、exec DSL、validation
-- Turn-based Q&A：`last_query_state`、follow-up detection、patch merge、confirmation flow
-- Session 持久化：基于 JSONL append-only 的会话存储与恢复
-- Pending task 持久化：确认任务可跨进程重启恢复
-- 项目级 memory：`project_{id}/MEMORY.md` + 相关片段选择
-- 用户偏好重排：按 `project_id + user_id` 作用域做 post-recall bias
-- 异步 memory learning：成功查询后可写回 correction / preference / constraint
-- Telegram long polling gateway + message bus worker 架构
-- end-to-end eval：覆盖新查询、follow-up、confirmation、memory 注入、重启恢复
+- **确定性实体解析**：表/列/指标名由倒排索引 + RapidFuzz 对 schema 目录解析（带分数与候选），LLM 从不发明实体名
+- **确认流即护栏**：低置信实体（40-80 分）触发显式用户确认而非静默猜测；join 路径缺失同样升级确认
+- **Join 由 schema 配置**：join 关系来自元数据，不由 LLM 猜测
+- **Turn-based 多轮**：`last_query_state` + follow-up 检测 + 字段级 patch merge（状态机，不是聊天回放）
+- **接地（grounded）的 SQL 生成**：生成 prompt 固定已解析的表/列/指标名、join 条件与时间谓词，LLM 只组装查询结构
+- **sqlglot 校验**：单条只读语句、表白名单、默认 LIMIT 注入，失败带错误信息修复重试（上限 2 轮）
+- **AST 后置分析**（`sql_ast_analyzer.py`）：列存在性（别名解析）、实体保真断言（已解析的表/指标表达式/过滤谓词必须出现在 SQL 中，对抗语义漂移）、join 边与 join 键与 schema 声明一致性、静态成本分析（est_rows 扫描量估算、事实表全表扫描检测）——分析错误同样回灌修复循环
+- **Cross-encoder 重排**（`reranker.py`，`RERANKER_ENABLED=true`）：歧义匹配（40-80 确认带或候选并列）时的受限 LLM 终选——只能从已有候选中选、不得发明新值；明确胜出（relevance≥85 且 margin≥15）则静默采纳，否则确认流照常但候选更优排序；生产可替换为本地 bge-reranker 模型
+- 会话持久化（JSONL append-only，重启恢复）与待确认任务持久化（幂等确认）
+- 异步记忆学习：成功查询可回写纠正/偏好/约束记忆
+- 端到端 eval：新查询、follow-up、确认、记忆注入、重启恢复
 
-## 核心概念
-
-### 1. Semantic DSL vs Exec DSL
-
-- `Semantic DSL` 表示用户查询意图的规范化结构
-- `Exec DSL` 是最终发给下游查询系统的执行格式
-
-这样分层的好处是：
-
-- 更容易解释为什么这样解析
-- 可以在中间层做确认、修正、验证
-- 更适合做端到端回归测试
-
-### 2. Turn-Based Querying
-
-系统支持多轮查询，例如：
+## 示例会话
 
 ```text
-Q1: 德国 app_launch 的 PV
-Q2: 换成昨天
-Q3: 再按渠道拆一下
-Q4: 那美国呢
+Q1: 近7天各地区的销售额
+-> SELECT users.region AS region, sum(orders.amount) AS revenue
+   FROM orders JOIN users ON orders.user_id = users.id
+   WHERE orders.created_at >= now() - INTERVAL 7 DAY
+   GROUP BY users.region ORDER BY revenue DESC LIMIT 100
+
+Q2: 改成只看VIP用户，每个地区前3
+-> patch: filters += [users.vip_level = 'vip'], window = {users.region, top 3}
+-> SELECT users.region, sum(orders.amount) AS revenue
+   FROM orders JOIN users ON orders.user_id = users.id
+   WHERE users.vip_level = 'vip' AND orders.created_at >= now() - INTERVAL 7 DAY
+   GROUP BY users.region ORDER BY revenue DESC LIMIT 3 BY users.region
 ```
 
-这里不是每轮都重新完整理解，而是：
+Q2 继承了 Q1 的指标/时间/分组——每轮只抽取和合并变化的部分。`LIMIT 3 BY` 是 ClickHouse 的分组内排名语法。
 
-- 用 `last_query_state` 继承上轮结构化状态
-- 用 `followup_resolver` 判断这轮是 new query 还是 follow-up
-- 用 `query_state_merger` 做字段级 patch merge
+## 关键概念
 
-### 3. 三层 Memory
+### 1. 分层生成
 
-当前项目里最重要的记忆分层是：
+- **Layer 1（LLM 抽取）** 只切分意图片段——从不给出表名或列名
+- **Layer 2（matcher）** 把片段解析为规范 `table` / `table.column` / `metric_id`（带分数）：≥ 80 直接用，40-80 触发确认，< 40 丢弃或回退。用户不提表名时从指标表达式或列归属投票推断主表
+- **Layer 3（SQL 生成）** 是一次"接地"的 LLM 调用：prompt 固定表名、列名、指标表达式、join 条件和时间谓词，LLM 只组装结构（GROUP BY / JOIN / 用 `LIMIT n BY` 做分组排名）
+- **校验**（sqlglot，`dialect="clickhouse"`）强制单条只读语句、表白名单、默认 LIMIT；失败带错误反馈修复
 
-- `Session Memory`
-  - 当前会话里的 `last_query_state / pending_task / recent turns`
-- `Project Memory`
-  - 某个项目的业务约束、默认映射、口径说明、纠正知识
-- `User Preference Signal`
-  - 某个用户在某个项目里的常用 `event / metric / group_by`
+### 2. Turn-Based 多轮查询
 
-这里的用户偏好不是主判定器，只用于 recall 后的轻量 rerank。
+```text
+Q1: 近7天各地区的销售额        （新查询）
+Q2: 昨天                       （patch time_range）
+Q3: 改成订单量                 （patch metrics）
+Q4: 再按品类拆一下             （patch group_by）
+Q5: 那商品表呢                 （patch tables）
+Q6: 每个地区前3                （patch window）
+```
+
+turn 判定是纯规则（`followup_resolver`），状态合并是字段级（`query_state_merger`，带 explicit/inherited 溯源），每轮可通过 `turn_explain` 完整解释。
+
+### 3. 三层记忆
+
+- `Session Memory` — `last_query_state / pending_task / recent turns`，JSONL 持久化，重启可恢复
+- `Project Memory` — 项目级纠正/约束（`project_{id}/MEMORY.md`），按关键词选取注入抽取 prompt
+- `User Preference Signal` — `project_id + user_id` 维度的表/指标/列使用计数，仅作为 recall 后的弱 rerank 信号
 
 ## 快速开始
-
-### 环境要求
-
-- Python 3.11+
-- `pip`
-- Redis 仅在 `MESSAGE_BUS_BACKEND=redis` 时需要
 
 ### 安装
 
@@ -109,213 +108,127 @@ pip install -r requirements.txt
 
 ### 配置
 
-复制环境变量：
-
 ```bash
 cp .env.example .env
 ```
 
 常用环境变量：
 
-| 变量 | 必填 | 默认值 | 说明 |
+| Variable | Required | Default | Description |
 |---|---|---|---|
-| `PORT` | 否 | `8000` | HTTP 端口 |
-| `HOST` | 否 | `0.0.0.0` | 监听地址 |
-| `LOG_LEVEL` | 否 | `DEBUG` | 日志级别 |
-| `TELEGRAM_BOT_TOKEN` | 否 | - | Telegram 入口 |
-| `MESSAGE_BUS_BACKEND` | 否 | `direct` | `direct` 或 `redis` |
-| `REDIS_URL` | 否 | `redis://localhost:6379/0` | Redis 连接地址 |
-| `CATALOG_API_BASE` | 否 | - | Catalog 同步源 |
+| `PORT` | No | `8000` | HTTP 端口 |
+| `LOG_LEVEL` | No | `DEBUG` | 日志级别 |
+| `LLM_BACKEND` | No | `zhipu` | `zhipu` 或 `ollama` |
+| `ZHIPU_MODEL` | No | `glm-4` | 抽取 + SQL 生成模型 |
+| `TOOL_CALLING_ENABLED` | No | `true` | `false` 强制走 prompt-based JSON 输出 |
+| `RERANKER_ENABLED` | No | `false` | `true` 开启歧义匹配的 LLM cross-encoder 重排 |
+| `TELEGRAM_BOT_TOKEN` | No | - | Telegram 入口 |
+| `MESSAGE_BUS_BACKEND` | No | `direct` | `direct` 或 `redis` |
 
-LLM、下游查询、Bearer 相关变量请按你的本地环境配置。
-
-### 启动
-
-本地直连模式：
+### 运行
 
 ```bash
 python server.py
 ```
 
-开发模式：
+### 试一下
 
 ```bash
-uvicorn server:app_with_ws --reload --port 8000
+curl -X POST localhost:8000/nl2sql -H 'Content-Type: application/json' -d '{
+  "text": "近7天各地区的销售额",
+  "project_id": 55
+}'
 ```
 
-Redis 模式：
+响应字段：
 
-```bash
-MESSAGE_BUS_BACKEND=redis docker-compose up --build
-```
+- `extraction_json` — Layer 1 意图片段
+- `sql` — 校验后的 ClickHouse SQL
+- `resolved_intent` — 生成 SQL 所用的完整查询状态
+- `explain` — `resolver_explain` / `turn_explain` / `sql_generation` / timing
+- `session_id`、`status`、`message`、`task_id`、`candidates`
 
-## API
+状态取值：
 
-### `POST /nl2dsl`
+- `success`：SQL 已生成并通过校验
+- `early_exit`：没有可用的查询信号（未提表/指标/过滤）
+- `needs_confirmation`：低置信候选需要用户确认
 
-主查询接口。
+`POST /nl2dsl` 保留为兼容别名。会话调试 API：`GET /sessions`、`GET /sessions/{id}`、`DELETE /sessions/{id}`。
 
-请求示例：
-
-```json
-{
-  "text": "德国近7天 app_launch 的 PV",
-  "project_id": 55,
-  "session_id": "optional-session-id",
-  "user_id": "optional-user-id"
-}
-```
-
-返回字段包括：
-
-- `extraction_json`
-- `semantic`
-- `exec_dsl`
-- `explain`
-- `session_id`
-- `status`
-- `message`
-- `task_id`
-- `candidates`
-
-其中：
-
-- `status=success`：查询已构建完成
-- `status=early_exit`：缺少必要信息，例如没有 event
-- `status=needs_confirmation`：低置信度候选，需要用户确认
-
-### `POST /query/bearer`
-
-执行下游 Bearer 查询。
-
-### Session 调试接口
-
-- `GET /sessions`
-- `GET /sessions/{session_id}`
-- `DELETE /sessions/{session_id}`
-
-## 架构摘要
+## 架构总览
 
 ```mermaid
 flowchart TD
     User["User / Client"] --> API["FastAPI API"]
     API --> Session["Session Manager"]
     Session --> Context["Enhanced Context Builder"]
-    Context --> LLM["LLM Extraction"]
-    LLM --> Match["Matcher Resolution"]
-    Match --> Turn{"Turn Type"}
-    Turn -->|New Query| DSL["Semantic DSL"]
+    Context --> L1["LLM 意图抽取"]
+    L1 --> Match["Matcher 解析<br/>(表 / 列 / 指标 / 时间)"]
+    Match --> Turn{"Turn 类型"}
+    Turn -->|新查询| State["QueryState"]
     Turn -->|Follow-up Patch| Merge["QueryState Merge"]
-    Merge --> DSL
-    Turn -->|Needs Confirmation| Task["Task Manager"]
-    Task --> Confirm["User Reply"]
-    Confirm --> DSL
-    DSL --> Render["Exec DSL Render"]
-    Render --> Validate["Validators"]
-    Validate --> Response["Response / Query"]
-    Validate --> Memory["Async Memory Learning"]
+    Merge --> State
+    Turn -->|需要确认| Task["Task Manager"]
+    Task --> Confirm["用户回复"]
+    Confirm --> State
+    State --> Join["Join 推断<br/>(schema 配置)"]
+    Join --> Gen["LLM SQL 生成<br/>(ClickHouse, grounded)"]
+    Gen --> Validate["sqlglot 校验"]
+    Validate --> Response["ClickHouse SQL"]
+    Validate --> Memory["异步记忆学习"]
 ```
 
 更完整的模块说明见 [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md)。
 
-## 项目结构
+## Schema 元数据与生产方向说明
 
-```text
-query-agent/
-├── app.py                     # FastAPI route + NL2DSL main flow
-├── server.py                  # 生命周期启动 + gateway/bus wiring
-├── gateway/                   # Telegram gateway
-├── ingress/                   # cleaning / dedup / adapter
-├── bus/                       # direct / redis bus
-├── worker/                    # agent worker
-├── dispatcher/                # response dispatch
-├── service/
-│   ├── llm_extractions.py
-│   ├── session_manager.py
-│   ├── session_models.py
-│   ├── task_manager.py
-│   ├── followup_resolver.py
-│   └── query_state_merger.py
-├── matcher/                   # metric / event / dimension / time matchers
-├── dsl/                       # semantic models, renderer, validators
-├── memory/
-│   ├── long_term_memory.py
-│   ├── memory_writer.py
-│   └── user_preference_store.py
-├── catalog/                   # demo YAML catalog
-├── data/                      # session / task / memory / preference runtime data
-└── tests/
-```
+表/列/指标元数据在 [catalog/sql_schema.yaml](../catalog/sql_schema.yaml)——本地演示样例（`orders / users / products` 电商 schema，声明式 join，指标口径如 `revenue = sum(orders.amount)`）。
 
-## Catalog 说明
+本 Demo 刻意止步于 **NL → 校验后的 ClickHouse SQL**。以下生产扩展是文档化的方向，不在本 Demo 实现范围内：
 
-仓库里的 `catalog/*.yaml` 主要用于 Demo 和本地开发。真实场景下，项目设计上更偏向：
+1. **元数据来源** — `sql_schema.yaml` 是开发/演示态输入。生产态应从公司元数据服务（或 `INFORMATION_SCHEMA`）定时同步表/列/指标元数据，喂给 `load_sql_schema()` 热重建 matcher 索引
+2. **查询执行** — 对真实 ClickHouse 执行 SQL（只读账号、语句超时、行数/成本上限、结果缓存）是下游步骤；当前 API 只返回 SQL
+3. **结果渲染** — 查询结果的图表/表格渲染属于展示层
+4. **治理加固** — 基于 user-scoped 谓词的行级安全、按用户限流、PII 脱敏、完整审计日志，是现有校验器之上的自然下一步
 
-- 项目启动时从 HTTP 接口加载 metadata
-- 或通过定时同步将 metadata 落到本地 catalog
+## 评测
 
-所以：
-
-- `catalog YAML` 是开发态/演示态输入
-- `metadata service + sync` 才是生产态方向
-
-## 评估
-
-当前测试包含两类：
+两类测试：
 
 - 单元 / 集成测试
-- 数据驱动的 end-to-end eval
+- 数据驱动的端到端 eval：[tests/evals/nl2sql_cases.yaml](../tests/evals/nl2sql_cases.yaml) + [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
 
-end-to-end eval 位于：
+覆盖：
 
-- [tests/evals/nl2dsl_cases.yaml](../tests/evals/nl2dsl_cases.yaml)
-- [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
-
-目前已经覆盖：
-
-- basic new query
-- follow-up patch
+- 基础新查询（显式表名 / 从指标推断表名）
+- follow-up patch（时间 / 指标 / 分组排名窗口）
 - follow-up + confirmation
-- project memory injection
-- confirmation after restart
+- 项目记忆注入
+- 重启后确认恢复
 
-运行：
+eval harness mock 了 LLM 抽取与 SQL 生成，但跑真实的 matcher 服务、阈值逻辑、状态合并、确认流和持久化——golden case 锁定管道的确定性内核。
 
 ```bash
 ./.venv311/bin/pytest -q
 ```
 
-## 文档导航
-
-- [README.md](README.md): docs 目录索引
-- [ARCHITECTURE.md](ARCHITECTURE.md): 英文架构说明
-- [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md): 当前真实架构、模块职责、依赖方向
-- [EVALUATION.md](EVALUATION.md): eval harness、golden cases、回归策略
-- [EVALUATION.zh-CN.md](EVALUATION.zh-CN.md): 中文评估说明
-- [MEMORY.md](MEMORY.md): session/project/user memory 设计
-- [MEMORY.zh-CN.md](MEMORY.zh-CN.md): 中文 memory 设计说明
-- [diagrams/architecture.md](diagrams/architecture.md): Mermaid 架构图
-- [diagrams/sequence.md](diagrams/sequence.md): 时序图
-- [diagrams/flowchart.md](diagrams/flowchart.md): 总体流程图
-- [diagrams/matcher-sequence.md](diagrams/matcher-sequence.md): matcher 时序细节
-- [TELEGRAM_TEST.md](TELEGRAM_TEST.md): Telegram 相关测试说明
-- [TELEGRAM_TEST.zh-CN.md](TELEGRAM_TEST.zh-CN.md): 中文 Telegram 测试说明
-
 ## 当前状态
 
-当前主线能力已经具备：
+主线能力：
 
-- `NL -> DSL` 主链路
-- turn-based query handling
-- confirmation flow
-- session/task persistence
-- project memory injection
-- user preference rerank signal
-- async memory learning
-- end-to-end eval harness
+- `NL -> 校验后 ClickHouse SQL` 管道（单表、schema 配置 join、`LIMIT n BY` 分组排名）
+- 结构化状态合并的 turn-based 多轮
+- 持久化、幂等的确认流
+- 会话/任务持久化与重启恢复
+- 项目记忆注入
+- 用户偏好 rerank 信号
+- 异步记忆学习
+- 端到端 eval harness
 
-下一阶段更适合继续做：
+下一步方向：
 
-- richer `UserPattern / UserAlias / Preferences`
-- stronger memory categorization and retrieval
-- larger golden eval set based on real query logs
+- 更丰富的 `UserPattern / UserAlias / Preferences`
+- 元数据服务同步 + schema 热更新
+- 查询执行层（带成本护栏的只读 ClickHouse runner）
+- 基于真实 query log 扩大 golden eval 集

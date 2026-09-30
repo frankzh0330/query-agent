@@ -7,14 +7,15 @@ from typing import Any
 from service.session_models import QueryState
 
 _STATE_FIELDS = (
-    "event",
-    "metric",
-    "time_range",
-    "region_filter",
-    "group_by",
+    "tables",
+    "metrics",
+    "detail_columns",
     "filters",
-    "chart_type",
-    "interaction_mode",
+    "time_range",
+    "group_by",
+    "order_by",
+    "limit",
+    "window",
 )
 
 

@@ -13,17 +13,17 @@ flowchart TD
     Empty -->|Yes| DropEmpty(("Discard"))
     Empty -->|No| Session
 
-    Channel -->|HTTP| HTTP["FastAPI POST /nl2dsl"]
+    Channel -->|HTTP| HTTP["FastAPI POST /nl2sql"]
     HTTP --> Session
 
     Session["SessionManager<br/>create_or_get"]
     Session --> Context["Enhanced Context<br/>Session + Project Memory"]
     Context --> Extract
 
-    subgraph Extract["Layer 1: LLM Extraction"]
+    subgraph Extract["Layer 1: LLM Intent Extraction"]
         Prompt["Build context-aware prompt"]
         LLM["Call LLM"]
-        Parsed["Parse ExtractionsJson"]
+        Parsed["Parse SQLIntentJson"]
         Prompt --> LLM --> Parsed
     end
 
@@ -37,32 +37,34 @@ flowchart TD
     Confirm --> Resolve
 
     subgraph Resolve["Layer 2: Matcher Resolution"]
-        Metric["MetricMatcher"]
-        Event["EventMatcher"]
-        Dimension["DimensionMatcher"]
+        Table["TableMatcher"]
+        Metric["SQLMetricMatcher"]
+        Column["ColumnMatcher"]
         Time["TimeMatcher"]
-        Metric --> Event --> Dimension --> Time
+        Infer["Table inference +<br/>join inference"]
+        Table --> Metric --> Column --> Time --> Infer
     end
 
-    Time --> Ambiguous{"Needs confirmation?"}
+    Infer --> Ambiguous{"Needs confirmation?"}
     Ambiguous -->|Yes| Task["Create TaskContext<br/>Return candidates"]
     Task --> EndConfirm(("Wait for user reply"))
-    Ambiguous -->|No| BuildDSL
+    Ambiguous -->|No| GenSQL
 
-    subgraph BuildDSL["Layer 3-4: DSL Build And Render"]
-        Semantic["Build Semantic DSL"]
-        Render["Render Exec DSL"]
-        Validate["Validate region and consistency"]
-        Semantic --> Render --> Validate
+    subgraph GenSQL["Layer 3-4: SQL Generation And Validation"]
+        Intent["Assemble grounded intent<br/>tables / metric exprs / joins / time expr"]
+        Generate["LLM generates ClickHouse SQL"]
+        Validate["sqlglot validate<br/>readonly / whitelist / auto LIMIT"]
+        Repair["Repair loop with error feedback"]
+        Intent --> Generate --> Validate
+        Validate -->|invalid| Repair --> Generate
     end
 
     Validate --> Persist["Persist session state<br/>Record preferences"]
     Persist --> Learn["Async MemoryWriter"]
     Persist --> Caller{"Caller?"}
-    Caller -->|Telegram| Execute["BearerService execute_query"]
-    Execute --> Format["Format response"]
+    Caller -->|Telegram| Format["Format SQL + intent"]
     Format --> Send["Send Telegram response"]
     Send --> EndTG(("End"))
-    Caller -->|HTTP| Return["Return NL2DSLResponse"]
+    Caller -->|HTTP| Return["Return NL2SQLResponse"]
     Return --> EndHTTP(("End"))
 ```

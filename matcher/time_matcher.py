@@ -4,8 +4,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from service.llm_extractions import ExtractionsJson
-
 
 @dataclass
 class TimeMatchResult:
@@ -150,16 +148,16 @@ class TimeMatcher:
         )
 
 
-def resolve_last_n_days(extraction_json: ExtractionsJson) -> tuple[int, Dict[str, Any]]:
+def resolve_last_n_days(extraction_json) -> tuple[int, Dict[str, Any]]:
     """
-    从 LLM 提取结果中解析时间范围
+    从 LLM 提取结果中解析时间范围（duck typing：需要 time_extractions 属性）
 
-    :param extraction_json: LLM 提取结果
+    :param extraction_json: LLM 提取结果（SQLIntentJson）
     :return: (days, explain)
     """
     matcher = TimeMatcher()
 
-    for extraction in extraction_json.time_extractions:
+    for extraction in getattr(extraction_json, "time_extractions", []) or []:
         text = extraction.text if hasattr(extraction, "text") else extraction.get("text", "")
         result = matcher.match(text)
         if result.time_type != "default":
@@ -170,6 +168,11 @@ def resolve_last_n_days(extraction_json: ExtractionsJson) -> tuple[int, Dict[str
         "reason": "no valid time pattern found",
         "default": matcher.DEFAULT_LAST_N_DAYS,
     }
+
+
+def time_range_from_explain(days: int, explain: Dict[str, Any]) -> Dict[str, Any]:
+    """把 TimeMatcher 的解析结果折叠为 QueryState.time_range 结构"""
+    return {"type": explain.get("pattern", "last_n_days"), "n": days}
 
 
 # =========================

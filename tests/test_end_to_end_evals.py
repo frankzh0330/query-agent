@@ -1,4 +1,4 @@
-"""Data-driven end-to-end evals for the NL2DSL pipeline."""
+"""Data-driven end-to-end evals for the NL2SQL pipeline."""
 
 from __future__ import annotations
 
@@ -9,170 +9,137 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from matcher.matcher_service import ResolvedResult
-from service.llm_extractions import Extraction, ExtractionsJson
+from matcher.base import MatchResult
+from matcher.matcher_service import MatcherService
+from service.llm_extractions import Extraction, FilterExtraction, SQLIntentJson
 from service.session_models import QueryState
 
 
 def _load_cases() -> list[dict]:
-    path = Path(__file__).parent / "evals" / "nl2dsl_cases.yaml"
+    path = Path(__file__).parent / "evals" / "nl2sql_cases.yaml"
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return data.get("cases", [])
 
 
-def _make_extraction(payload: dict | None) -> ExtractionsJson:
+# ==================== LLM 抽取 mock ====================
+
+def _make_intent(payload: dict | None) -> SQLIntentJson:
     payload = payload or {}
 
     def _items(key: str) -> list[Extraction]:
         return [Extraction(text=text) for text in payload.get(key, [])]
 
-    return ExtractionsJson(
+    return SQLIntentJson(
+        table_extractions=_items("table_extractions"),
         metric_extractions=_items("metric_extractions"),
-        time_extractions=_items("time_extractions"),
-        event_extractions=_items("event_extractions"),
+        column_extractions=_items("column_extractions"),
+        filter_extractions=[
+            FilterExtraction(
+                text=f.get("text", ""),
+                column=f.get("column"),
+                op=f.get("op", "="),
+                value=f.get("value"),
+            )
+            for f in payload.get("filter_extractions", [])
+        ],
         group_by_extractions=_items("group_by_extractions"),
-        chart_type_extractions=_items("chart_type_extractions"),
-        interaction_mode_extractions=_items("interaction_mode_extractions"),
-        region_filter=payload.get("region_filter", []),
+        time_extractions=_items("time_extractions"),
+        order_extractions=_items("order_extractions"),
+        window_extractions=_items("window_extractions"),
     )
 
 
-def _build_resolver(name: str):
-    svc = mock.MagicMock()
+# ==================== matcher mock（真实服务 + 假匹配层） ====================
+
+def _mr(matched, score, candidates=None) -> MatchResult:
+    explain = {}
+    if candidates:
+        explain["rerank_explain"] = {"top5": [{"name": v, "score": s} for v, s in candidates]}
+    return MatchResult(matched=matched, score=score, explain=explain)
+
+
+class FakeMatcher:
+    def __init__(self, results=None):
+        self.results = results or {}
+
+    def match(self, text):
+        if text in self.results:
+            return self.results[text]
+        return MatchResult(matched=None, score=0.0, explain={})
+
+
+COLUMN_MAP = {
+    "地区": ("users.region", 100.0),
+    "品类": ("products.category", 100.0),
+    "渠道": ("orders.channel", 100.0),
+    "金额": ("orders.amount", 100.0),
+    "会员等级": ("users.vip_level", 100.0),
+}
+
+
+def _build_service(name: str) -> MatcherService:
+    svc = MatcherService(catalog_path="catalog")
 
     if name == "high_confidence":
-        svc.resolve_with_candidates.side_effect = lambda mtype, extractions, default: ResolvedResult(
-            value="app_launch" if mtype.value == "event" else ("pv" if mtype.value == "metric" else "country"),
-            score=95.0,
-            method="exact",
-            candidates=[],
-            needs_confirmation=False,
+        svc.table_matcher = FakeMatcher({
+            "订单表": _mr("orders", 100.0),
+            "订单": _mr("orders", 100.0),
+            "商品表": _mr("products", 100.0),
+        })
+        svc.metric_matcher = FakeMatcher({
+            "销售额": _mr("revenue", 100.0),
+            "订单量": _mr("order_count", 100.0),
+        })
+        svc.column_matcher = FakeMatcher(
+            {text: _mr(v, s) for text, (v, s) in COLUMN_MAP.items()}
         )
-        svc.resolve_time.return_value = (7, {"method": "default", "n": 7})
         return svc
 
-    if name == "time_yesterday":
-        svc.resolve_time.return_value = (1, {"method": "matched", "n": 1})
-        return svc
-
-    if name == "metric_uv":
-        def _resolve_metric(mtype, extractions, default):
-            if mtype.value == "metric":
-                return ResolvedResult(
-                    value="uv",
-                    score=96.0,
-                    method="exact",
-                    candidates=[],
-                    needs_confirmation=False,
-                )
-            raise AssertionError(f"unexpected matcher type: {mtype}")
-
-        svc.resolve_with_candidates.side_effect = _resolve_metric
-        return svc
-
-    if name == "low_confidence_event":
-        def _resolve_event(mtype, extractions, default):
-            if mtype.value == "event":
-                return ResolvedResult(
-                    value="purchase_success",
-                    score=55.0,
-                    method="fuzzy_low_confidence",
-                    candidates=[
-                        {"value": "purchase_success", "score": 55.0},
-                        {"value": "payment_submit", "score": 48.0},
-                    ],
-                    needs_confirmation=True,
-                )
-            return ResolvedResult(
-                value="pv" if mtype.value == "metric" else "country",
-                score=95.0,
-                method="exact",
-                candidates=[],
-                needs_confirmation=False,
-            )
-
-        svc.resolve_with_candidates.side_effect = _resolve_event
-        svc.resolve_time.return_value = (7, {"method": "default", "n": 7})
-        return svc
-
-    if name == "project_memory_alias":
-        def _resolve_alias(mtype, extractions, default):
-            if mtype.value == "event":
-                return ResolvedResult(
-                    value="activation_success",
-                    score=97.0,
-                    method="memory_alias",
-                    candidates=[],
-                    needs_confirmation=False,
-                )
-            return ResolvedResult(
-                value="pv" if mtype.value == "metric" else "country",
-                score=95.0,
-                method="exact",
-                candidates=[],
-                needs_confirmation=False,
-            )
-
-        svc.resolve_with_candidates.side_effect = _resolve_alias
-        svc.resolve_time.return_value = (7, {"method": "default", "n": 7})
+    if name == "low_confidence_table":
+        svc.table_matcher = FakeMatcher({
+            "商品表": _mr(None, 55.0, candidates=[("products", 55.0), ("orders", 48.0)]),
+        })
+        svc.metric_matcher = FakeMatcher({"销售额": _mr("revenue", 100.0)})
+        svc.column_matcher = FakeMatcher(
+            {text: _mr(v, s) for text, (v, s) in COLUMN_MAP.items()}
+        )
         return svc
 
     raise ValueError(f"unknown resolver scenario: {name}")
 
 
-@pytest.fixture
-def eval_client(tmp_path):
+# ==================== fixtures / runtime ====================
+
+def _rebind_runtime(tmp_data_root: str) -> None:
     import app as app_module
     from memory.storage.memory_file import TaskStorage
     from memory.user_preference_store import UserPreferenceStore
     from service.session_manager import SessionManager
     from service.task_manager import TaskManager
 
-    app_module.session_manager = SessionManager(data_path=str(tmp_path / "data"))
+    app_module.session_manager = SessionManager(data_path=tmp_data_root)
     app_module.task_manager = TaskManager(
-        storage=TaskStorage(data_path=str(tmp_path / "data" / "tasks"))
+        storage=TaskStorage(data_path=str(Path(tmp_data_root) / "tasks"))
     )
     app_module.user_preference_store = UserPreferenceStore(
-        data_path=str(tmp_path / "data" / "user_preferences")
+        data_path=str(Path(tmp_data_root) / "user_preferences")
     )
-
-    # 同步更新 orchestrator 的引用
     app_module.orchestrator.session = app_module.session_manager
     app_module.orchestrator.task = app_module.task_manager
     app_module.orchestrator.preferences = app_module.user_preference_store
 
-    mock_service = mock.MagicMock()
-    mock_service.catalog = mock.MagicMock()
-    app_module._matcher_service = mock_service
+
+@pytest.fixture
+def eval_client(tmp_path):
+    import app as app_module
+
+    _rebind_runtime(str(tmp_path / "data"))
+    app_module._matcher_service = _build_service("high_confidence")
 
     with TestClient(app_module.app) as c:
         yield c
 
     app_module._matcher_service = None
-
-
-def _build_runtime(data_root: Path) -> None:
-    import app as app_module
-    from memory.storage.memory_file import TaskStorage
-    from memory.user_preference_store import UserPreferenceStore
-    from service.session_manager import SessionManager
-    from service.task_manager import TaskManager
-
-    app_module.session_manager = SessionManager(data_path=str(data_root))
-    app_module.task_manager = TaskManager(
-        storage=TaskStorage(data_path=str(data_root / "tasks"))
-    )
-    app_module.user_preference_store = UserPreferenceStore(
-        data_path=str(data_root / "user_preferences")
-    )
-
-    # 同步更新 orchestrator 的引用
-    app_module.orchestrator.session = app_module.session_manager
-    app_module.orchestrator.task = app_module.task_manager
-    app_module.orchestrator.preferences = app_module.user_preference_store
-    mock_service = mock.MagicMock()
-    mock_service.catalog = mock.MagicMock()
-    app_module._matcher_service = mock_service
 
 
 def _write_project_memory(case: dict, data_root: Path) -> None:
@@ -210,7 +177,7 @@ def _seed_setup(case: dict) -> str | None:
     return ctx.session_id
 
 
-def _assert_expectations(body: dict, expect: dict) -> None:
+def _assert_expectations(body: dict, expect: dict, gen_mock: mock.AsyncMock | None) -> None:
     assert body["status"] == expect["status"]
 
     if "turn_mode" in expect:
@@ -219,25 +186,37 @@ def _assert_expectations(body: dict, expect: dict) -> None:
     if "candidates_contains" in expect:
         assert expect["candidates_contains"] in (body.get("candidates") or {})
 
-    semantic_expect = expect.get("semantic")
-    if not semantic_expect:
+    intent_expect = expect.get("resolved_intent")
+    if not intent_expect:
         return
 
-    semantic = body["semantic"]
-    if "event" in semantic_expect:
-        assert semantic["event"]["event_name"] == semantic_expect["event"]
-    if "metric" in semantic_expect:
-        assert semantic["metric"]["metric_id"] == semantic_expect["metric"]
-    if "region_filter" in semantic_expect:
-        assert semantic["region_filter"] == semantic_expect["region_filter"]
-    if "group_by" in semantic_expect:
-        assert [item["dimension_id"] for item in semantic["group_by"]] == semantic_expect["group_by"]
-    if "time_n" in semantic_expect:
-        assert semantic["time_range"]["n"] == semantic_expect["time_n"]
+    resolved = body["resolved_intent"]
+    if "tables" in intent_expect:
+        assert resolved["tables"] == intent_expect["tables"]
+    if "metrics" in intent_expect:
+        assert resolved["metrics"] == intent_expect["metrics"]
+    if "group_by" in intent_expect:
+        assert resolved["group_by"] == intent_expect["group_by"]
+    if "time_n" in intent_expect:
+        assert resolved["time_range"]["n"] == intent_expect["time_n"]
+    if "window_group" in intent_expect:
+        assert resolved["window"]["group_by"] == intent_expect["window_group"]
+    if "window_limit" in intent_expect:
+        assert resolved["window"]["limit"] == intent_expect["window_limit"]
+    if "filter_column" in intent_expect:
+        assert resolved["filters"][0]["column"] == intent_expect["filter_column"]
+
+    if "sql_intent_contains_join" in expect:
+        # SQL 生成入参应包含推断出的 join
+        gen_intent = gen_mock.call_args.args[1]
+        assert any(
+            expect["sql_intent_contains_join"] in (j["right"], j["left"])
+            for j in gen_intent["joins"]
+        )
 
 
 @pytest.mark.parametrize("case", _load_cases(), ids=lambda case: case["name"])
-def test_nl2dsl_end_to_end_eval_cases(eval_client, case):
+def test_nl2sql_end_to_end_eval_cases(eval_client, case):
     import app as app_module
 
     data_root = Path(app_module.session_manager.storage.data_path).parent
@@ -245,7 +224,8 @@ def test_nl2dsl_end_to_end_eval_cases(eval_client, case):
 
     for step in case["steps"]:
         if step.get("restart_before"):
-            _build_runtime(data_root)
+            _rebind_runtime(str(data_root))
+            app_module._matcher_service = _build_service("high_confidence")
 
         request_body = {
             "text": step["text"],
@@ -254,50 +234,36 @@ def test_nl2dsl_end_to_end_eval_cases(eval_client, case):
         if session_id:
             request_body["session_id"] = session_id
 
-        patches = [
-            mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}),
-            mock.patch("service.query_orchestrator.validate_region"),
-            mock.patch("service.query_orchestrator.validate_region_consistency"),
-        ]
-
         extraction_payload = step.get("extraction")
-        if extraction_payload is not None:
-            expected_memory = step.get("assert_memory_contains")
+        expected_memory = step.get("assert_memory_contains")
 
-            async def _mock_extract(query, session_context=None, *, _payload=extraction_payload, _expected_memory=expected_memory):
-                if _expected_memory:
-                    memory_context = (session_context or {}).get("memory_corrections", "")
-                    assert _expected_memory in memory_context
-                return _make_extraction(_payload)
-
-            patches.append(
-                mock.patch(
-                    "service.query_orchestrator.extract_llm_async",
-                    new_callable=mock.AsyncMock,
-                    side_effect=_mock_extract,
-                )
-            )
+        async def _mock_extract(query, session_context=None,
+                                *, _payload=extraction_payload, _expected_memory=expected_memory):
+            if _expected_memory:
+                memory_context = (session_context or {}).get("memory_corrections", "")
+                assert _expected_memory in memory_context
+            return _make_intent(_payload)
 
         resolver_name = step.get("resolver")
-        if resolver_name:
-            patches.append(
-                mock.patch("app.get_matcher_service", return_value=_build_resolver(resolver_name))
-            )
 
-        with patches[0], patches[1], patches[2]:
-            extra_contexts = patches[3:]
-            if extra_contexts:
-                with extra_contexts[0]:
-                    if len(extra_contexts) > 1:
-                        with extra_contexts[1]:
-                            resp = eval_client.post("/nl2dsl", json=request_body)
-                    else:
-                        resp = eval_client.post("/nl2dsl", json=request_body)
-            else:
-                resp = eval_client.post("/nl2dsl", json=request_body)
+        with mock.patch(
+            "service.query_orchestrator.extract_llm_async",
+            new_callable=mock.AsyncMock,
+            side_effect=_mock_extract,
+        ):
+            with mock.patch(
+                "service.query_orchestrator.generate_sql",
+                new_callable=mock.AsyncMock,
+                return_value=("SELECT 1", {"rounds": [{"round": 1, "ok": True, "errors": []}]}),
+            ) as gen_mock:
+                if resolver_name:
+                    with mock.patch("app.get_matcher_service", return_value=_build_service(resolver_name)):
+                        resp = eval_client.post("/nl2sql", json=request_body)
+                else:
+                    resp = eval_client.post("/nl2sql", json=request_body)
 
         body = resp.json()
-        _assert_expectations(body, step["expect"])
+        _assert_expectations(body, step["expect"], gen_mock if body["status"] == "success" else None)
         session_id = body.get("session_id", session_id)
 
         # eval 期间确保 session 确实持续复用，避免 accidentally stateless

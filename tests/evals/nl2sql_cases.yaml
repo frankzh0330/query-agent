@@ -1,0 +1,200 @@
+# NL2SQL 端到端 golden cases
+#
+# 每条 case:
+#   setup:       可选 last_query_state（多轮前置）/ project_memory（记忆注入前置）
+#   steps:       每步 text + extraction（mock LLM 抽取）+ resolver（mock matcher 场景）
+#   expect:      status / turn_mode / resolved_intent 关键字段
+#
+# SQL 生成（generate_sql）在 harness 中统一 mock，评测对象是：
+#   意图解析 → matcher 解析 → 状态合并 → 确认流 → SQL 生成入参
+
+cases:
+  - name: basic_new_query
+    steps:
+      - text: 查询近7天订单表的销售额
+        project_id: 55
+        extraction:
+          table_extractions: ["订单表"]
+          metric_extractions: ["销售额"]
+          time_extractions: ["近7天"]
+        resolver: high_confidence
+        expect:
+          status: success
+          turn_mode: new_query
+          resolved_intent:
+            tables: ["orders"]
+            metrics: ["revenue"]
+            time_n: 7
+
+  - name: basic_new_query_with_join
+    steps:
+      - text: 近7天各地区的订单表订单量
+        project_id: 55
+        extraction:
+          table_extractions: ["订单表"]
+          metric_extractions: ["订单量"]
+          group_by_extractions: ["地区"]
+          time_extractions: ["近7天"]
+        resolver: high_confidence
+        expect:
+          status: success
+          turn_mode: new_query
+          resolved_intent:
+            tables: ["orders"]
+            metrics: ["order_count"]
+            group_by: ["users.region"]
+          sql_intent_contains_join: users
+
+  - name: followup_change_time
+    setup:
+      last_query_state:
+        project_id: 55
+        tables: ["orders"]
+        metrics: ["revenue"]
+        time_range:
+          type: last_n_days
+          n: 7
+        group_by: ["users.region"]
+        filters: []
+        turn_type: new_query
+    steps:
+      - text: 昨天
+        project_id: 55
+        extraction:
+          time_extractions: ["昨天"]
+        resolver: high_confidence
+        expect:
+          status: success
+          turn_mode: followup_patch
+          resolved_intent:
+            tables: ["orders"]
+            metrics: ["revenue"]
+            time_n: 1
+
+  - name: followup_change_metric
+    setup:
+      last_query_state:
+        project_id: 55
+        tables: ["orders"]
+        metrics: ["revenue"]
+        time_range:
+          type: last_n_days
+          n: 7
+        group_by: ["users.region"]
+        filters: []
+        turn_type: new_query
+    steps:
+      - text: 改成订单量
+        project_id: 55
+        extraction:
+          metric_extractions: ["订单量"]
+        resolver: high_confidence
+        expect:
+          status: success
+          turn_mode: followup_patch
+          resolved_intent:
+            tables: ["orders"]
+            metrics: ["order_count"]
+
+  - name: followup_add_window_rank
+    setup:
+      last_query_state:
+        project_id: 55
+        tables: ["orders"]
+        metrics: ["revenue"]
+        time_range:
+          type: last_n_days
+          n: 7
+        group_by: ["users.region"]
+        filters: []
+        turn_type: new_query
+    steps:
+      - text: 每个地区前3
+        project_id: 55
+        extraction:
+          window_extractions: ["每个地区前3"]
+        resolver: high_confidence
+        expect:
+          status: success
+          turn_mode: followup_patch
+          resolved_intent:
+            tables: ["orders"]
+            metrics: ["revenue"]
+            window_group: users.region
+            window_limit: 3
+
+  - name: followup_confirmation_flow
+    setup:
+      last_query_state:
+        project_id: 55
+        tables: ["orders"]
+        metrics: ["revenue"]
+        time_range:
+          type: last_n_days
+          n: 7
+        group_by: ["orders.channel"]
+        filters: []
+        turn_type: new_query
+    steps:
+      - text: 对比商品表
+        project_id: 55
+        extraction:
+          table_extractions: ["商品表"]
+        resolver: low_confidence_table
+        expect:
+          status: needs_confirmation
+          turn_mode: followup_patch
+          candidates_contains: tables
+      - text: "1"
+        project_id: 55
+        expect:
+          status: success
+          turn_mode: confirmation
+          resolved_intent:
+            tables: ["products"]
+            metrics: ["revenue"]
+
+  - name: project_memory_context_injected
+    setup:
+      project_memory:
+        project_id: 55
+        entries:
+          - filename: aliases.md
+            content: |
+              在本项目口语里，"大单" 指金额大于 1000 的订单。
+    steps:
+      - text: 看大单数据
+        project_id: 55
+        extraction:
+          metric_extractions: ["销售额"]
+          filter_extractions: [{"text": "大单", "column": "金额", "op": ">", "value": "1000"}]
+        resolver: high_confidence
+        assert_memory_contains: "大单"
+        expect:
+          status: success
+          turn_mode: new_query
+          resolved_intent:
+            tables: ["orders"]
+            metrics: ["revenue"]
+            filter_column: orders.amount
+
+  - name: confirmation_after_restart
+    steps:
+      - text: 商品表的销售额
+        project_id: 55
+        extraction:
+          table_extractions: ["商品表"]
+          metric_extractions: ["销售额"]
+        resolver: low_confidence_table
+        expect:
+          status: needs_confirmation
+          candidates_contains: tables
+      - text: "1"
+        project_id: 55
+        restart_before: true
+        expect:
+          status: success
+          turn_mode: confirmation
+          resolved_intent:
+            tables: ["products"]
+            metrics: ["revenue"]

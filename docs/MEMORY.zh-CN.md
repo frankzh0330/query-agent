@@ -54,9 +54,9 @@ Session memory 存当前会话里的短期状态：
 它解决的是 turn-based 连续性：
 
 ```text
-Q1: 德国 app_launch 的 PV
+Q1: 近7天各地区的销售额
 Q2: 昨天
-Q3: 改成 UV
+Q3: 改成订单量
 ```
 
 如果没有 session memory，系统每一轮都得重新推断全部字段。
@@ -74,7 +74,7 @@ Q3: 改成 UV
 
 Project memory 存项目级业务知识：
 
-- 默认 event mapping
+- 默认表/指标 mapping
 - 业务约束
 - 纠正规则
 - dimension/property caveats
@@ -101,8 +101,8 @@ Project memory 存项目级业务知识：
 
 在真实 metadata 很大的环境里，这层尤其重要，例如：
 
-- 4 万级 event
-- 每个 event 很多 property
+- 数万级表和列
+- 每个列很多业务别名
 - 自然语言表达高度重叠
 
 这时正确性很大程度上依赖项目语义，而不只是字符串匹配。
@@ -131,7 +131,7 @@ Project memory 从 `project_{id}/MEMORY.md` 加载。
 
 User preference 存轻量的使用习惯，例如：
 
-- 常用 event
+- 常用表
 - 常用 metric
 - 常用 group-by dimension
 
@@ -187,7 +187,7 @@ User preference 存轻量的使用习惯，例如：
 当前 query：看注册完成
 ```
 
-如果 preference 权重过强，系统可能会被带向支付类 event。  
+如果 preference 权重过强，系统可能会被带向用户常用但本轮不相关的指标。  
 所以用户偏好必须保持为弱信号。
 
 好的用法：
@@ -280,11 +280,11 @@ flowchart TD
 
 ```json
 {
-  "event": "app_launch",
-  "metric": "pv",
+  "tables": ["orders"],
+  "metrics": ["revenue"],
   "time_range": {"type": "last_n_days", "n": 7},
-  "region_filter": ["ROW"],
-  "group_by": ["country"]
+  "group_by": ["users.region"],
+  "window": {"group_by": "users.region", "limit": 3}
 }
 ```
 
@@ -323,9 +323,9 @@ flowchart TD
 
 推荐拆分：
 
-- `UserAlias`：显式或学习到的别名，例如 “startup” -> `app_launch`
-- `UserPattern`：聚合后的 top events、metrics、dimensions、regions、query frequency
-- `UserPreferences`：稳定默认值，例如常用 metric、region、time range
+- `UserAlias`：显式或学习到的别名，例如 “大单” -> `orders.amount > 1000` 过滤
+- `UserPattern`：聚合后的 top tables、metrics、columns、query frequency
+- `UserPreferences`：稳定默认值，例如常用 metric、table、time range
 - `QueryHistory`：持久化 query trace，用于 replay、evaluation、pattern learning
 
 推荐存储：

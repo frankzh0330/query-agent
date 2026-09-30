@@ -1,0 +1,110 @@
+# ============================================================
+# SQL Schema 元数据（演示态）
+#
+# 生产方向（不在本 Demo 范围内，见 README "Production Notes"）：
+#   - 表/列/指标元数据从公司 metadata service / INFORMATION_SCHEMA 定时同步
+#   - 同步后热更新 matcher 索引（catalog_scheduler 已预留该机制）
+#
+# 结构说明：
+#   tables.<name>.aliases   — 表别名（喂给倒排索引 matcher）
+#   tables.<name>.time_column — 时间过滤默认落点
+#   tables.<name>.columns.<col>.aliases — 列别名
+#   joins — join 推断依据（schema 声明式配置，不由 LLM 猜）
+#   metrics.<name>.expr — 业务指标口径 = ClickHouse 聚合表达式
+# ============================================================
+schema:
+  name: ecommerce
+  description: 电商订单分析示例库（ClickHouse）
+
+  tables:
+    orders:
+      aliases: ["订单", "订单表", "下单", "订单记录", "order"]
+      description: 订单事实表，一行一个订单
+      time_column: created_at
+      est_rows: 80000000      # 静态成本估算用（生产态来自 metadata service 的表统计）
+      columns:
+        order_id:
+          aliases: ["订单号", "订单ID"]
+          type: "UInt64"
+        user_id:
+          aliases: ["用户ID"]
+          type: "UInt64"
+        product_id:
+          aliases: ["商品ID", "商品编号"]
+          type: "UInt32"
+        amount:
+          aliases: ["金额", "订单金额", "下单金额"]
+          type: "Float64"
+        status:
+          aliases: ["状态", "订单状态"]
+          type: "LowCardinality(String)"
+        channel:
+          aliases: ["渠道", "来源", "流量渠道"]
+          type: "LowCardinality(String)"
+        created_at:
+          aliases: ["下单时间", "时间", "日期"]
+          type: "DateTime"
+
+    users:
+      aliases: ["用户", "用户表", "会员", "user"]
+      description: 用户维表
+      time_column: registered_at
+      est_rows: 2000000
+      columns:
+        id:
+          aliases: ["用户ID"]
+          type: "UInt64"
+        region:
+          aliases: ["地区", "区域", "国家"]
+          type: "LowCardinality(String)"
+        vip_level:
+          aliases: ["会员等级", "VIP等级", "等级"]
+          type: "LowCardinality(String)"
+        registered_at:
+          aliases: ["注册时间"]
+          type: "DateTime"
+
+    products:
+      aliases: ["商品", "商品表", "产品", "product"]
+      description: 商品维表
+      est_rows: 50000
+      columns:
+        id:
+          aliases: ["商品ID"]
+          type: "UInt32"
+        category:
+          aliases: ["品类", "类目", "商品类目"]
+          type: "LowCardinality(String)"
+        price:
+          aliases: ["价格", "单价", "售价"]
+          type: "Float64"
+
+  joins:
+    - left: orders
+      right: users
+      condition: "orders.user_id = users.id"
+    - left: orders
+      right: products
+      condition: "orders.product_id = products.id"
+
+  metrics:
+    revenue:
+      aliases: ["销售额", "营收", "GMV", "销售金额", "成交额"]
+      expr: "sum(orders.amount)"
+      table: orders            # 归属表（count() 类无表引用表达式的主表推断依据）
+      description: 总销售金额
+    order_count:
+      aliases: ["订单量", "订单数", "单量", "订单数量"]
+      expr: "count()"
+      table: orders
+      description: 订单总数
+    avg_order_amount:
+      aliases: ["客单价", "平均订单金额", "平均金额"]
+      expr: "avg(orders.amount)"
+      table: orders
+      description: 平均订单金额
+    user_count:
+      aliases: ["用户数", "买家数", "购买用户数", "下单用户数"]
+      expr: "uniqExact(orders.user_id)"
+      table: orders
+      description: 去重下单用户数

@@ -106,56 +106,66 @@ class TelegramGateway(BaseGateway):
         else:
             logger.error("No bus configured, message dropped")
 
-    def format_response(self, nl2dsl_result: Any, query_result: Any = None) -> str:
+    def format_response(self, nl2sql_result: Any) -> str:
         """格式化响应消息为 Telegram 文本"""
-        status = nl2dsl_result.get("status", "success")
+        status = nl2sql_result.get("status", "success")
 
         # 确认流：返回候选列表供用户选择
         if status == "needs_confirmation":
-            return self._format_confirmation(nl2dsl_result)
+            return self._format_confirmation(nl2sql_result)
 
-        # 正常结果
-        semantic = nl2dsl_result.get("semantic", {})
-        metric = semantic.get("metric", {})
-        event = semantic.get("event", {})
-        time_range = semantic.get("time_range", {})
+        if status == "early_exit":
+            return nl2sql_result.get("message", "无法处理该查询")
 
-        lines = [
-            "\U0001F4CA 查询结果",
-            f"地区: {', '.join(semantic.get('region_filter', []))}",
-            f"指标: {metric.get('metric_id', 'N/A')}",
-            f"事件: {event.get('event_name', 'N/A')}",
-            f"时间: 近 {time_range.get('n', 0)} 天",
-        ]
+        # 正常结果：展示生成的 SQL 与解析意图
+        intent = nl2sql_result.get("resolved_intent", {})
+        sql = nl2sql_result.get("sql", "")
 
-        if query_result and query_result.get("success"):
-            data = query_result.get("result", query_result)
-            mock_data = data.get("data", {})
-            records = mock_data.get("result", mock_data.get("data", []))
+        lines = ["\U0001F4C4 已生成 ClickHouse SQL"]
 
-            if records:
-                lines.append("\n\U0001F4C8 数据结果")
-                for record in records[:5]:
-                    parts = []
-                    for k, v in record.items():
-                        if k != "date":
-                            parts.append(f"{k}={v}")
-                    date_val = record.get('date', 'N/A')
-                    if parts:
-                        lines.append(f"{date_val}: {', '.join(parts)}")
-                    else:
-                        lines.append(f"{date_val}: {json.dumps(record, ensure_ascii=False)}")
+        if intent.get("tables"):
+            lines.append(f"表: {', '.join(intent['tables'])}")
+        if intent.get("metrics"):
+            lines.append(f"指标: {', '.join(intent['metrics'])}")
+        if intent.get("group_by"):
+            lines.append(f"分组: {', '.join(intent['group_by'])}")
+        if intent.get("filters"):
+            f_strs = [f"{f.get('column')} {f.get('op')} {f.get('value')}" for f in intent["filters"]]
+            lines.append(f"过滤: {', '.join(f_strs)}")
+        tr = intent.get("time_range") or {}
+        if tr:
+            lines.append(f"时间: {tr.get('type', 'last_n_days')} n={tr.get('n', '?')}")
 
-                if len(records) > 5:
-                    lines.append(f"...(还有 {len(records) - 5} 条记录)")
-            else:
-                lines.append("\n暂无数据")
-        elif query_result and query_result.get("error"):
-            lines.append(f"\n\U0000274C 查询失败: {query_result.get('error')}")
-        else:
-            lines.append("\n\U000026A0\uFE0F 未获取到查询结果")
+        # AST 分析摘要（护栏效果可视化：扫描量估算 + 警告码）
+        summary = self._format_ast_summary(nl2sql_result)
+        if summary:
+            lines.append(summary)
 
+        lines.append("")
+        lines.append(sql or "（SQL 为空）")
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_ast_summary(nl2sql_result: Any) -> str:
+        """从 explain 中提取 AST 分析摘要行，无分析数据时返回空串"""
+        try:
+            gen = ((nl2sql_result.get("explain") or {}).get("resolver_explain") or {}).get("sql_generation") or {}
+            ast = gen.get("ast_analysis") or {}
+            cost = ast.get("cost") or {}
+            if not cost:
+                return ""
+            scanned = cost.get("estimated_rows_scanned", 0)
+            scan_str = f"{scanned / 1_000_000:.0f}M" if scanned >= 1_000_000 else f"{scanned / 1_000:.0f}K"
+            parts = [f"📊 估算扫描 ~{scan_str} 行"]
+            if cost.get("join_count"):
+                parts.append(f"join x{cost['join_count']}")
+            warnings = [w.get("code", "") for w in ast.get("warnings", [])]
+            parts.append("⚠️ " + ", ".join(warnings) if warnings else "✅ 无警告")
+            if gen.get("repaired"):
+                parts.append("🔧 已自动修复")
+            return " · ".join(parts)
+        except Exception:
+            return ""
 
     async def send_response(self, recipient: str, response: Dict[str, Any]) -> None:
         """发送响应"""
@@ -174,17 +184,17 @@ class TelegramGateway(BaseGateway):
             else:
                 logger.info(f"Message sent to {recipient}")
 
-    def _format_confirmation(self, nl2dsl_result: Any) -> str:
+    def _format_confirmation(self, nl2sql_result: Any) -> str:
         """格式化确认请求消息"""
-        message = nl2dsl_result.get("message", "")
-        candidates = nl2dsl_result.get("candidates", {})
+        message = nl2sql_result.get("message", "")
+        candidates = nl2sql_result.get("candidates", {})
 
         if not candidates:
             return message
 
         lines = []
         for field_name, cands in candidates.items():
-            field_display = {"event": "事件", "metric": "指标"}.get(field_name, field_name)
+            field_display = {"tables": "表", "metrics": "指标", "join": "关联表"}.get(field_name, field_name)
             lines.append(f"请选择{field_display}:")
             for i, c in enumerate(cands[:5], 1):
                 lines.append(f"  {i}. {c['value']} (匹配度 {c['score']:.0f}%)")

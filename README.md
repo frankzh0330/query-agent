@@ -4,15 +4,14 @@
 
 Formatted documentation: [query-agent.mintlify.app](https://query-agent.mintlify.app/)
 
-`query-agent` is a data-query-oriented NL2DSL agent. It accepts natural language questions, extracts `event / metric / time / region / group_by`, builds a canonical semantic DSL, renders an executable DSL, and supports multi-turn sessions, confirmation flows, project memory, user preference reranking, and asynchronous memory learning.
+`query-agent` is a **NL2SQL Data Agent for ClickHouse**. It accepts natural language questions, extracts query intent fragments (`table / metric / column / filter / time / group_by / order / window`), resolves them to canonical schema entities with deterministic matchers, and generates validated ClickHouse SQL — with multi-turn sessions, confirmation flows for ambiguous entities, project memory, and user-preference reranking.
 
-The project is no longer a single-turn `NL -> DSL` demo. It is evolving into a controlled data agent with:
+The project is not a plain text2sql demo. It is a controlled data agent with:
 
 - HTTP and Telegram entry points
 - turn-based follow-up and confirmation handling
 - Session Memory, Project Memory, and User Preference signals
 - Direct and Redis message bus modes
-- project-level catalog synchronization
 - data-driven end-to-end eval cases
 
 ## Overview
@@ -21,12 +20,12 @@ Core query flow:
 
 ```text
 Natural Language
-  -> LLM Extraction
-  -> Matcher Resolution
+  -> LLM Intent Extraction (Layer 1)
+  -> Deterministic Entity Resolution (Layer 2: table / column / metric / time)
   -> QueryState / Turn Logic
-  -> Semantic DSL
-  -> Exec DSL
-  -> Validation
+  -> LLM SQL Generation grounded on resolved entities (Layer 3)
+  -> sqlglot Validation (read-only, table whitelist, auto LIMIT)
+  -> ClickHouse SQL
 ```
 
 Runtime flow:
@@ -36,71 +35,76 @@ Gateway
   -> Ingress
   -> Message Bus
   -> Agent Worker
-  -> NL2DSL Pipeline
+  -> NL2SQL Pipeline
   -> Dispatcher
 ```
 
 ## Highlights
 
-- Layered NL2DSL pipeline: extraction, matching, semantic DSL, exec DSL, validation
-- Turn-based Q&A: `last_query_state`, follow-up detection, patch merge, confirmation flow
-- Session persistence: JSONL append-only session storage with restart recovery
-- Pending task persistence: confirmation tasks can survive process restarts
-- Project-scoped memory: `project_{id}/MEMORY.md` with relevant-snippet selection
-- User preference rerank: post-recall bias scoped by `project_id + user_id`
-- Async memory learning: successful queries can write back correction, preference, and constraint memory
-- Telegram long-polling gateway and message-bus-based worker orchestration
+- **Deterministic entity resolution**: table/column/metric names are resolved by an inverted index + RapidFuzz against the schema catalog (scored, with candidates) — the LLM never invents entity names
+- **Confirmation flow as guardrail**: low-confidence entities (score 40–80) trigger explicit user confirmation instead of silent guessing; missing join paths escalate too
+- **Schema-configured joins**: join relationships come from metadata, not LLM invention
+- **Turn-based Q&A**: `last_query_state` + follow-up detection + field-level patch merge (a state machine, not chat replay)
+- **Grounded SQL generation**: the generation prompt pins resolved table/column/metric names, join conditions, and time predicates; the LLM assembles query structure only
+- **sqlglot validation**: single read-only statement, table whitelist, default LIMIT injection, and a repair loop with error feedback (max 2 rounds)
+- Session persistence (JSONL append-only, restart recovery) and pending-task persistence (idempotent confirmation)
+- Async memory learning: successful queries can write back correction/preference/constraint memory
 - End-to-end eval suite for new queries, follow-ups, confirmations, memory injection, and restart recovery
+
+## Example Session
+
+```text
+Q1: 近7天各地区的销售额
+-> SELECT users.region AS region, sum(orders.amount) AS revenue
+   FROM orders JOIN users ON orders.user_id = users.id
+   WHERE orders.created_at >= now() - INTERVAL 7 DAY
+   GROUP BY users.region ORDER BY revenue DESC LIMIT 100
+
+Q2: 改成只看VIP用户，每个地区前3
+-> patch: filters += [users.vip_level = 'vip'], window = {users.region, top 3}
+-> SELECT users.region, sum(orders.amount) AS revenue
+   FROM orders JOIN users ON orders.user_id = users.id
+   WHERE users.vip_level = 'vip' AND orders.created_at >= now() - INTERVAL 7 DAY
+   GROUP BY users.region ORDER BY revenue DESC LIMIT 3 BY users.region
+```
+
+Q2 inherits metric / time / grouping from Q1 — only the deltas are extracted and merged. `LIMIT 3 BY` is ClickHouse's grouped-ranking syntax.
 
 ## Key Concepts
 
-### 1. Semantic DSL vs Exec DSL
+### 1. Layered Generation
 
-- `Semantic DSL` represents the normalized intent of a user query.
-- `Exec DSL` is the executable payload sent to the downstream query system.
-
-This split makes it easier to:
-
-- explain why the agent resolved a query in a certain way
-- confirm, patch, and validate intermediate state
-- test behavior at the semantic layer before execution details
+- **Layer 1 (LLM extraction)** only splits the question into intent fragments — it never names tables or columns.
+- **Layer 2 (matchers)** resolves fragments to canonical `table` / `table.column` / `metric_id` names with scores: score ≥ 80 auto-accepts, 40–80 requires confirmation, < 40 drops or falls back. The main table is inferred when the user does not name one (from the metric expression or column ownership votes).
+- **Layer 3 (SQL generation)** is an LLM call *grounded* on resolved entities. The prompt pins table names, column names, metric expressions, join conditions, and the time predicate; the LLM assembles structure (GROUP BY / JOIN / window ranking via `LIMIT n BY`).
+- **Validation** (sqlglot, `dialect="clickhouse"`) enforces read-only single statements, a table whitelist, and default LIMIT; failed generations are repaired with error feedback.
+- **AST post-analysis** (`service/sql_ast_analyzer.py`) then runs on the validated SQL: column-existence checks (with alias resolution via sqlglot qualify), entity-fidelity assertions (resolved tables / metric expressions / filter predicates must survive into the SQL — catching semantic drift), join-edge and join-key consistency against the declared `joins:` config, and static cost analysis (scan estimates from `est_rows`, full-scan-on-fact-table detection, join-chain depth). Analysis errors feed the same repair loop; warnings and cost metrics are reported in `explain.resolver_explain.sql_generation.ast_analysis`.
+- **Cross-encoder reranking** (`service/reranker.py`, `RERANKER_ENABLED=true`) is a constrained LLM final selection step for ambiguous matches: when the matcher lands in the 40-80 confirmation band — or top candidates are tied — the LLM rescores the existing candidates (it can only pick from them, never invent values). A clear winner (relevance ≥ 85 with margin ≥ 15) is silently accepted, turning a would-be confirmation interrupt into a direct answer; otherwise the confirmation flow proceeds with better-ordered candidates. Production can swap in a local cross-encoder model (e.g. bge-reranker-v2-m3) behind the same interface.
 
 ### 2. Turn-Based Querying
 
-The system supports multi-turn querying, for example:
-
 ```text
-Q1: Show PV for app_launch in Germany
-Q2: Change it to yesterday
-Q3: Break it down by channel
-Q4: What about the US?
+Q1: Revenue by region for the last 7 days    (new query)
+Q2: Yesterday                                (patch time_range)
+Q3: Change to order count                    (patch metrics)
+Q4: Break it down by category                (patch group_by)
+Q5: What about the products table?           (patch tables)
+Q6: Top 3 per region                         (patch window)
 ```
 
-The agent does not rebuild the whole query from scratch on every turn. Instead:
-
-- `last_query_state` carries the previous structured state
-- `followup_resolver` decides whether the current turn is a new query or a follow-up
-- `query_state_merger` applies field-level patches to the previous state
+Turn detection is rule-based (`followup_resolver`), state merging is field-level (`query_state_merger` with explicit/inherited provenance), and every turn is explainable via `turn_explain`.
 
 ### 3. Memory Layers
 
-The project currently uses three main memory layers:
-
-- `Session Memory`
-  - current-session `last_query_state / pending_task / recent turns`
-- `Project Memory`
-  - project-specific business constraints, default mappings, corrections, and caveats
-- `User Preference Signal`
-  - frequently used `event / metric / group_by` scoped by `project_id + user_id`
-
-User preference is not a primary resolver. It is only used as a weak post-recall rerank signal.
+- `Session Memory` — `last_query_state / pending_task / recent turns`, JSONL persisted and restart-recoverable
+- `Project Memory` — project-scoped corrections/constraints (`project_{id}/MEMORY.md`), keyword-selected and injected into the extraction prompt
+- `User Preference Signal` — per `project_id + user_id` usage counts of tables/metrics/columns, applied only as a weak post-recall rerank bias
 
 ## Quick Start
 
 ### Requirements
 
 - Python 3.11+
-- `pip`
 - Redis only when `MESSAGE_BUS_BACKEND=redis`
 
 ### Install
@@ -110,8 +114,6 @@ pip install -r requirements.txt
 ```
 
 ### Configure
-
-Copy and edit the environment file:
 
 ```bash
 cp .env.example .env
@@ -124,12 +126,13 @@ Common environment variables:
 | `PORT` | No | `8000` | HTTP port |
 | `HOST` | No | `0.0.0.0` | Bind address |
 | `LOG_LEVEL` | No | `DEBUG` | Logging level |
+| `LLM_BACKEND` | No | `zhipu` | `zhipu` or `ollama` |
+| `ZHIPU_MODEL` | No | `glm-4` | Extraction + SQL generation model |
+| `TOOL_CALLING_ENABLED` | No | `true` | `false` forces prompt-based JSON output |
+| `RERANKER_ENABLED` | No | `false` | `true` enables LLM cross-encoder reranking for ambiguous matches |
 | `TELEGRAM_BOT_TOKEN` | No | - | Telegram gateway token |
 | `MESSAGE_BUS_BACKEND` | No | `direct` | `direct` or `redis` |
 | `REDIS_URL` | No | `redis://localhost:6379/0` | Redis URL |
-| `CATALOG_API_BASE` | No | - | Catalog sync source |
-
-Configure LLM, downstream query, and Bearer-related variables according to your local environment.
 
 ### Run
 
@@ -151,50 +154,30 @@ Redis mode:
 MESSAGE_BUS_BACKEND=redis docker-compose up --build
 ```
 
-## API
+### Try it
 
-### `POST /nl2dsl`
-
-Main natural-language-to-DSL endpoint.
-
-Request example:
-
-```json
-{
-  "text": "Show PV for app_launch in Germany over the last 7 days",
-  "project_id": 55,
-  "session_id": "optional-session-id",
-  "user_id": "optional-user-id"
-}
+```bash
+curl -X POST localhost:8000/nl2sql -H 'Content-Type: application/json' -d '{
+  "text": "近7天各地区的销售额",
+  "project_id": 55
+}'
 ```
 
 Response fields include:
 
-- `extraction_json`
-- `semantic`
-- `exec_dsl`
-- `explain`
-- `session_id`
-- `status`
-- `message`
-- `task_id`
-- `candidates`
+- `extraction_json` — Layer 1 intent fragments
+- `sql` — validated ClickHouse SQL
+- `resolved_intent` — the full query state used for generation
+- `explain` — `resolver_explain` / `turn_explain` / `sql_generation` / timing
+- `session_id`, `status`, `message`, `task_id`, `candidates`
 
 Status values:
 
-- `status=success`: the query was resolved and DSL was generated
-- `status=early_exit`: required information is missing, such as an event
+- `status=success`: SQL was generated and validated
+- `status=early_exit`: no usable query signal (no table/metric/filter mentioned)
 - `status=needs_confirmation`: low-confidence candidates require user confirmation
 
-### `POST /query/bearer`
-
-Execute a downstream Bearer query.
-
-### Session Debug APIs
-
-- `GET /sessions`
-- `GET /sessions/{session_id}`
-- `DELETE /sessions/{session_id}`
+`POST /nl2dsl` remains as a compatibility alias. Session debug APIs: `GET /sessions`, `GET /sessions/{id}`, `DELETE /sessions/{id}`.
 
 ## Architecture Summary
 
@@ -203,18 +186,19 @@ flowchart TD
     User["User / Client"] --> API["FastAPI API"]
     API --> Session["Session Manager"]
     Session --> Context["Enhanced Context Builder"]
-    Context --> LLM["LLM Extraction"]
-    LLM --> Match["Matcher Resolution"]
+    Context --> L1["LLM Intent Extraction"]
+    L1 --> Match["Matcher Resolution<br/>(table / column / metric / time)"]
     Match --> Turn{"Turn Type"}
-    Turn -->|New Query| DSL["Semantic DSL"]
+    Turn -->|New Query| State["QueryState"]
     Turn -->|Follow-up Patch| Merge["QueryState Merge"]
-    Merge --> DSL
+    Merge --> State
     Turn -->|Needs Confirmation| Task["Task Manager"]
     Task --> Confirm["User Reply"]
-    Confirm --> DSL
-    DSL --> Render["Exec DSL Render"]
-    Render --> Validate["Validators"]
-    Validate --> Response["Response / Query"]
+    Confirm --> State
+    State --> Join["Join Inference<br/>(schema config)"]
+    Join --> Gen["LLM SQL Generation<br/>(ClickHouse, grounded)"]
+    Gen --> Validate["sqlglot Validators"]
+    Validate --> Response["ClickHouse SQL"]
     Validate --> Memory["Async Memory Learning"]
 ```
 
@@ -224,7 +208,7 @@ For a deeper module breakdown, see [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ```text
 query-agent/
-├── app.py                     # FastAPI route + NL2DSL main flow
+├── app.py                     # FastAPI route (POST /nl2sql) + global wiring
 ├── server.py                  # lifecycle bootstrap + gateway/bus wiring
 ├── gateway/                   # Telegram gateway
 ├── ingress/                   # cleaning / dedup / adapter
@@ -232,54 +216,56 @@ query-agent/
 ├── worker/                    # agent worker
 ├── dispatcher/                # response dispatch
 ├── service/
-│   ├── llm_extractions.py
-│   ├── session_manager.py
-│   ├── session_models.py
-│   ├── task_manager.py
-│   ├── followup_resolver.py
-│   └── query_state_merger.py
-├── matcher/                   # metric / event / dimension / time matchers
-├── dsl/                       # semantic models, renderer, validators
-├── memory/
-│   ├── long_term_memory.py
-│   ├── memory_writer.py
-│   └── user_preference_store.py
-├── catalog/                   # demo YAML catalog
+│   ├── llm_extractions.py     # Layer 1: intent extraction (SQLIntentJson)
+│   ├── sql_generator.py       # Layer 3: grounded SQL generation + repair loop + time exprs
+│   ├── sql_validator.py       # sqlglot guardrails
+│   ├── query_orchestrator.py  # three turn paths (new / followup / confirmation)
+│   ├── session_manager.py     # session memory (JSONL persisted)
+│   ├── session_models.py      # QueryState / TaskContext / SessionContext
+│   ├── task_manager.py        # confirmation tasks (idempotent, persisted)
+│   ├── followup_resolver.py   # rule-based turn detection
+│   └── query_state_merger.py  # field-level patch merge
+├── matcher/
+│   ├── base.py                # inverted index + RapidFuzz + synonyms (core)
+│   ├── schema_loader.py       # sql_schema.yaml -> SQLSchema
+│   ├── table_matcher.py       # table name resolution
+│   ├── column_matcher.py      # column resolution (doc = "table.column")
+│   ├── sql_metric_matcher.py  # business metric resolution
+│   ├── time_matcher.py        # time range parsing
+│   └── matcher_service.py     # unified resolution + table/join inference
+├── memory/                    # project memory / memory writer / user preferences
+├── catalog/sql_schema.yaml    # demo schema metadata (see Production Notes)
 ├── data/                      # session / task / memory / preference runtime data
-└── tests/
+└── tests/                     # unit + integration + data-driven e2e evals
 ```
 
-## Catalog Note
+## Schema Metadata & Production Notes
 
-The checked-in `catalog/*.yaml` files are mainly for demos and local development. In a realistic deployment, metadata is expected to come from:
+Table/column/metric metadata lives in [catalog/sql_schema.yaml](catalog/sql_schema.yaml) — a local demo sample (an `orders / users / products` e-commerce schema with declarative joins and metric expressions such as `revenue = sum(orders.amount)`).
 
-- HTTP metadata services loaded at startup
-- scheduled sync jobs that materialize metadata into the local catalog
+This demo deliberately stops at **NL → validated ClickHouse SQL**. The following production extensions are documented as the intended direction and are not implemented here:
 
-In other words:
-
-- `catalog YAML` is the development/demo input
-- `metadata service + sync` is the production-oriented direction
+1. **Metadata sourcing** — `sql_schema.yaml` is the development/demo input. In production, table/column/metric metadata should be synced from the company metadata service (or `INFORMATION_SCHEMA`) on a schedule, then fed into `load_sql_schema()` to hot-rebuild matcher indexes.
+2. **Query execution** — running the SQL against a real ClickHouse (read-only account, statement timeout, row/cost caps, result caching) is a downstream step; the current API returns SQL only.
+3. **Result rendering** — chart/table rendering of query results belongs to the presentation layer.
+4. **Governance hardening** — row-level security via user-scoped predicates, per-user rate limits, PII masking, and full audit logging are natural next steps on top of the existing validator.
 
 ## Evaluation
 
 The project uses two kinds of tests:
 
 - unit / integration tests
-- data-driven end-to-end eval cases
-
-The end-to-end eval suite lives in:
-
-- [tests/evals/nl2dsl_cases.yaml](tests/evals/nl2dsl_cases.yaml)
-- [tests/test_end_to_end_evals.py](tests/test_end_to_end_evals.py)
+- data-driven end-to-end eval cases: [tests/evals/nl2sql_cases.yaml](tests/evals/nl2sql_cases.yaml) + [tests/test_end_to_end_evals.py](tests/test_end_to_end_evals.py)
 
 Current coverage includes:
 
-- basic new query
-- follow-up patch
+- basic new query (explicit table, and table inferred from a metric)
+- follow-up patches (time / metric / window rank)
 - follow-up + confirmation
 - project memory injection
 - confirmation after restart
+
+The eval harness mocks LLM extraction and SQL generation but runs the real matcher service, threshold logic, state merging, confirmation flow, and persistence — golden cases pin down the deterministic core of the pipeline.
 
 Run:
 
@@ -291,27 +277,25 @@ Run:
 
 - [Formatted Docs](https://query-agent.mintlify.app/): hosted Mintlify documentation
 - [docs/README.md](docs/README.md): documentation index
+- [README.zh-CN.md](docs/README.zh-CN.md): Chinese readme
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md): current architecture, module ownership, and dependency direction
 - [ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md): Chinese architecture document
 - [EVALUATION.md](docs/EVALUATION.md): eval harness, golden cases, and regression strategy
-- [EVALUATION.zh-CN.md](docs/EVALUATION.zh-CN.md): Chinese evaluation document
 - [MEMORY.md](docs/MEMORY.md): session/project/user memory design
 - [MEMORY.zh-CN.md](docs/MEMORY.zh-CN.md): Chinese memory design document
 - [docs/diagrams/architecture.md](docs/diagrams/architecture.md): Mermaid architecture diagrams
 - [docs/diagrams/sequence.md](docs/diagrams/sequence.md): sequence diagrams
 - [docs/diagrams/flowchart.md](docs/diagrams/flowchart.md): high-level flowcharts
-- [docs/diagrams/matcher-sequence.md](docs/diagrams/matcher-sequence.md): matcher sequence details
 - [TELEGRAM_TEST.md](docs/TELEGRAM_TEST.md): Telegram testing notes
-- [TELEGRAM_TEST.zh-CN.md](docs/TELEGRAM_TEST.zh-CN.md): Chinese Telegram testing notes
 
 ## Current Status
 
 The main capabilities currently in place are:
 
-- `NL -> DSL` pipeline
-- turn-based query handling
-- confirmation flow
-- session/task persistence
+- `NL -> validated ClickHouse SQL` pipeline (single table, joins from schema config, grouped ranking via `LIMIT n BY`)
+- turn-based query handling with structured state merging
+- confirmation flow with persisted, idempotent tasks
+- session/task persistence and restart recovery
 - project memory injection
 - user preference rerank signal
 - async memory learning
@@ -320,5 +304,6 @@ The main capabilities currently in place are:
 Good next steps:
 
 - richer `UserPattern / UserAlias / Preferences`
-- stronger memory categorization and retrieval
+- metadata service sync for schema hot-reload
+- query execution layer (read-only ClickHouse runner with cost guards)
 - larger golden eval set based on real query logs

@@ -10,44 +10,43 @@ Query Agent MCP 服务器
 
 from __future__ import annotations
 
-import asyncio
 import json
-from typing import Any
+import sys
 
 from mcp.server.fastmcp import FastMCP
 
 from common.text_utils import normalize, tokenize_mixed
-from matcher.event_matcher import build_event_matcher_from_catalog
-from matcher.metric_matcher import build_metric_matcher_from_catalog
-from matcher.dimension_matcher import build_dimension_matcher_from_catalog
-from matcher.catalog_loader import load_catalog
+from matcher.column_matcher import build_column_matcher_from_schema
+from matcher.schema_loader import load_sql_schema
+from matcher.sql_metric_matcher import build_sql_metric_matcher_from_schema
+from matcher.table_matcher import build_table_matcher_from_schema
 
 
 # 全局 matcher 实例
-_event_matcher = None
+_table_matcher = None
 _metric_matcher = None
-_dimension_matcher = None
+_column_matcher = None
 
 
 def _init_matchers():
     """初始化所有 matcher"""
-    global _event_matcher, _metric_matcher, _dimension_matcher
-    if _event_matcher is None:
-        catalog = load_catalog("catalog")
-        _event_matcher = build_event_matcher_from_catalog(catalog.events)
-        _metric_matcher = build_metric_matcher_from_catalog(catalog.metrics)
-        _dimension_matcher = build_dimension_matcher_from_catalog(catalog.dimensions)
+    global _table_matcher, _metric_matcher, _column_matcher
+    if _table_matcher is None:
+        schema = load_sql_schema("catalog")
+        _table_matcher = build_table_matcher_from_schema(schema.tables)
+        _metric_matcher = build_sql_metric_matcher_from_schema(schema.metrics)
+        _column_matcher = build_column_matcher_from_schema(schema.columns)
 
 
 def _get_matcher(matcher_type: str):
     """根据类型获取 matcher"""
     _init_matchers()
-    if matcher_type == "event":
-        return _event_matcher
+    if matcher_type == "table":
+        return _table_matcher
     elif matcher_type == "metric":
         return _metric_matcher
-    elif matcher_type == "dimension":
-        return _dimension_matcher
+    elif matcher_type == "column":
+        return _column_matcher
     else:
         raise ValueError(f"Unknown matcher_type: {matcher_type}")
 
@@ -59,14 +58,14 @@ mcp = FastMCP("Query Agent")
 @mcp.tool()
 async def token(
     query: str,
-    matcher_type: str = "event",
-) -> dict[str, Any]:
+    matcher_type: str = "table",
+) -> dict:
     """
     测试分词功能
 
     Args:
         query: 要分词的查询文本
-        matcher_type: matcher 类型 (event/metric/dimension)
+        matcher_type: matcher 类型 (table/metric/column)
 
     Returns:
         {
@@ -95,14 +94,14 @@ async def token(
 @mcp.tool()
 async def recall(
     query: str,
-    matcher_type: str = "event",
-) -> dict[str, Any]:
+    matcher_type: str = "table",
+) -> dict:
     """
     测试召回功能
 
     Args:
         query: 查询文本
-        matcher_type: matcher 类型 (event/metric/dimension)
+        matcher_type: matcher 类型 (table/metric/column)
 
     Returns:
         {
@@ -146,14 +145,14 @@ async def recall(
 @mcp.tool()
 async def rerank(
     query: str,
-    matcher_type: str = "event",
-) -> dict[str, Any]:
+    matcher_type: str = "table",
+) -> dict:
     """
     测试重排功能
 
     Args:
         query: 查询文本
-        matcher_type: matcher 类型 (event/metric/dimension)
+        matcher_type: matcher 类型 (table/metric/column)
 
     Returns:
         {

@@ -22,17 +22,17 @@ graph TB
 
     subgraph API["API Layer"]
         FastAPI["FastAPI App<br/>app.py"]
-        Models["NL2DSLRequest<br/>NL2DSLResponse"]
+        Models["NL2SQLRequest<br/>NL2SQLResponse"]
         TelegramNotify["Telegram Notification Helper"]
     end
 
     subgraph Service["Service Layer"]
         Orchestrator["QueryOrchestrator<br/>Turn Routing + Business Flow"]
-        LLM["LLM Extractions"]
+        LLM["LLM Intent Extraction<br/>SQLIntentJson"]
+        SQLGen["SQL Generator<br/>Grounded ClickHouse Generation"]
+        SQLVal["SQL Validator<br/>sqlglot Guardrails"]
         SessionManager["SessionManager<br/>Session State"]
         TaskManager["TaskManager<br/>Confirmation Tasks"]
-        BearerService["BearerService<br/>Query Execution"]
-        CatalogSync["CatalogSync<br/>Metadata Refresh"]
     end
 
     subgraph Memory["Memory Layer"]
@@ -43,32 +43,22 @@ graph TB
     end
 
     subgraph Matcher["Matcher Layer"]
-        MatcherService["MatcherService"]
-        EventMatcher["EventMatcher"]
-        MetricMatcher["MetricMatcher"]
-        DimensionMatcher["DimensionMatcher"]
+        MatcherService["MatcherService<br/>+ Table/Join Inference"]
+        TableMatcher["TableMatcher"]
+        ColumnMatcher["ColumnMatcher<br/>doc = table.column"]
+        SQLMetricMatcher["SQLMetricMatcher"]
         TimeMatcher["TimeMatcher"]
+        BaseMatcher["BaseMatcher<br/>Inverted Index + RapidFuzz"]
     end
 
-    subgraph DSL["DSL Layer"]
-        SemanticDSL["Semantic Models"]
-        Renderer["Exec DSL Renderer"]
-        Validators["Validators"]
-    end
-
-    subgraph Catalog["Catalog Layer"]
-        Metrics["metrics.yaml"]
-        Events["events.yaml"]
-        Dimensions["dimensions.yaml"]
-        Regions["region_groups.yaml"]
-        CatalogLoader["Catalog Loader"]
+    subgraph Schema["Schema Layer"]
+        SchemaYaml["sql_schema.yaml<br/>tables / columns / joins / metrics"]
+        SchemaLoader["Schema Loader"]
     end
 
     subgraph External["External Services"]
         TelegramAPI["Telegram Bot API"]
         LLMBackend["LLM Backend"]
-        BearerAPI["Bearer Query Engine"]
-        CatalogAPI["Catalog API"]
     end
 
     TelegramUser --> TelegramAPI
@@ -87,9 +77,7 @@ graph TB
     Orchestrator --> TaskManager
     Orchestrator --> LLM
     Orchestrator --> MatcherService
-    Orchestrator --> SemanticDSL
-    Orchestrator --> Renderer
-    Orchestrator --> Validators
+    Orchestrator --> SQLGen
     Orchestrator --> MemoryWriter
     Orchestrator --> UserPreference
 
@@ -98,21 +86,18 @@ graph TB
     MemoryWriter --> Storage
     UserPreference --> Storage
 
-    MatcherService --> EventMatcher
-    MatcherService --> MetricMatcher
-    MatcherService --> DimensionMatcher
-    MatcherService --> TimeMatcher
-    EventMatcher --> Events
-    MetricMatcher --> Metrics
-    DimensionMatcher --> Dimensions
-    CatalogLoader --> Metrics
-    CatalogLoader --> Events
-    CatalogLoader --> Dimensions
-    CatalogLoader --> Regions
-
+    SQLGen --> SQLVal
+    SQLGen --> LLMBackend
     LLM --> LLMBackend
-    BearerService --> BearerAPI
-    CatalogSync --> CatalogAPI
-    Renderer --> BearerService
+
+    MatcherService --> TableMatcher
+    MatcherService --> ColumnMatcher
+    MatcherService --> SQLMetricMatcher
+    MatcherService --> TimeMatcher
+    TableMatcher -.-> BaseMatcher
+    ColumnMatcher -.-> BaseMatcher
+    SQLMetricMatcher -.-> BaseMatcher
+    MatcherService --> SchemaLoader
+    SchemaLoader --> SchemaYaml
     TelegramGateway --> TelegramAPI
 ```

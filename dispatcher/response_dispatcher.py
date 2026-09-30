@@ -38,17 +38,15 @@ class ResponseDispatcher:
             return
 
         try:
-            if result.success and result.nl2dsl_result:
+            if result.success and result.nl2sql_result:
                 # 检查 early_exit
-                if result.error and not result.query_result:
+                if result.error and result.nl2sql_result.get("status") == "early_exit":
                     # early_exit 场景：发送错误提示
                     await gateway.send_response(msg.chat_id, {"text": result.error})
                     return
 
                 # 正常结果：让 Gateway 自己格式化
-                response_text = gateway.format_response(
-                    result.nl2dsl_result, result.query_result
-                )
+                response_text = gateway.format_response(result.nl2sql_result)
                 await gateway.send_response(msg.chat_id, {"text": response_text})
             else:
                 error_msg = f"处理失败: {result.error or '未知错误'}"

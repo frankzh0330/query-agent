@@ -10,16 +10,10 @@
 # Required: Telegram Bot token
 export TELEGRAM_BOT_TOKEN="your_bot_token_here"
 
-# Enable mock mode when the Bearer API is not available
-export BEARER_MOCK="true"
-
 # LLM configuration
 export LLM_BACKEND="zhipu"  # or "ollama"
 export ZHIPU_API_KEY="your_zhipu_key"  # when using zhipu
 export OLLAMA_BASE_URL="http://localhost:11434"  # when using ollama
-
-# Optional: API service URL
-export API_BASE_URL="http://localhost:8000"
 ```
 
 ### 2. Run
@@ -32,33 +26,38 @@ python server.py
 
 1. Send a message to the Telegram bot, for example:
 
-- `PV in Germany`
-- `UV in France`
-- `app_launch in California over the last 7 days`
+- `近7天各地区的销售额`
+- `改成只看VIP用户`
+- `每个地区前3`
 
-2. The bot should return a formatted query result:
+2. The bot should return the generated SQL and resolved intent:
 
 ```text
-Query Result
-Region: EUTTP
-Metric: pv
-Event: app_launch
-Time: last 7 days
+📄 已生成 ClickHouse SQL
+表: orders
+指标: revenue
+分组: users.region
+时间: last_n_days n=7
 
-Data Result
-2024-03-24: pv=12345, region=EUTTP
-2024-03-23: pv=11234, region=EUTTP
-2024-03-22: pv=10234, region=EUTTP
-...
+SELECT users.region AS region, sum(orders.amount) AS revenue
+FROM orders JOIN users ON orders.user_id = users.id
+WHERE orders.created_at >= now() - INTERVAL 7 DAY
+GROUP BY users.region ORDER BY revenue DESC LIMIT 100
 ```
 
-## Mock Data
+Note: query execution and result rendering are intentionally out of scope for
+this demo — the bot returns the validated SQL only (see Production Notes in the README).
 
-In mock mode, the service:
+3. If a table or metric is ambiguous, the bot will ask for confirmation:
 
-- extracts `region / metric / event` from `exec_dsl`
-- returns three example rows for recent days
-- includes date and metric value in each row
+```text
+请选择表:
+  1. products (匹配度 55%)
+  2. orders (匹配度 48%)
+回复编号或名称即可
+```
+
+Reply `1` (or the name) to continue; the pending confirmation survives restarts.
 
 ## Debugging
 
@@ -74,12 +73,12 @@ http://localhost:8000/docs
 curl http://localhost:8000/sessions
 ```
 
-### Test The NL2DSL API Directly
+### Test The NL2SQL API Directly
 
 ```bash
-curl -X POST http://localhost:8000/nl2dsl \
+curl -X POST http://localhost:8000/nl2sql \
   -H "Content-Type: application/json" \
-  -d '{"text": "PV in Germany", "project_id": 55}'
+  -d '{"text": "近7天各地区的销售额", "project_id": 55}'
 ```
 
 ## Troubleshooting
@@ -97,4 +96,4 @@ curl -X POST http://localhost:8000/nl2dsl \
 3. Memory files are not visible.
 
 - Runtime memory is stored under the configured `data/` directory.
-- Check `data/memory/`, `data/session/`, and `data/user_preferences/`.
+- Check `data/memory/`, `data/sessions/`, and `data/user_preferences/`.

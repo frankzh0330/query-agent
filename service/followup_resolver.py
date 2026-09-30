@@ -23,9 +23,9 @@ _FOLLOWUP_PREFIXES = (
     "比较",
 )
 
-_REGION_TOKENS = ("美国", "德国", "欧洲", "新加坡", "row", "usttp", "euttp")
-_GROUP_BY_TOKENS = ("渠道", "国家", "地区", "城市", "平台")
-_METRIC_TOKENS = ("uv", "pv", "arpu", "gmv", "留存", "转化")
+_TABLE_TOKENS = ("订单", "用户", "会员", "商品")
+_GROUP_BY_TOKENS = ("地区", "区域", "渠道", "品类", "状态", "国家", "城市", "平台")
+_METRIC_TOKENS = ("销售额", "订单量", "客单价", "用户数", "金额", "营收", "gmv", "单量", "pv", "uv")
 _FOLLOWUP_SUFFIXES = ("呢", "吧", "一下", "看看", "再来")
 _COMPARISON_PATTERNS = ("和昨天比", "和今天比", "和上周比", "同比", "环比")
 
@@ -172,14 +172,18 @@ def _looks_like_short_patch(text: str) -> bool:
         "今天",
         "本周",
         "本月",
-        "uv",
-        "pv",
-        "美国",
-        "德国",
-        "欧洲",
-        "渠道",
-        "国家",
+        "销售额",
+        "订单量",
+        "客单价",
+        "用户数",
+        "订单",
+        "用户",
+        "会员",
+        "商品",
         "地区",
+        "品类",
+        "渠道",
+        "状态",
     )
     lowered = text.lower()
     return any(keyword.lower() in lowered for keyword in patch_keywords)
@@ -189,15 +193,15 @@ def _collect_patch_signals(text: str) -> list[str]:
     lowered = text.lower()
     signals: list[str] = []
 
-    if any(token in lowered for token in _REGION_TOKENS):
-        signals.append("region_token")
+    if any(token in lowered for token in _TABLE_TOKENS):
+        signals.append("table_token")
     if any(token in lowered for token in _GROUP_BY_TOKENS):
         signals.append("group_by_token")
     if any(token in lowered for token in _METRIC_TOKENS):
         signals.append("metric_token")
     if any(token in text for token in _FOLLOWUP_SUFFIXES):
         signals.append("followup_suffix")
-    if any(token in text for token in ("按", "拆", "看", "对比", "比较")):
+    if any(token in text for token in ("按", "拆", "看", "对比", "比较", "前")):
         signals.append("patch_verb")
     if any(token in text for token in _COMPARISON_PATTERNS):
         signals.append("comparison_phrase")
@@ -210,14 +214,14 @@ def _looks_like_contextual_patch(text: str, signals: list[str]) -> bool:
         return False
 
     short_enough = len(text) <= 18
-    if short_enough and any(signal in signals for signal in ("region_token", "metric_token", "group_by_token")):
+    if short_enough and any(signal in signals for signal in ("table_token", "metric_token", "group_by_token")):
         return True
 
     if "comparison_phrase" in signals:
         return True
 
     if "followup_suffix" in signals and any(
-        signal in signals for signal in ("region_token", "metric_token", "group_by_token", "patch_verb")
+        signal in signals for signal in ("table_token", "metric_token", "group_by_token", "patch_verb")
     ):
         return True
 

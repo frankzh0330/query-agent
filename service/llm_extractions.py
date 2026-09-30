@@ -34,10 +34,8 @@ def _build_context_str(session_context: Optional[Dict[str, Any]]) -> str:
     """构建动态会话上下文字符串（注入到提示词）
 
     只保留有价值的动态上下文：
-    1. QueryState — 上下文继承（最高价值）
+    1. QueryState — 上一轮 SQL 查询意图（上下文继承，最高价值）
     2. 最近用户消息 — 辅助理解
-
-    不再注入 favorite_regions/metrics/events（LLM + Catalog 已够用）
     记忆文件纠正内容在 _build_messages 中单独注入。
     """
     if not session_context:
@@ -49,20 +47,23 @@ def _build_context_str(session_context: Optional[Dict[str, Any]]) -> str:
     if session_context.get("last_query_state"):
         qs = session_context["last_query_state"]
         state_parts = []
-        if qs.get("region_filter"):
-            state_parts.append(f"地区={','.join(qs['region_filter'])}")
-        if qs.get("metric"):
-            state_parts.append(f"指标={qs['metric']}")
-        if qs.get("event"):
-            state_parts.append(f"事件={qs['event']}")
+        if qs.get("tables"):
+            state_parts.append(f"表={','.join(qs['tables'])}")
+        if qs.get("metrics"):
+            state_parts.append(f"指标={','.join(qs['metrics'])}")
+        if qs.get("columns"):
+            state_parts.append(f"列={','.join(qs['columns'])}")
         if qs.get("time_range"):
             tr = qs["time_range"]
             state_parts.append(f"时间=近{tr.get('n', '?')}天")
         if qs.get("group_by"):
             state_parts.append(f"分组={','.join(qs['group_by'])}")
         if qs.get("filters"):
-            filter_strs = [f"{f['field']}{f['op']}{f['value']}" for f in qs["filters"]]
+            filter_strs = [f"{f.get('column')}{f.get('op')}{f.get('value')}" for f in qs["filters"]]
             state_parts.append(f"过滤={','.join(filter_strs)}")
+        if qs.get("window"):
+            w = qs["window"]
+            state_parts.append(f"窗口排名={w.get('group_by')}前{w.get('limit')}")
 
         if state_parts:
             parts.append(f"上次查询: {', '.join(state_parts)}")
@@ -91,9 +92,9 @@ def _build_followup_instruction(session_context: Optional[Dict[str, Any]]) -> st
     return (
         "\n\n=== 多轮查询补充规则 ===\n"
         "如果当前问题看起来是在补充、修改或缩写上一轮查询，请优先抽取本轮明确提到的新信息。\n"
-        "不要为了补全而重复输出用户本轮没有明确说出的 event、metric、group_by。\n"
-        "如果本轮只说了时间、地区、指标或分组变化，就只抽取这些变化。\n"
-        "只有当用户本轮明确提到 event 时，才填充 event_extractions。\n"
+        "不要为了补全而重复输出用户本轮没有明确说出的表、指标、列、过滤条件。\n"
+        "如果本轮只说了时间、过滤或分组变化，就只抽取这些变化。\n"
+        "只有当用户本轮明确提到表或指标时，才填充对应 extractions。\n"
         "=== 规则结束 ===\n"
     )
 
@@ -171,60 +172,74 @@ class Extraction(BaseModel):
     text: str
 
 
-class ExtractionsJson(BaseModel):
+class FilterExtraction(BaseModel):
+    """过滤条件抽取：column/value 为自然语言片段，由 matcher 解析"""
+    text: str
+    column: Optional[str] = None   # 如 "会员等级"（待 ColumnMatcher 解析）
+    op: str = "="                  # = | != | > | < | >= | <= | in | like
+    value: Optional[str] = None    # 如 "vip"（LLM 直接给出或从 text 截取）
+
+
+class SQLIntentJson(BaseModel):
+    """Layer 1 LLM 抽取结果 — SQL 查询意图片段（不做任何解析/翻译）"""
+    table_extractions: List[Extraction] = Field(default_factory=list)
     metric_extractions: List[Extraction] = Field(default_factory=list)
-    time_extractions: List[Extraction] = Field(default_factory=list)
-    event_extractions: List[Extraction] = Field(default_factory=list)
-
-    # 区域过滤：LLM 直接返回 ["EUTTP"], ["USTTP"], 或 ["ROW"]
-    # 注意：region_filter 不能为空，默认为 ["ROW"]
-    region_filter: List[str] = Field(default_factory=lambda: ["ROW"])
-
+    column_extractions: List[Extraction] = Field(default_factory=list)
+    filter_extractions: List[FilterExtraction] = Field(default_factory=list)
     group_by_extractions: List[Extraction] = Field(default_factory=list)
+    time_extractions: List[Extraction] = Field(default_factory=list)
+    order_extractions: List[Extraction] = Field(default_factory=list)    # "销售额最高的前3"
+    window_extractions: List[Extraction] = Field(default_factory=list)   # "每个地区前3"
 
 
 # ==================== Prompt ====================
 
 FEW_SHOT_EXAMPLES = r"""
 示例:
-德国 PV -> {"metric_extractions":[{"text":"PV"}],"event_extractions":[],"region_filter":["EUTTP"]}
-加州 UV -> {"metric_extractions":[{"text":"UV"}],"event_extractions":[],"region_filter":["USTTP"]}
-欧洲 app_launch的PV -> {"metric_extractions":[{"text":"PV"}],"event_extractions":[{"text":"app_launch"}],"region_filter":["EUTTP"]}
-欧洲 近7天 app_launch -> {"metric_extractions":[{"text":"PV"}],"time_extractions":[{"text":"近7天"}],"event_extractions":[{"text":"app_launch"}],"region_filter":["EUTTP"]}
+近7天各地区的销售额 -> {"metric_extractions":[{"text":"销售额"}],"group_by_extractions":[{"text":"地区"}],"time_extractions":[{"text":"近7天"}]}
+VIP用户的订单量 -> {"metric_extractions":[{"text":"订单量"}],"filter_extractions":[{"text":"VIP用户","column":"会员等级","op":"=","value":"vip"}]}
+订单表前10条金额大于100的记录 -> {"table_extractions":[{"text":"订单表"}],"column_extractions":[{"text":"金额"}],"filter_extractions":[{"text":"金额大于100","column":"金额","op":">","value":"100"}]}
+每个地区销售额前3的会员 -> {"metric_extractions":[{"text":"销售额"}],"window_extractions":[{"text":"每个地区前3"}]}
+客单价最高的前5 -> {"metric_extractions":[{"text":"客单价"}],"order_extractions":[{"text":"最高的前5"}]}
 """
 
-_BASE_SYSTEM_PROMPT = r"""你是"提取器"。只做：从用户问题中抽取结构化片段（extractions）。
+_BASE_SYSTEM_PROMPT = r"""你是"抽取器"。只做：从用户问题中抽取 SQL 查询意图的原文片段（extractions）。
+注意：你不生成 SQL，不翻译名字——表名/指标名/列名的解析由下游 matcher 完成，你只负责切分和归类。
 
 抽取规则：
-- metric_extractions：从用户问题中提取指标
-  - 明确提到 PV/浏览量/访问量/点击量 → "PV"
-  - 明确提到 UV/独立访客/访客数/用户数 → "UV"
-  - 没有明确提到指标 → 默认提取为 "PV"（这是最常用的指标）
-  - metric_extractions 不能为空，必须有值
+- table_extractions：用户明确提到的表
+  - 订单/订单表/下单 → 抽取原文
+  - 用户/会员 → 抽取原文
+  - 只有明确提到表或表相关描述才抽取，不要猜测
 
-- event_extractions：从用户问题中提取事件名称（重要！）
-  - app_launch/启动/应用启动/打开app → "app_launch"
-  - click/点击/点击事件 → "click"
-  - view/浏览/浏览事件 → "view"
-  - 其他事件名 → 直接提取原文
-  - 注意：如果提到 app launch、click、view 等，这些是事件，不是时间！
-  - 只有用户明确提到事件才提取，不要猜测或默认填充
+- metric_extractions：业务指标（通常是聚合值）
+  - 销售额/营收/GMV → "销售额"
+  - 订单量/单量/订单数 → "订单量"
+  - 客单价 → "客单价"
+  - 用户数/买家数 → "用户数"
 
-- time_extractions：从用户问题中提取时间范围
-  - 近7天/最近7天/7天内 → "近7天"
-  - 昨天/昨天一天 → "昨天"
-  - 今天/当天 → "今天"
-  - 本周/这周 → "本周"
-  - 本月/这个月 → "本月"
-  - 注意：只有明确的时间描述才是 time，app_launch 不是时间！
+- column_extractions：普通列（非指标、用于明细展示或隐含过滤分组）
+  - "订单号"、"金额"、"状态"、"地区"、"品类" → 抽取原文
 
-- region_filter：直接返回区域代码列表，注意不是国家名而是区域代码！
-  - 欧洲/欧盟国家（德国、法国、意大利等）→ ["EUTTP"]
-  - 美国/美国州（加州、纽约等）→ ["USTTP"]
-  - 其他/未知/新加坡等 → ["ROW"]
-  - 无区域信息 → ["ROW"]
+- filter_extractions：过滤条件
+  - "VIP用户" → {"text":"VIP用户","column":"会员等级","op":"=","value":"vip"}
+  - "金额大于100" → {"text":"金额大于100","column":"金额","op":">","value":"100"}
+  - "状态是已支付" → {"text":"状态是已支付","column":"状态","op":"=","value":"已支付"}
+  - op 只能是: = | != | > | < | >= | <= | in | like
+  - column 抽原文（如"会员等级"），value 给规范化值（如"vip"、"100"）
 
-- group_by_extractions：从用户问题中提取分组维度
+- group_by_extractions：分组维度
+  - "各地区"、"按渠道拆"、"每个品类" → 抽取维度原文（"地区"、"渠道"、"品类"）
+
+- time_extractions：时间范围
+  - 近7天/最近7天 → "近7天"；昨天 → "昨天"；本周 → "本周"；本月 → "本月"
+
+- order_extractions：显式排序/TopN（针对全结果集）
+  - "销售额最高的前5"、"按金额从大到小" → 抽取原文
+
+- window_extractions：分组内排名（每个X内的前N）
+  - "每个地区前3"、"每个品类销售额第一" → 抽取原文
+  - 注意区分："销售额前5"（全局 TopN → order_extractions）vs "每个地区前3"（分组内 → window_extractions）
 
 """ + FEW_SHOT_EXAMPLES
 
@@ -239,14 +254,23 @@ _BASE_SYSTEM_PROMPT_TEXT = _BASE_SYSTEM_PROMPT + r"""
 
 # ==================== Tool Schema (Function Calling) ====================
 
-EXTRACT_ENTITIES_TOOL = {
+EXTRACT_INTENT_TOOL = {
     "type": "function",
     "function": {
-        "name": "extract_entities",
-        "description": "从用户自然语言查询中提取结构化实体",
+        "name": "extract_sql_intent",
+        "description": "从用户自然语言查询中抽取 SQL 查询意图片段",
         "parameters": {
             "type": "object",
             "properties": {
+                "table_extractions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                    "description": "表抽取，如 订单表、用户表",
+                },
                 "metric_extractions": {
                     "type": "array",
                     "items": {
@@ -254,30 +278,30 @@ EXTRACT_ENTITIES_TOOL = {
                         "properties": {"text": {"type": "string"}},
                         "required": ["text"],
                     },
-                    "description": "指标提取，如 PV、UV",
+                    "description": "业务指标抽取，如 销售额、订单量、客单价",
                 },
-                "time_extractions": {
+                "column_extractions": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "properties": {"text": {"type": "string"}},
                         "required": ["text"],
                     },
-                    "description": "时间范围提取，如 近7天、昨天",
+                    "description": "普通列抽取，如 订单号、地区、品类",
                 },
-                "event_extractions": {
+                "filter_extractions": {
                     "type": "array",
                     "items": {
                         "type": "object",
-                        "properties": {"text": {"type": "string"}},
+                        "properties": {
+                            "text": {"type": "string"},
+                            "column": {"type": "string"},
+                            "op": {"type": "string", "enum": ["=", "!=", ">", "<", ">=", "<=", "in", "like"]},
+                            "value": {"type": "string"},
+                        },
                         "required": ["text"],
                     },
-                    "description": "事件名提取，如 app_launch、click",
-                },
-                "region_filter": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "区域代码列表，如 EUTTP、USTTP、ROW",
+                    "description": "过滤条件抽取，如 VIP用户、金额大于100",
                 },
                 "group_by_extractions": {
                     "type": "array",
@@ -286,10 +310,37 @@ EXTRACT_ENTITIES_TOOL = {
                         "properties": {"text": {"type": "string"}},
                         "required": ["text"],
                     },
-                    "description": "分组维度提取",
+                    "description": "分组维度抽取，如 地区、渠道、品类",
+                },
+                "time_extractions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                    "description": "时间范围抽取，如 近7天、昨天、本月",
+                },
+                "order_extractions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                    "description": "全局排序/TopN 抽取，如 销售额最高的前5",
+                },
+                "window_extractions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                    "description": "分组内排名抽取，如 每个地区前3",
                 },
             },
-            "required": ["metric_extractions", "region_filter"],
+            "required": [],
         },
     },
 }
@@ -346,8 +397,9 @@ def _build_messages(query: str, session_context: Optional[Dict[str, Any]],
     """构建 OpenAI 兼容的 messages 列表
 
     注入结构（按顺序追加到 system prompt）：
-    1. 记忆文件内容（纠正/约束，借鉴 cc_python section 9 的内容注入方式）
+    1. 记忆文件内容（纠正/约束）
     2. 动态上下文（QueryState + 最近消息）
+    3. follow-up patch extraction 指令
     """
     system_prompt = _BASE_SYSTEM_PROMPT if use_tool_calling else _BASE_SYSTEM_PROMPT_TEXT
 
@@ -384,24 +436,24 @@ def _build_messages(query: str, session_context: Optional[Dict[str, Any]],
 
 # ==================== 提取逻辑 ====================
 
-def _parse_result(data: dict) -> ExtractionsJson:
+def _parse_result(data: dict) -> SQLIntentJson:
     """解析并验证提取结果"""
-    return ExtractionsJson.model_validate(data)
+    return SQLIntentJson.model_validate(data)
 
 
-def extract_llm(query: str, session_context: Optional[Dict[str, Any]] = None) -> ExtractionsJson:
-    """LLM 提取实体（支持会话上下文）
+def extract_llm(query: str, session_context: Optional[Dict[str, Any]] = None) -> SQLIntentJson:
+    """LLM 抽取 SQL 查询意图（支持会话上下文）
 
     Args:
         query: 用户查询文本
-        session_context: 会话上下文，包含历史对话和已解析实体
+        session_context: 会话上下文，包含历史对话和已解析状态
     """
     # 检查缓存（暂不支持带上下文的缓存）
     if _is_cache_enabled() and not session_context:
         cache_key = _query_hash(query)
         if cache_key in _query_cache:
             logger.info(f"extract_llm: cache hit for query: {query}")
-            return ExtractionsJson(**_query_cache[cache_key])
+            return SQLIntentJson(**_query_cache[cache_key])
 
     client = get_llm_client()
     model = _get_model_name()
@@ -416,8 +468,8 @@ def extract_llm(query: str, session_context: Optional[Dict[str, Any]] = None) ->
     logger.debug(f"LLM extract: model={model}, tool_calling={use_tool_calling}, query={query[:80]}")
 
     if use_tool_calling:
-        kwargs["tools"] = [EXTRACT_ENTITIES_TOOL]
-        kwargs["tool_choice"] = {"type": "function", "function": {"name": "extract_entities"}}
+        kwargs["tools"] = [EXTRACT_INTENT_TOOL]
+        kwargs["tool_choice"] = {"type": "function", "function": {"name": "extract_sql_intent"}}
 
     resp = client.chat.completions.create(**kwargs)
     choice = resp.choices[0]
@@ -438,7 +490,7 @@ def extract_llm(query: str, session_context: Optional[Dict[str, Any]] = None) ->
             result = _parse_result(data)
         except (json.JSONDecodeError, ValidationError) as e:
             logger.error(f"LLM extract parse failed: {e}, raw={content[:300]}")
-            raise ValueError(f"LLM extractions 输出不合法: {e}\nRaw:\n{content}")
+            raise ValueError(f"LLM SQLIntentJson 输出不合法: {e}\nRaw:\n{content}")
 
     # 保存到缓存（仅无上下文时）
     if _is_cache_enabled() and not session_context:
@@ -447,6 +499,6 @@ def extract_llm(query: str, session_context: Optional[Dict[str, Any]] = None) ->
     return result
 
 
-async def extract_llm_async(query: str, session_context: Optional[Dict[str, Any]] = None) -> ExtractionsJson:
+async def extract_llm_async(query: str, session_context: Optional[Dict[str, Any]] = None) -> SQLIntentJson:
     """extract_llm 的异步包装，通过 asyncio.to_thread 避免阻塞事件循环"""
     return await asyncio.to_thread(extract_llm, query, session_context)

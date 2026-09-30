@@ -1,0 +1,11 @@
+{
+  "tables": {
+    "orders": 4
+  },
+  "metrics": {
+    "revenue": 4
+  },
+  "columns": {
+    "users.region": 4
+  }
+}

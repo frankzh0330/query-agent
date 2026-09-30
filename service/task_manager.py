@@ -114,18 +114,15 @@ class TaskManager:
 
         # 2. patch partial_query_state
         if task.partial_query_state:
-            if field == "event":
-                task.partial_query_state.event = value
-            elif field == "metric":
-                task.partial_query_state.metric = value
-            elif field == "region":
-                task.partial_query_state.region_filter = [value]
-            elif field == "group_by":
-                task.partial_query_state.group_by = value if isinstance(value, list) else [value]
-            elif field == "chart_type":
-                task.partial_query_state.chart_type = value
-            elif field == "interaction_mode":
-                task.partial_query_state.interaction_mode = value
+            if field == "tables":
+                task.partial_query_state.tables = [value]
+            elif field == "metrics":
+                task.partial_query_state.metrics = [value]
+            elif field == "join":
+                if value not in task.partial_query_state.tables:
+                    task.partial_query_state.tables.append(value)
+            elif field == "column":
+                task.partial_query_state.columns.append(value)
 
         # 3. 检查是否所有需要确认的字段都已确认
         all_confirmed = all(

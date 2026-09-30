@@ -42,8 +42,7 @@ class DirectCallBus(MessageBus):
             bus_result = BusResult(
                 msg=msg,
                 success=True,
-                nl2dsl_result=result.get("nl2dsl"),
-                query_result=result.get("query"),
+                nl2sql_result=result.get("nl2sql"),
                 error=result.get("message") if result.get("early_exit") else None,
             )
         except Exception as e:

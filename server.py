@@ -16,14 +16,16 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
+# 第三方 HTTP 库的 DEBUG 日志是纯噪音（每次 TLS/请求头都打一行），统一压到 WARNING
+for _noisy in ("httpx", "httpcore", "asyncio"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 from app import app, set_matcher_service
 from bus import create_bus
 from bus.direct_call_bus import DirectCallBus
 from dispatcher.response_dispatcher import ResponseDispatcher
 from gateway.telegram_gateway import TelegramGateway
 from matcher.matcher_service import MatcherService
-from service.catalog_scheduler import CatalogScheduler
-from service.catalog_sync import CatalogSync
 from worker.agent_worker import AgentWorker
 
 logger = logging.getLogger(__name__)
@@ -97,18 +99,7 @@ async def websocket_lifespan(app: FastAPI):
     else:
         logger.warning("TELEGRAM_BOT_TOKEN not set, skipping TelegramGateway")
 
-    # 4. 启动 Catalog 定时同步调度器
-    catalog_api_base = os.getenv("CATALOG_API_BASE")
-    if catalog_api_base:
-        catalog_sync = CatalogSync(api_base=catalog_api_base, catalog_dir="catalog")
-        catalog_scheduler = CatalogScheduler(catalog_sync, matcher_service)
-        catalog_scheduler.start()
-        logger.info(f"CatalogScheduler started with API: {catalog_api_base}")
-    else:
-        catalog_scheduler = None
-        logger.info("CATALOG_API_BASE not set, skipping CatalogScheduler")
-
-    # 5. 启动 Session 定时清理
+    # 4. 启动 Session 定时清理
     from app import session_manager
 
     async def _session_cleanup_loop():
@@ -128,8 +119,6 @@ async def websocket_lifespan(app: FastAPI):
     logger.info("=== Stopping Server ===")
     for gw in _gateways.values():
         await gw.stop()
-    if catalog_scheduler:
-        catalog_scheduler.shutdown()
 
 
 # 创建带生命周期的 FastAPI 应用

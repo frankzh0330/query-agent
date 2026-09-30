@@ -13,6 +13,10 @@ This folder collects the project documentation that used to live at the reposito
 - [MEMORY.md](MEMORY.md): session, project, and user memory design
 - [MEMORY.zh-CN.md](MEMORY.zh-CN.md): Chinese memory design document
 
+## Study Notes
+
+- [ADK_NL2SQL.md](ADK_NL2SQL.md): study notes on how Google builds NL2SQL agents with the Agent Development Kit, and where that design diverges from this repository's. Not part of the running service.
+
 ## Runtime Notes
 
 - [TELEGRAM_TEST.md](TELEGRAM_TEST.md): Telegram testing notes

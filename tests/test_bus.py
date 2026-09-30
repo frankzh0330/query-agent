@@ -32,8 +32,8 @@ class TestBusResult:
         from bus.message_schema import BusMessage, BusResult
         msg = BusMessage(channel="telegram", chat_id="123", text="hello")
         result = BusResult(msg=msg, success=True)
-        assert result.nl2dsl_result is None
-        assert result.query_result is None
+        assert result.nl2sql_result is None
+        
 
     def test_bus_result_failure(self):
         from bus.message_schema import BusMessage, BusResult
@@ -61,7 +61,7 @@ class TestDirectCallBus:
 
         bus = DirectCallBus()
         mock_worker = mock.AsyncMock()
-        mock_worker.process.return_value = {"nl2dsl": {"status": "ok"}, "query": {}}
+        mock_worker.process.return_value = {"nl2sql": {"status": "ok"}}
         bus.bind_worker(mock_worker)
 
         msg = BusMessage(channel="telegram", chat_id="123", text="hello")
@@ -75,7 +75,7 @@ class TestDirectCallBus:
 
         bus = DirectCallBus()
         mock_worker = mock.AsyncMock()
-        mock_worker.process.return_value = {"nl2dsl": {"status": "ok"}, "query": {}}
+        mock_worker.process.return_value = {"nl2sql": {"status": "ok"}}
         mock_dispatcher = mock.AsyncMock()
         bus.bind_worker(mock_worker)
         bus.bind_dispatcher(mock_dispatcher)

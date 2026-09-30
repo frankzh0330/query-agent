@@ -1,8 +1,0 @@
-events:
-  app_launch:
-    aliases: [ "app_launch", "应用启动", "启动", "启动埋点", "App launch", "APP LAUNCH", "打开app", "打开APP", "打开应用", "APP启动", "App启动事件", "激活应用", "App首次使用", "启动应用", "首次打开" ]
-    show_name: "应用启动"
-    event_type: "origin"
-    event_name: "app_launch"
-
-

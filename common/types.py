@@ -5,7 +5,7 @@ from enum import Enum
 
 class MatcherType(str, Enum):
     """Matcher 类型枚举"""
-    EVENT = "event"
+    TABLE = "table"
+    COLUMN = "column"
     METRIC = "metric"
-    DIMENSION = "dimension"
     TIME = "time"

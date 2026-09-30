@@ -79,7 +79,7 @@ Purpose:
 
 Main files:
 
-- [tests/evals/nl2dsl_cases.yaml](../tests/evals/nl2dsl_cases.yaml)
+- [tests/evals/nl2sql_cases.yaml](../tests/evals/nl2sql_cases.yaml)
 - [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
 
 This harness is intentionally closer to “golden cases” than pure unit testing.
@@ -90,7 +90,7 @@ Each case is YAML-driven and may include:
 
 - `setup`
 - one or more `steps`
-- expected status, turn mode, and semantic fields
+- expected status, turn mode, and resolved-intent fields
 
 Example shape:
 
@@ -100,34 +100,32 @@ cases:
     setup:
       last_query_state:
         project_id: 55
-        event: app_launch
-        metric: pv
+        tables: ["orders"]
+        metrics: ["revenue"]
         time_range:
           type: last_n_days
           n: 7
-        region_filter: ["ROW"]
-        group_by: ["country"]
+        group_by: ["orders.channel"]
         filters: []
         turn_type: new_query
     steps:
-      - text: Compare with purchase
+      - text: Compare with the products table
         project_id: 55
         extraction:
-          event_extractions: ["purchase"]
-          region_filter: ["ROW"]
-        resolver: low_confidence_event
+          table_extractions: ["products"]
+        resolver: low_confidence_table
         expect:
           status: needs_confirmation
           turn_mode: followup_patch
-          candidates_contains: event
+          candidates_contains: tables
       - text: "1"
         project_id: 55
         expect:
           status: success
           turn_mode: confirmation
-          semantic:
-            event: purchase_success
-            metric: pv
+          resolved_intent:
+            tables: ["products"]
+            metrics: ["revenue"]
 ```
 
 ## What the Harness Can Simulate Today
@@ -135,28 +133,34 @@ cases:
 The current runner supports:
 
 - pre-seeded `last_query_state`
-- mocked extraction output
-- mocked resolver scenarios
+- mocked extraction output (`SQLIntentJson` fragments)
+- mocked resolver scenarios (high-confidence / low-confidence table)
+- mocked SQL generation (the harness pins the deterministic core:
+  matchers, thresholds, state merging, confirmation flow, persistence)
 - multi-step session continuity
 - `project_memory` setup
 - `restart_before: true` for restart simulation
 - assertions on:
   - `status`
   - `turn_mode`
-  - `semantic.event`
-  - `semantic.metric`
-  - `semantic.region_filter`
-  - `semantic.group_by`
-  - `semantic.time_range.n`
+  - `resolved_intent.tables`
+  - `resolved_intent.metrics`
+  - `resolved_intent.group_by`
+  - `resolved_intent.time_range.n`
+  - `resolved_intent.window` (grouped ranking)
+  - `resolved_intent.filters`
+  - join inference into the SQL-generation intent (`sql_intent_contains_join`)
   - candidate presence
 
 ## Current Covered Scenarios
 
 The current end-to-end cases cover:
 
-- basic new query
+- basic new query (explicit table; table inferred from a metric)
 - follow-up change time
 - follow-up change metric
+- follow-up add grouped-ranking window (top-N per group)
+- join inference (column on another table -> join from schema config)
 - follow-up confirmation flow
 - project memory context injection
 - confirmation after restart

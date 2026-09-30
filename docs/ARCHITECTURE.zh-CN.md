@@ -20,10 +20,10 @@
 │   task_manager.py · followup_resolver.py                    │
 │   query_state_merger.py                                     │
 ├──────────────────────────────────────────────────────────────┤
-│                       NL2DSL Pipeline                       │
+│                       NL2SQL Pipeline                       │
 │   llm_extractions.py                                        │
-│   matcher_service.py + matchers                             │
-│   semantic_models.py · renderer.py · validators.py          │
+│   matcher_service.py + table/column/metric matchers         │
+│   sql_generator.py · sql_validator.py                       │
 ├──────────────────────────────────────────────────────────────┤
 │                        Memory Layer                         │
 │   long_term_memory.py · memory_writer.py                    │
@@ -52,7 +52,8 @@ server.py
             ├─ service/query_state_merger.py
             ├─ service/llm_extractions.py
             ├─ matcher/*
-            ├─ dsl/*
+            ├─ service/sql_generator.py
+            ├─ service/sql_validator.py
             └─ memory/*
 ```
 
@@ -69,22 +70,23 @@ server.py
 
 ```mermaid
 flowchart TD
-    U["用户"] --> API["POST /nl2dsl"]
+    U["用户"] --> API["POST /nl2sql"]
     API --> ORC["QueryOrchestrator.process()"]
     ORC --> S["SessionManager.create_or_get"]
     S --> C["Enhanced Context"]
-    C --> L1["LLM Extraction"]
-    L1 --> L2["Matcher Resolution"]
+    C --> L1["LLM 意图抽取"]
+    L1 --> L2["Matcher 解析<br/>(表 / 列 / 指标 / 时间)"]
     L2 --> T{"Turn Logic"}
-    T -->|new_query| D1["Semantic DSL"]
+    T -->|new_query| S1["QueryState"]
     T -->|followup_patch| M["QueryState Merge"]
-    M --> D1
+    M --> S1
     T -->|needs_confirmation| K["TaskManager"]
     K --> R["User Reply"]
-    R --> D1
-    D1 --> D2["Exec DSL Render"]
-    D2 --> V["Validation"]
-    V --> O["Response"]
+    R --> S1
+    S1 --> J["Join 推断 (schema 配置)"]
+    J --> G["LLM SQL 生成<br/>(ClickHouse, grounded)"]
+    G --> V["sqlglot 校验"]
+    V --> O["ClickHouse SQL"]
     V --> ML["Async MemoryWriter"]
 ```
 
@@ -100,7 +102,7 @@ flowchart TD
     DISP --> TG
 ```
 
-## NL2DSL Pipeline
+## NL2SQL Pipeline
 
 ### Layer 1：LLM Extraction
 
@@ -121,40 +123,49 @@ flowchart TD
 
 输出：
 
-- `ExtractionsJson`
+- `SQLIntentJson`（table / metric / column / filter / group_by / time / order / window 片段）
 
 ### Layer 2：Matcher Resolution
 
-主要文件：[matcher/matcher_service.py](../matcher/matcher_service.py) 及具体 matcher。
+主要文件：[matcher/matcher_service.py](../matcher/matcher_service.py) 及具体 matcher
+（[table_matcher.py](../matcher/table_matcher.py)、[column_matcher.py](../matcher/column_matcher.py)、
+[sql_metric_matcher.py](../matcher/sql_metric_matcher.py)、[time_matcher.py](../matcher/time_matcher.py)），
+全部构建在 [matcher/base.py](../matcher/base.py)（倒排索引 + RapidFuzz + 同义词）之上，
+元数据来自 [matcher/schema_loader.py](../matcher/schema_loader.py)。
 
 职责：
 
-- 解析 `metric / event / dimension / time`
-- 返回 score、candidates、`needs_confirmation`
-- 保持解析逻辑确定性、可解释
+- 解析 `table / table.column / metric_id / time_range`，带分数与候选
+- 阈值策略（确定性，不依赖 LLM）：≥ 80 直接用，40-80 触发确认，< 40 丢弃/回退
+- 用户不提表名时推断主表（从指标表达式或列归属投票）
+- 从声明式 `joins:` 配置推断 join 步骤；路径缺失升级为确认流
 
 重要细节：
 
 - user preference 只在 recall 后做小幅 rerank
 - matcher 本身仍然是主要语义解析器
 
-### Layer 3：Semantic DSL
+### Layer 3：SQL Generation
 
-主要文件：[dsl/semantic_models.py](../dsl/semantic_models.py)
-
-职责：
-
-- 表达规范化后的查询意图
-- 将查询语义与下游执行格式解耦
-
-### Layer 4：Exec DSL
-
-主要文件：[dsl/renderer.py](../dsl/renderer.py) 和 [dsl/validators.py](../dsl/validators.py)
+主要文件：[service/sql_generator.py](../service/sql_generator.py)
 
 职责：
 
-- 渲染执行 payload
-- 校验 region 与一致性约束
+- 用已解析实体组装生成 prompt：主表、指标表达式、限定列、过滤条件、
+  ClickHouse 时间谓词、join 条件、window/order 意图
+- LLM 只组装结构（GROUP BY / JOIN / `LIMIT n BY` 分组排名），实体名由 prompt 固定
+- 修复循环：校验失败的错误信息回灌下一轮（最多额外 2 轮）
+
+### Layer 4：Validation
+
+主要文件：[service/sql_validator.py](../service/sql_validator.py)（sqlglot，`dialect="clickhouse"`）
+
+职责：
+
+- 单条只读语句（仅 SELECT / WITH）
+- 所有表引用必须在 schema 白名单内
+- 默认 LIMIT 注入
+- 确定性护栏，独立于 LLM
 
 ## Turn-Based Querying
 
@@ -183,10 +194,10 @@ Turn-based 行为是系统的一等公民，不是简单的 prompt 技巧。
 ```mermaid
 flowchart TD
     Q["Incoming text"] --> D["detect_followup()"]
-    D -->|new_query| N["Run full NL2DSL path"]
+    D -->|new_query| N["Run full NL2SQL path"]
     D -->|followup_patch| P["Extract patch"]
     P --> M["merge_query_state()"]
-    M --> S["Semantic DSL"]
+    M --> S["SQL Generation"]
     D -->|confirmation_reply| T["TaskManager / pending task"]
 ```
 
@@ -195,11 +206,12 @@ flowchart TD
 它能支持这类多轮查询：
 
 ```text
-Q1: 德国 app_launch 的 PV
+Q1: 近7天各地区的销售额
 Q2: 昨天
-Q3: 改成 UV
-Q4: 再按渠道拆一下
-Q5: 那美国呢
+Q3: 改成订单量
+Q4: 再按品类拆一下
+Q5: 只看VIP用户
+Q6: 每个地区前3
 ```
 
 而不要求用户每轮都把所有字段重说一遍。
@@ -251,7 +263,7 @@ Q5: 那美国呢
 
 存储内容：
 
-- 用户级 `event / metric / group_by` 使用计数
+- 用户级 `table / metric / column` 使用计数
 - 作用域严格限制为 `project_id + user_id`
 
 作用：
@@ -323,10 +335,9 @@ Session 和 Task 分开持久化：
 职责：
 
 - 应用生命周期
-- matcher service 初始化
+- matcher service 初始化（schema 加载 + 索引构建）
 - bus / worker / dispatcher 装配
 - Telegram gateway 启动
-- catalog scheduler 启动
 - session 定时清理（5 分钟间隔，60 分钟过期）
 
 ### `gateway/*`, `ingress/*`, `bus/*`, `worker/*`, `dispatcher/*`
@@ -349,9 +360,9 @@ Session 和 Task 分开持久化：
 ### 场景 1：首次查询
 
 ```json
-POST /nl2dsl
+POST /nl2sql
 {
-  "text": "德国 app_launch 的 PV",
+  "text": "近7天各地区的销售额",
   "project_id": 55
 }
 ```
@@ -360,16 +371,18 @@ POST /nl2dsl
 
 - 创建或恢复 session
 - 走完整 `new_query` 路径
-- 解析 event、metric、time、region
+- 解析 metric / time / 分组列，从指标推断主表（`revenue -> orders`），
+  并为 `users.region` 推断 join
+- 生成并校验 ClickHouse SQL
 - 返回 `status=success`
 - 持久化 `last_query_state`，供后续 turn 使用
 
 ### 场景 2：Follow-Up Patch
 
 ```json
-POST /nl2dsl
+POST /nl2sql
 {
-  "text": "换成 UV",
+  "text": "改成订单量",
   "project_id": 55,
   "session_id": "abc-123"
 }
@@ -378,22 +391,22 @@ POST /nl2dsl
 预期行为：
 
 - 识别为 `followup_patch`
-- 继承 event、region 等未显式修改字段
-- 只 patch metric 字段
+- 继承 tables、time 等未显式修改字段
+- 只 patch metrics 字段
 - 在 `field_sources` 中标记字段来源是 `explicit` 还是 `inherited`
 
 ### 场景 3：纯时间 Follow-Up
 
 ```text
-Q1: 德国 app_launch 的 PV
+Q1: 近7天各地区的销售额
 Q2: 昨天
 ```
 
 预期行为：
 
-- 保持 `event=app_launch`
-- 保持 `metric=pv`
-- 保持上一轮 region
+- 保持 `tables=[orders]`
+- 保持 `metrics=[revenue]`
+- 保持上一轮分组
 - 只修改 time range
 
 这也是为什么 `last_query_state` 必须是结构化状态，而不能只是普通聊天摘要。
@@ -401,23 +414,23 @@ Q2: 昨天
 ### 场景 4：确认流
 
 ```json
-POST /nl2dsl
+POST /nl2sql
 {
-  "text": "看启动成功",
+  "text": "商品表的销售额",
   "project_id": 55
 }
 ```
 
-如果 event 解析存在歧义，系统应返回：
+如果表解析存在歧义，系统应返回：
 
 ```json
 {
   "status": "needs_confirmation",
   "task_id": "xxx",
   "candidates": {
-    "event": [
-      { "value": "app_launch", "score": 72.0 },
-      { "value": "app_cold_start_success", "score": 69.0 }
+    "tables": [
+      { "value": "products", "score": 55.0 },
+      { "value": "orders", "score": 48.0 }
     ]
   }
 }
@@ -426,14 +439,14 @@ POST /nl2dsl
 随后用户回复：
 
 ```json
-POST /nl2dsl
+POST /nl2sql
 {
   "text": "1",
   "session_id": "abc-123"
 }
 ```
 
-系统应恢复 pending task，应用用户确认的候选值，继续生成 DSL，并清理
+系统应恢复 pending task，应用用户确认的候选值，继续生成 SQL，并清理
 `pending_task_id`。
 
 ### 场景 5：Project Memory 注入
@@ -457,17 +470,17 @@ User query:
 
 ```text
 User history:
-user_a 在 project_55 中经常选择 payment_submit。
+user_a 在 project_55 中经常使用 order_count。
 
 Current query:
-看 payment event 的 PV。
+销售额情况（低置信，候选 revenue/order_count 接近）。
 ```
 
 预期行为：
 
 - matcher recall 仍然先产生候选集
 - user preference 只在 recall 后生效
-- preference 可以轻微提升 `payment_submit`
+- preference 可以轻微提升 `order_count`
 - preference 不能覆盖更强的显式语义匹配
 
 ### 场景 7：重启恢复
@@ -506,7 +519,7 @@ Turn 2: 用户回复 "1"
 
 主要文件：
 
-- [tests/evals/nl2dsl_cases.yaml](../tests/evals/nl2dsl_cases.yaml)
+- [tests/evals/nl2sql_cases.yaml](../tests/evals/nl2sql_cases.yaml)
 - [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
 
 当前覆盖包括：
@@ -519,20 +532,21 @@ Turn 2: 用户回复 "1"
 
 这套 harness 更接近“golden cases”，而不是单纯 unit test。
 
-## Catalog 与 Metadata
+## Schema 与 Metadata
 
-仓库里的 YAML catalog 主要是 demo/development 态输入。
+仓库里的 [catalog/sql_schema.yaml](../catalog/sql_schema.yaml) 是 demo/development 态输入
+（表/列/指标别名 + 声明式 join + 指标口径表达式）。
 
 更接近生产的方向是：
 
-- metadata 从 HTTP 源获取
-- 同步到本地 catalog
-- matcher indexes 在刷新后重建
+- 表/列/指标 metadata 从公司 metadata service（或 INFORMATION_SCHEMA）定时同步
+- 同步后调用 `load_sql_schema()` 热重建 matcher 索引
+- 查询执行（只读账号、超时、成本上限）与结果渲染属于下游层，不在本 Demo 范围
 
 这一点重要，因为真实环境可能会有：
 
-- 数万级 event
-- 每个 event 多个 dimension/property
+- 数万级表和列
+- 每个列多个业务别名
 - 强项目语义和业务约束
 
 ## 演进路线
@@ -567,9 +581,9 @@ Turn 2: 用户回复 "1"
 
 比较自然的未来模型包括：
 
-- `UserPreferences`：默认 metric、region、event、time range
-- `UserAlias`：用户自定义表达与标准 event / metric / dimension 的映射
-- `UserPattern`：聚合后的 top events、metrics、regions、dimensions、query frequency
+- `UserPreferences`：默认 metric、table、过滤值、time range
+- `UserAlias`：用户自定义表达与标准 table / column / metric 的映射
+- `UserPattern`：聚合后的 top tables、metrics、columns、query frequency
 - `QueryHistory`：成功和失败 query trace，用于 replay、learning、evaluation
 
 ### 重要约束

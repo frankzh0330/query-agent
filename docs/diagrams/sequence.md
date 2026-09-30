@@ -6,15 +6,14 @@ sequenceDiagram
     participant TgAPI as Telegram Bot API
     participant TGGw as TelegramGateway
     participant Ingress as Adapter + Cleaner + Deduplicator
-    participant API as FastAPI /nl2dsl
+    participant API as FastAPI /nl2sql
     participant ORC as QueryOrchestrator
     participant Session as SessionManager
     participant Memory as LongTermMemory
     participant LLM as LLM Service
     participant Matcher as MatcherService
     participant Task as TaskManager
-    participant DSL as DSL Renderer
-    participant Bearer as BearerService
+    participant SQLGen as SQL Generator + Validator
 
     rect rgb(232, 245, 233)
     Note over User,Ingress: Phase 1 - message ingestion
@@ -27,7 +26,7 @@ sequenceDiagram
 
     rect rgb(227, 242, 253)
     Note over TGGw,Session: Phase 2 - orchestrated processing
-    TGGw->>API: POST /nl2dsl
+    TGGw->>API: POST /nl2sql
     API->>ORC: process(request)
     ORC->>Session: create_or_get(session_id, user_id, project_id)
     Session-->>ORC: SessionContext
@@ -39,34 +38,33 @@ sequenceDiagram
 
     rect rgb(255, 243, 224)
     Note over ORC,Matcher: Phase 3 - extraction and resolution
-    ORC->>LLM: extract_llm(text, context)
-    LLM-->>ORC: ExtractionsJson
+    ORC->>LLM: extract intent fragments
+    LLM-->>ORC: SQLIntentJson
     ORC->>ORC: detect follow-up mode
-    ORC->>Matcher: resolve metric/event/dimension/time
-    Matcher-->>ORC: resolved values and candidates
+    ORC->>Matcher: resolve table / column / metric / time
+    Matcher-->>ORC: resolved values, candidates, join steps
     end
 
     rect rgb(255, 235, 238)
     Note over ORC,Task: Optional confirmation
-    alt Low confidence
+    alt Low confidence or missing join
         ORC->>Task: create pending task
         Task-->>ORC: task_id
         ORC-->>API: needs_confirmation
     else Confident
-        ORC->>DSL: build semantic DSL and render exec DSL
-        DSL-->>ORC: exec_dsl
+        ORC->>SQLGen: generate SQL grounded on resolved entities
+        SQLGen->>SQLGen: sqlglot validate (readonly / whitelist / LIMIT)
+        SQLGen-->>ORC: ClickHouse SQL
     end
     end
 
     rect rgb(255, 249, 196)
-    Note over ORC,Bearer: Phase 4 - persistence and response
+    Note over ORC,TgAPI: Phase 4 - persistence and response
     ORC->>Session: persist turn state
     ORC->>ORC: record preferences and async memory learning
-    ORC-->>API: NL2DSLResponse
+    ORC-->>API: NL2SQLResponse (sql + resolved_intent + explain)
     API-->>TGGw: response
-    TGGw->>Bearer: execute_query(exec_dsl)
-    Bearer-->>TGGw: data
-    TGGw->>TgAPI: sendMessage
+    TGGw->>TgAPI: sendMessage (SQL + intent)
     TgAPI->>User: formatted result
     end
 ```

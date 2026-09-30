@@ -9,9 +9,9 @@ class TestTaskManager:
         task = task_manager.create_task(
             session_id="sess_1",
             raw_query="purchase的情况",
-            extraction={"event": "purchase"},
+            extraction={"tables": ["orders"]},
             user_id="user_1",
-            candidates={"event": [{"value": "payment_submit", "score": 0.88}]},
+            candidates={"table": [{"value": "payment_submit", "score": 0.88}]},
         )
         assert task.task_id
         assert task.status == "waiting_confirmation"
@@ -46,60 +46,60 @@ class TestTaskManager:
     def test_confirm_task_records_selection(self, task_manager):
         task = task_manager.create_task(
             "s1", "q1", {},
-            candidates={"event": [{"value": "payment_success", "score": 0.55}]},
+            candidates={"table": [{"value": "orders", "score": 0.55}]},
             partial_query_state=QueryState(project_id=55),
         )
-        result = task_manager.confirm_task(task.task_id, "event", "payment_success")
-        assert result.user_selection["event"] == "payment_success"
+        result = task_manager.confirm_task(task.task_id, "table", "orders")
+        assert result.user_selection["table"] == "orders"
 
     def test_confirm_task_patches_query_state(self, task_manager):
         from service.session_models import QueryState
         qs = QueryState(project_id=55)
         task_manager.create_task(
             "s1", "q1", {},
-            candidates={"event": [{"value": "x", "score": 0.5}]},
+            candidates={"table": [{"value": "x", "score": 0.5}]},
             partial_query_state=qs,
         )
         task_id = task_manager.list_tasks()[0].task_id
-        task_manager.confirm_task(task_id, "event", "payment_success")
-        assert qs.event == "payment_success"
+        task_manager.confirm_task(task_id, "tables", "orders")
+        assert qs.tables == ["orders"]
 
     def test_confirm_task_idempotent(self, task_manager):
         task = task_manager.create_task(
             "s1", "q1", {},
-            candidates={"event": [{"value": "x", "score": 0.5}]},
+            candidates={"table": [{"value": "x", "score": 0.5}]},
         )
-        task_manager.confirm_task(task.task_id, "event", "a")
-        task_manager.confirm_task(task.task_id, "event", "b")
-        assert task.user_selection["event"] == "b"
+        task_manager.confirm_task(task.task_id, "table", "a")
+        task_manager.confirm_task(task.task_id, "table", "b")
+        assert task.user_selection["table"] == "b"
 
     def test_confirm_task_partial_confirm(self, task_manager):
         task = task_manager.create_task(
             "s1", "q1", {},
             candidates={
-                "event": [{"value": "x", "score": 0.5}],
-                "metric": [{"value": "pv", "score": 0.6}],
+                "table": [{"value": "x", "score": 0.5}],
+                "metric": [{"value": "revenue", "score": 0.6}],
             },
         )
-        task_manager.confirm_task(task.task_id, "event", "x")
+        task_manager.confirm_task(task.task_id, "table", "x")
         assert task.status == "waiting_confirmation"
 
     def test_confirm_task_all_confirmed(self, task_manager):
         task = task_manager.create_task(
             "s1", "q1", {},
             candidates={
-                "event": [{"value": "x", "score": 0.5}],
-                "metric": [{"value": "pv", "score": 0.6}],
+                "table": [{"value": "x", "score": 0.5}],
+                "metric": [{"value": "revenue", "score": 0.6}],
             },
         )
-        task_manager.confirm_task(task.task_id, "event", "x")
-        task_manager.confirm_task(task.task_id, "metric", "pv")
+        task_manager.confirm_task(task.task_id, "table", "x")
+        task_manager.confirm_task(task.task_id, "metric", "revenue")
         assert task.status == "confirmed"
 
     def test_confirm_task_expired_returns_none(self, task_manager):
-        task = task_manager.create_task("s1", "q1", {}, candidates={"event": []})
+        task = task_manager.create_task("s1", "q1", {}, candidates={"table": []})
         task_manager._tasks[task.task_id].created_at = datetime.now() - timedelta(minutes=31)
-        result = task_manager.confirm_task(task.task_id, "event", "x")
+        result = task_manager.confirm_task(task.task_id, "table", "x")
         assert result is None
 
     def test_update_status_valid_transition(self, task_manager):
@@ -148,14 +148,14 @@ class TestTaskManager:
         assert task_manager.update_status("nonexistent", "confirmed") is None
 
     def test_create_task_persists_to_storage(self, task_manager):
-        task = task_manager.create_task("s1", "q1", {}, candidates={"event": [{"value": "x", "score": 0.5}]})
+        task = task_manager.create_task("s1", "q1", {}, candidates={"table": [{"value": "x", "score": 0.5}]})
         latest = task_manager.storage.read_latest(task.task_id)
         assert latest is not None
         assert latest["status"] == "waiting_confirmation"
         assert latest["session_id"] == "s1"
 
     def test_get_task_restores_from_storage(self, task_manager):
-        task = task_manager.create_task("s1", "q1", {}, candidates={"event": [{"value": "x", "score": 0.5}]})
+        task = task_manager.create_task("s1", "q1", {}, candidates={"table": [{"value": "x", "score": 0.5}]})
         task_manager._tasks.clear()
         restored = task_manager.get_task(task.task_id)
         assert restored is not None
@@ -165,11 +165,11 @@ class TestTaskManager:
     def test_confirm_task_persists_updated_state(self, task_manager):
         task = task_manager.create_task(
             "s1", "q1", {},
-            candidates={"event": [{"value": "payment_success", "score": 0.55}]},
+            candidates={"table": [{"value": "orders", "score": 0.55}]},
         )
-        task_manager.confirm_task(task.task_id, "event", "payment_success")
+        task_manager.confirm_task(task.task_id, "table", "orders")
         latest = task_manager.storage.read_latest(task.task_id)
-        assert latest["user_selection"]["event"] == "payment_success"
+        assert latest["user_selection"]["table"] == "orders"
         assert latest["status"] == "confirmed"
 
 

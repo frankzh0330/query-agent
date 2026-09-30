@@ -169,14 +169,14 @@ class LongTermMemory:
                     raw_tokens.append(chunk[idx : idx + 2])
 
         if last_query_state:
-            for key in ("event", "metric"):
-                value = last_query_state.get(key)
-                if isinstance(value, str) and value:
-                    raw_tokens.append(value.lower())
-            for key in ("group_by", "region_filter"):
-                values = last_query_state.get(key)
-                if isinstance(values, list):
-                    raw_tokens.extend(str(value).lower() for value in values if value)
+            for key in ("tables", "metrics"):
+                values_state = last_query_state.get(key)
+                if isinstance(values_state, list):
+                    raw_tokens.extend(str(value).lower() for value in values_state if value)
+            for key in ("group_by", "detail_columns"):
+                values_state = last_query_state.get(key)
+                if isinstance(values_state, list):
+                    raw_tokens.extend(str(value).lower() for value in values_state if value)
 
         seen = set()
         keywords = []

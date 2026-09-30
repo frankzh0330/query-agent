@@ -8,32 +8,42 @@ from typing import Any, Dict, Optional
 
 @dataclass
 class QueryState:
-    """最近一次查询的完整语义状态（替代旧的 resolved_entities）
+    """最近一次 SQL 查询的完整意图状态
 
-    覆盖查询的所有维度：event, metric, time, region, group_by, filters, chart_type。
-    每次成功执行查询后更新，作为下一轮对话的默认补全来源。
+    覆盖 SQL 生成所需的全部维度：tables / metrics / columns / filters /
+    time_range / group_by / order_by / limit / window。
+    每次成功生成 SQL 后更新，作为下一轮 follow-up 的默认补全来源。
 
     优先级：explicit user input > session state (last_query_state) > preference memory
+
+    字段格式约定：
+      tables   = ["orders"]
+      metrics  = ["revenue", "order_count"]           # schema metrics id
+      columns  = ["users.region"]                     # 涉及的限定列 "table.column"
+      detail_columns = ["orders.order_id"]            # 明细展示列
+      filters  = [{"column": "users.vip_level", "op": "=", "value": "vip"}]
+      time_range = {"type": "last_n_days", "n": 7}    # type: last_n_days|yesterday|today|this_week|last_week|this_month|last_month
+      order_by = {"metric": "revenue", "metric_expr": "sum(orders.amount)", "direction": "DESC", "limit": 5}
+      window   = {"group_by": "users.region", "limit": 3}
     """
 
     project_id: int = 55
 
     # 主体
-    event: Optional[str] = None
-    metric: Optional[str] = None
+    tables: list[str] = field(default_factory=list)
+    metrics: list[str] = field(default_factory=list)
+    columns: list[str] = field(default_factory=list)
+    detail_columns: list[str] = field(default_factory=list)
 
-    # 时间
-    time_range: Optional[Dict[str, Any]] = None  # {"type": "last_n_days", "n": 7}
-
-    # 维度 / 过滤
-    region_filter: list[str] = field(default_factory=list)
-    group_by: list[str] = field(default_factory=list)
+    # 过滤 / 时间 / 分组
     filters: list[Dict[str, Any]] = field(default_factory=list)
-    # filters 格式: [{"field": "platform", "op": "=", "value": "ios"}, ...]
+    time_range: Optional[Dict[str, Any]] = None
+    group_by: list[str] = field(default_factory=list)
 
-    # 展示 / 交互
-    chart_type: Optional[str] = None
-    interaction_mode: Optional[str] = None
+    # 排序 / TopN / 窗口
+    order_by: Optional[Dict[str, Any]] = None
+    limit: Optional[int] = None
+    window: Optional[Dict[str, Any]] = None
 
     # 调试
     confidence: Optional[float] = None
@@ -45,14 +55,16 @@ class QueryState:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "project_id": self.project_id,
-            "event": self.event,
-            "metric": self.metric,
-            "time_range": self.time_range,
-            "region_filter": self.region_filter,
-            "group_by": self.group_by,
+            "tables": self.tables,
+            "metrics": self.metrics,
+            "columns": self.columns,
+            "detail_columns": self.detail_columns,
             "filters": self.filters,
-            "chart_type": self.chart_type,
-            "interaction_mode": self.interaction_mode,
+            "time_range": self.time_range,
+            "group_by": self.group_by,
+            "order_by": self.order_by,
+            "limit": self.limit,
+            "window": self.window,
             "confidence": self.confidence,
             "explicit_fields": self.explicit_fields,
             "inherited_fields": self.inherited_fields,
@@ -65,7 +77,7 @@ class QueryState:
 class TaskContext:
     """单次查询任务的上下文
 
-    当用户需要确认（如多个候选 event）时，创建 TaskContext 追踪状态。
+    当用户需要确认（如表/指标/列多个候选）时，创建 TaskContext 追踪状态。
     与 Session 解耦：通过 task_id 索引，不挂在 session 上。
     TTL 30 分钟，过期自动失效。
     """
@@ -81,10 +93,10 @@ class TaskContext:
     # 正在构建中的 QueryState（尚未确认/执行）
     partial_query_state: Optional[QueryState] = None
 
-    # 候选项: {"event": [{"value": "payment_submit", "score": 0.88}, ...]}
+    # 候选项: {"table": [{"value": "orders", "score": 0.88}, ...]}
     candidates: Dict[str, list[Dict[str, Any]]] = field(default_factory=dict)
 
-    # 用户已确认的选择: {"event": "payment_success"}
+    # 用户已确认的选择: {"table": "orders"}
     user_selection: Dict[str, str] = field(default_factory=dict)
 
     # 状态：waiting_confirmation | confirmed | completed | cancelled | expired
@@ -145,7 +157,7 @@ class SessionContext:
     project_id: int = 55
     messages: list[Message] = field(default_factory=list)
 
-    # 最近一次"已确认 / 已执行成功"的查询状态
+    # 最近一次"已确认 / 已成功生成 SQL"的查询状态
     last_query_state: Optional[QueryState] = None
 
     # 最近一次结果摘要（可选）

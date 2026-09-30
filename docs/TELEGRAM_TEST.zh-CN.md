@@ -10,16 +10,10 @@
 # 必需：Telegram Bot Token
 export TELEGRAM_BOT_TOKEN="your_bot_token_here"
 
-# 启用 Mock 模式（不需要 Bearer API）
-export BEARER_MOCK="true"
-
 # LLM 配置
 export LLM_BACKEND="zhipu"  # 或 "ollama"
 export ZHIPU_API_KEY="your_zhipu_key"  # 如果用 zhipu
 export OLLAMA_BASE_URL="http://localhost:11434"  # 如果用 ollama
-
-# 可选：API 服务地址
-export API_BASE_URL="http://localhost:8000"
 ```
 
 ### 2. 启动服务
@@ -31,61 +25,74 @@ python server.py
 ## 测试流程
 
 1. **向 Telegram Bot 发送消息**，例如：
-   - `德国的PV`
-   - `法国的UV`
-   - `加州近7天 app_launch`
+   - `近7天各地区的销售额`
+   - `改成只看VIP用户`
+   - `每个地区前3`
 
-2. **Bot 会返回**：
+2. **Bot 会返回生成的 SQL 与解析意图**：
+
    ```
-   📊 查询结果
-   地区: `EUTTP`
-   指标: `pv`
-   事件: `app_launch`
-   时间: 近 `7` 天
+   📄 已生成 ClickHouse SQL
+   表: orders
+   指标: revenue
+   分组: users.region
+   时间: last_n_days n=7
 
-   📈 数据结果
-   2024-03-24: pv=12345, region=EUTTP
-   2024-03-23: pv=11234, region=EUTTP
-   2024-03-22: pv=10234, region=EUTTP
-   ...(还有 2 条记录)
+   SELECT users.region AS region, sum(orders.amount) AS revenue
+   FROM orders JOIN users ON orders.user_id = users.id
+   WHERE orders.created_at >= now() - INTERVAL 7 DAY
+   GROUP BY users.region ORDER BY revenue DESC LIMIT 100
    ```
 
-## Mock 数据说明
+   说明：查询执行与结果渲染刻意不在本 Demo 范围内——Bot 只返回校验后的 SQL
+   （见 README 的 Production Notes）。
 
-Mock 模式下会生成以下假数据：
-- 自动从 exec_dsl 提取 region/metric/event
-- 返回 3 条示例数据（近3天）
-- 每条数据包含日期和指标值
+3. **表名或指标有歧义时，Bot 会发起确认**：
+
+   ```
+   请选择表:
+     1. products (匹配度 55%)
+     2. orders (匹配度 48%)
+   回复编号或名称即可
+   ```
+
+   回复 `1`（或名称）即可继续；待确认任务支持重启后恢复。
 
 ## 调试
 
-### 查看 API 文档
-```
+### API 文档
+
+```text
 http://localhost:8000/docs
 ```
 
-### 查看所有会话
+### 查看会话列表
+
 ```bash
 curl http://localhost:8000/sessions
 ```
 
-### 直接测试 nl2dsl API
+### 直接测试 NL2SQL API
+
 ```bash
-curl -X POST http://localhost:8000/nl2dsl \
+curl -X POST http://localhost:8000/nl2sql \
   -H "Content-Type: application/json" \
-  -d '{"text": "德国的PV", "project_id": 55}'
+  -d '{"text": "近7天各地区的销售额", "project_id": 55}'
 ```
 
 ## 常见问题
 
-1. **Telegram Bot 无响应**
-   - 检查 `TELEGRAM_BOT_TOKEN` 是否正确
-   - 检查日志是否有错误
+1. Telegram Bot 无响应。
 
-2. **LLM 调用失败**
-   - 检查 `LLM_BACKEND` 配置
-   - 如果用 zhipu，检查 `ZHIPU_API_KEY`
+- 检查 `TELEGRAM_BOT_TOKEN` 是否正确。
+- 检查服务日志中的错误信息。
 
-3. **内存文件目录**
-   - 用户记忆会保存在 `~/query-agent/memory/users/` 下
-   - 可以查看学习到的用户偏好
+2. LLM 调用失败。
+
+- 检查 `LLM_BACKEND`。
+- 如果用 zhipu，检查 `ZHIPU_API_KEY`。
+
+3. 记忆文件不可见。
+
+- 运行时数据存储在配置的 `data/` 目录下。
+- 检查 `data/memory/`、`data/sessions/`、`data/user_preferences/`。

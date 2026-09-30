@@ -24,6 +24,5 @@ class BusResult(BaseModel):
 
     msg: BusMessage
     success: bool
-    nl2dsl_result: Optional[Dict[str, Any]] = None
-    query_result: Optional[Dict[str, Any]] = None
+    nl2sql_result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None

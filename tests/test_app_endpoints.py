@@ -1,12 +1,92 @@
-"""app.py HTTP 端点测试（替代 test_nl2dsl_api.py）"""
+"""app.py HTTP 端点测试（NL2SQL 版）"""
 from unittest import mock
 
 import pytest
 from fastapi.testclient import TestClient
 
-from matcher.matcher_service import ResolvedResult
-from service.llm_extractions import Extraction, ExtractionsJson
+from matcher.base import MatchResult
+from matcher.matcher_service import MatcherService
+from service.llm_extractions import Extraction, SQLIntentJson
 from service.session_models import QueryState
+
+
+# ==================== Fake 底层 matcher ====================
+
+def _mr(matched, score, candidates=None):
+    """构造 MatchResult，可选 top5 候选"""
+    explain = {}
+    if candidates:
+        explain["rerank_explain"] = {"top5": [{"name": v, "score": s} for v, s in candidates]}
+    return MatchResult(matched=matched, score=score, explain=explain)
+
+
+class FakeMatcher:
+    """text → MatchResult 的假匹配器"""
+
+    def __init__(self, results=None, fallback=None):
+        self.results = results or {}
+        self.fallback = fallback
+
+    def match(self, text):
+        if text in self.results:
+            return self.results[text]
+        if self.fallback is not None:
+            return self.fallback
+        return MatchResult(matched=None, score=0.0, explain={})
+
+
+COLUMN_MAP = {
+    "地区": ("users.region", 100.0),
+    "区域": ("users.region", 100.0),
+    "品类": ("products.category", 100.0),
+    "渠道": ("orders.channel", 100.0),
+    "金额": ("orders.amount", 100.0),
+    "会员等级": ("users.vip_level", 100.0),
+    "状态": ("orders.status", 100.0),
+}
+
+
+def _fake_column_matcher(overrides=None):
+    results = {}
+    for text, (value, score) in COLUMN_MAP.items():
+        results[text] = _mr(value, score)
+    if overrides:
+        results.update(overrides)
+    return FakeMatcher(results)
+
+
+def _make_service(table_matcher=None, metric_matcher=None, column_matcher=None) -> MatcherService:
+    """真实 MatcherService（阈值/推断/join 跑真代码）+ 假文本匹配层"""
+    svc = MatcherService(catalog_path="catalog")
+    if table_matcher is not None:
+        svc.table_matcher = table_matcher
+    if metric_matcher is not None:
+        svc.metric_matcher = metric_matcher
+    if column_matcher is not None:
+        svc.column_matcher = column_matcher
+    return svc
+
+
+def _high_confidence_service() -> MatcherService:
+    return _make_service(
+        table_matcher=FakeMatcher({"订单表": _mr("orders", 100.0), "订单": _mr("orders", 100.0)}),
+        metric_matcher=FakeMatcher({
+            "销售额": _mr("revenue", 100.0),
+            "订单量": _mr("order_count", 100.0),
+            "客单价": _mr("avg_order_amount", 100.0),
+        }),
+        column_matcher=_fake_column_matcher(),
+    )
+
+
+def _low_confidence_table_service() -> MatcherService:
+    return _make_service(
+        table_matcher=FakeMatcher({
+            "商品表": _mr(None, 55.0, candidates=[("products", 55.0), ("orders", 48.0)]),
+        }),
+        metric_matcher=FakeMatcher({"销售额": _mr("revenue", 100.0)}),
+        column_matcher=_fake_column_matcher(),
+    )
 
 
 # ==================== Fixtures ====================
@@ -20,7 +100,6 @@ def client(tmp_path):
     from service.session_manager import SessionManager
     from service.task_manager import TaskManager
 
-    # 替换全局实例为隔离版本
     app_module.session_manager = SessionManager(data_path=str(tmp_path / "data"))
     app_module.task_manager = TaskManager(
         storage=TaskStorage(data_path=str(tmp_path / "data" / "tasks"))
@@ -28,86 +107,29 @@ def client(tmp_path):
     app_module.user_preference_store = UserPreferenceStore(
         data_path=str(tmp_path / "data" / "user_preferences")
     )
-
-    # 同步更新 orchestrator 的引用
     app_module.orchestrator.session = app_module.session_manager
     app_module.orchestrator.task = app_module.task_manager
     app_module.orchestrator.preferences = app_module.user_preference_store
 
-    # 初始化 matcher_service（用 mock 避免加载真实 catalog）
-    mock_service = mock.MagicMock()
-    mock_service.catalog = mock.MagicMock()
-    app_module._matcher_service = mock_service
+    app_module._matcher_service = _high_confidence_service()
 
     with TestClient(app_module.app) as c:
         yield c
 
-    # 清理
     app_module._matcher_service = None
 
 
-def _mock_high_confidence_resolver():
-    """高置信度 resolver（不需要确认）"""
-    svc = mock.MagicMock()
-    svc.resolve_with_candidates.side_effect = lambda mtype, extractions, default: ResolvedResult(
-        value="app_launch" if mtype.value == "event" else ("pv" if mtype.value == "metric" else "country"),
-        score=95.0,
-        method="exact",
-        candidates=[],
-        needs_confirmation=False,
+def _mock_generate_sql(sql="SELECT users.region, sum(orders.amount) AS revenue FROM orders"):
+    return mock.patch(
+        "service.query_orchestrator.generate_sql",
+        new_callable=mock.AsyncMock,
+        return_value=(sql, {"rounds": [{"round": 1, "ok": True, "errors": []}]}),
     )
-    svc.resolve_time.return_value = (7, {"method": "default", "n": 7})
-    return svc
-
-
-def _mock_low_confidence_resolver():
-    """低置信度 resolver（需要确认）"""
-    svc = mock.MagicMock()
-    call_count = {"n": 0}
-
-    def _resolve(mtype, extractions, default):
-        call_count["n"] += 1
-        if mtype.value == "event":
-            return ResolvedResult(
-                value="purchase_success",
-                score=55.0,
-                method="fuzzy_low_confidence",
-                candidates=[
-                    {"value": "purchase_success", "score": 55.0},
-                    {"value": "payment_submit", "score": 48.0},
-                ],
-                needs_confirmation=True,
-            )
-        return ResolvedResult(
-            value="pv" if mtype.value == "metric" else "country",
-            score=95.0,
-            method="exact",
-            candidates=[],
-            needs_confirmation=False,
-        )
-
-    svc.resolve_with_candidates.side_effect = _resolve
-    svc.resolve_time.return_value = (7, {"method": "default", "n": 7})
-    return svc
-
-
-def _mock_low_score_resolver():
-    """极低分 resolver（fallback 到 default）"""
-    svc = mock.MagicMock()
-    svc.resolve_with_candidates.side_effect = lambda mtype, extractions, default: ResolvedResult(
-        value=default,
-        score=20.0,
-        method="score_too_low",
-        candidates=[],
-        needs_confirmation=False,
-    )
-    svc.resolve_time.return_value = (7, {"method": "default", "n": 7})
-    return svc
 
 
 # ==================== Tests: Happy Path ====================
 
-class TestNL2DSLHappyPath:
+class TestNL2SQLHappyPath:
     @staticmethod
     def _seed_previous_state():
         import app as app_module
@@ -115,302 +137,261 @@ class TestNL2DSLHappyPath:
         ctx = app_module.session_manager.create_or_get(None, "user_1", 55)
         prev_qs = QueryState(
             project_id=55,
-            event="app_launch",
-            metric="pv",
+            tables=["orders"],
+            metrics=["revenue"],
             time_range={"type": "last_n_days", "n": 7},
-            region_filter=["ROW"],
-            group_by=["country"],
+            group_by=["users.region"],
             filters=[],
             turn_type="new_query",
         )
         app_module.session_manager.update_query_state(ctx.session_id, prev_qs)
         return ctx, prev_qs
 
-    def test_nl2dsl_success(self, client):
-        extraction = ExtractionsJson(
-            metric_extractions=[Extraction(text="PV")],
-            event_extractions=[Extraction(text="app_launch")],
-            region_filter=["ROW"],
-            group_by_extractions=[Extraction(text="country")],
+    def test_nl2sql_success_with_join_inference(self, client):
+        """表+指标+分组（地区列在 users 表）→ 自动 join 推断"""
+        intent = SQLIntentJson(
+            table_extractions=[Extraction(text="订单表")],
+            metric_extractions=[Extraction(text="销售额")],
+            group_by_extractions=[Extraction(text="地区")],
+            time_extractions=[Extraction(text="近7天")],
         )
-        mock_service = _mock_high_confidence_resolver()
 
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
-                        resp = client.post("/nl2dsl", json={
-                            "text": "查询近7天 app_launch 的PV",
-                            "project_id": 55,
-                        })
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql() as gen_mock:
+                resp = client.post("/nl2sql", json={
+                    "text": "近7天各地区订单表的销售额",
+                    "project_id": 55,
+                })
 
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "success"
-        assert "semantic" in body
-        assert "exec_dsl" in body
+        assert body["sql"].startswith("SELECT")
         assert body["session_id"]
 
-    def test_nl2dsl_returns_session_id(self, client):
-        extraction = ExtractionsJson(
-            event_extractions=[Extraction(text="app_launch")],
-            region_filter=["ROW"],
-        )
-        mock_service = _mock_high_confidence_resolver()
+        # resolved_intent：主表/指标/分组/时间
+        intent_out = body["resolved_intent"]
+        assert intent_out["tables"] == ["orders"]
+        assert intent_out["metrics"] == ["revenue"]
+        assert intent_out["group_by"] == ["users.region"]
+        assert intent_out["time_range"] == {"type": "last_n_days", "n": 7}
 
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
-                        resp = client.post("/nl2dsl", json={"text": "test", "project_id": 55})
+        # join 推断进 explain
+        resolver_explain = body["explain"]["resolver_explain"]
+        assert resolver_explain["sql_generation"]["join_explain"]["steps"], "region 在 users 表上，应推断出 join"
+        assert resolver_explain["table"]["method"] == "exact"
+
+        # SQL 生成收到的 intent 包含 join 步骤
+        gen_intent = gen_mock.call_args.args[1]
+        assert gen_intent["base_table"] == "orders"
+        assert any(j["right"] == "users" for j in gen_intent["joins"])
+        assert gen_intent["time_expr"].startswith("orders.created_at")
+
+    def test_nl2sql_metric_only_infers_table(self, client):
+        """不提表名 → 从指标表达式推断主表"""
+        intent = SQLIntentJson(
+            metric_extractions=[Extraction(text="客单价")],
+            time_extractions=[Extraction(text="近7天")],
+        )
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql():
+                resp = client.post("/nl2sql", json={"text": "近7天客单价是多少", "project_id": 55})
+
+        body = resp.json()
+        assert body["status"] == "success"
+        assert body["resolved_intent"]["tables"] == ["orders"]
+        assert body["explain"]["resolver_explain"]["table_inference"]["method"] == "inferred_from_metric"
+
+    def test_nl2sql_returns_session_id(self, client):
+        intent = SQLIntentJson(metric_extractions=[Extraction(text="销售额")])
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql():
+                resp = client.post("/nl2sql", json={"text": "销售额", "project_id": 55})
 
         assert resp.json()["session_id"] is not None
 
-    def test_nl2dsl_uses_existing_session(self, client):
+    def test_nl2sql_uses_existing_session(self, client):
         import app as app_module
         ctx = app_module.session_manager.create_or_get(None, "user_1", 55)
         sid = ctx.session_id
 
-        extraction = ExtractionsJson(
-            event_extractions=[Extraction(text="app_launch")],
-            region_filter=["ROW"],
-        )
-        mock_service = _mock_high_confidence_resolver()
+        intent = SQLIntentJson(metric_extractions=[Extraction(text="销售额")])
 
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
-                        resp = client.post("/nl2dsl", json={
-                            "text": "test",
-                            "project_id": 55,
-                            "session_id": sid,
-                        })
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql():
+                resp = client.post("/nl2sql", json={
+                    "text": "销售额",
+                    "project_id": 55,
+                    "session_id": sid,
+                })
 
         assert resp.json()["session_id"] == sid
 
-    def test_nl2dsl_followup_inherits_previous_state(self, client):
+    def test_nl2sql_followup_inherits_previous_state(self, client):
         ctx, _ = self._seed_previous_state()
 
-        extraction = ExtractionsJson(
+        intent = SQLIntentJson(
             time_extractions=[Extraction(text="昨天")],
-            event_extractions=[],
-            region_filter=["ROW"],
         )
-        mock_service = mock.MagicMock()
-        mock_service.resolve_time.return_value = (1, {"method": "matched", "n": 1})
-
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
-                        resp = client.post("/nl2dsl", json={
-                            "text": "昨天",
-                            "project_id": 55,
-                            "session_id": ctx.session_id,
-                        })
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql():
+                resp = client.post("/nl2sql", json={
+                    "text": "昨天",
+                    "project_id": 55,
+                    "session_id": ctx.session_id,
+                })
 
         body = resp.json()
         assert body["status"] == "success"
-        assert body["semantic"]["event"]["event_name"] == "app_launch"
-        assert body["semantic"]["metric"]["metric_id"] == "pv"
-        assert body["semantic"]["time_range"]["n"] == 1
+        intent_out = body["resolved_intent"]
+        assert intent_out["tables"] == ["orders"]
+        assert intent_out["metrics"] == ["revenue"]
+        assert intent_out["time_range"]["n"] == 1
         assert body["explain"]["turn_explain"]["mode"] == "followup_patch"
         assert body["explain"]["turn_explain"]["decision"]["reason"] == "time_only_term"
         assert body["explain"]["turn_explain"]["applied_patch_fields"] == ["time_range"]
 
-    def test_nl2dsl_followup_changes_metric_only(self, client):
+    def test_nl2sql_followup_changes_metric_only(self, client):
         ctx, _ = self._seed_previous_state()
 
-        extraction = ExtractionsJson(
-            metric_extractions=[Extraction(text="UV")],
-            event_extractions=[],
-            region_filter=["ROW"],
-        )
-        mock_service = mock.MagicMock()
+        intent = SQLIntentJson(metric_extractions=[Extraction(text="订单量")])
 
-        def _resolve(mtype, extractions, default):
-            if mtype.value == "metric":
-                return ResolvedResult(
-                    value="uv",
-                    score=96.0,
-                    method="exact",
-                    candidates=[],
-                    needs_confirmation=False,
-                )
-            raise AssertionError(f"unexpected matcher type: {mtype}")
-
-        mock_service.resolve_with_candidates.side_effect = _resolve
-
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
-                        resp = client.post("/nl2dsl", json={
-                            "text": "改成UV",
-                            "project_id": 55,
-                            "session_id": ctx.session_id,
-                        })
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql():
+                resp = client.post("/nl2sql", json={
+                    "text": "改成订单量",
+                    "project_id": 55,
+                    "session_id": ctx.session_id,
+                })
 
         body = resp.json()
         assert body["status"] == "success"
-        assert body["semantic"]["metric"]["metric_id"] == "uv"
-        assert body["semantic"]["event"]["event_name"] == "app_launch"
-        assert body["explain"]["turn_explain"]["explicit_fields"] == ["metric"]
-        assert body["explain"]["turn_explain"]["decision"]["matched_signals"]
-        assert body["explain"]["turn_explain"]["state_snapshot"]["metric"] == "uv"
+        intent_out = body["resolved_intent"]
+        assert intent_out["metrics"] == ["order_count"]
+        assert intent_out["tables"] == ["orders"]
+        assert body["explain"]["turn_explain"]["explicit_fields"] == ["metrics"]
+        assert body["explain"]["turn_explain"]["state_snapshot"]["metrics"] == ["order_count"]
 
-    def test_nl2dsl_followup_changes_region_only(self, client):
+    def test_nl2sql_followup_adds_window_rank(self, client):
+        """「每个地区前3」→ window patch（分组排名）"""
         ctx, _ = self._seed_previous_state()
 
-        extraction = ExtractionsJson(
-            event_extractions=[],
-            region_filter=["USTTP"],
-        )
-        mock_service = mock.MagicMock()
+        intent = SQLIntentJson(window_extractions=[Extraction(text="每个地区前3")])
 
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
-                        resp = client.post("/nl2dsl", json={
-                            "text": "那美国呢",
-                            "project_id": 55,
-                            "session_id": ctx.session_id,
-                        })
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql() as gen_mock:
+                resp = client.post("/nl2sql", json={
+                    "text": "每个地区前3",
+                    "project_id": 55,
+                    "session_id": ctx.session_id,
+                })
 
         body = resp.json()
         assert body["status"] == "success"
-        assert body["semantic"]["region_filter"] == ["USTTP"]
-        assert body["semantic"]["metric"]["metric_id"] == "pv"
-        assert body["semantic"]["event"]["event_name"] == "app_launch"
-        assert body["explain"]["turn_explain"]["explicit_fields"] == ["region_filter"]
-        assert "region_token" in body["explain"]["turn_explain"]["decision"]["matched_signals"]
+        intent_out = body["resolved_intent"]
+        assert intent_out["window"] == {"group_by": "users.region", "limit": 3}
+        assert body["explain"]["turn_explain"]["mode"] == "followup_patch"
 
-    def test_nl2dsl_followup_changes_group_by_only(self, client):
-        ctx, _ = self._seed_previous_state()
+        gen_intent = gen_mock.call_args.args[1]
+        assert gen_intent["window"] == {"group_by": "users.region", "limit": 3}
 
-        extraction = ExtractionsJson(
-            event_extractions=[],
-            region_filter=["ROW"],
-            group_by_extractions=[Extraction(text="渠道")],
+    def test_nl2sql_window_rank_new_query(self, client):
+        """新查询直接带分组排名意图"""
+        intent = SQLIntentJson(
+            metric_extractions=[Extraction(text="销售额")],
+            window_extractions=[Extraction(text="每个地区前3")],
         )
-        mock_service = mock.MagicMock()
 
-        def _resolve(mtype, extractions, default):
-            if mtype.value == "dimension":
-                return ResolvedResult(
-                    value="channel",
-                    score=94.0,
-                    method="exact",
-                    candidates=[],
-                    needs_confirmation=False,
-                )
-            raise AssertionError(f"unexpected matcher type: {mtype}")
-
-        mock_service.resolve_with_candidates.side_effect = _resolve
-
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
-                        resp = client.post("/nl2dsl", json={
-                            "text": "再按渠道拆一下",
-                            "project_id": 55,
-                            "session_id": ctx.session_id,
-                        })
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql() as gen_mock:
+                resp = client.post("/nl2sql", json={"text": "每个地区销售额前3", "project_id": 55})
 
         body = resp.json()
         assert body["status"] == "success"
-        assert body["semantic"]["group_by"] == [{"dimension_id": "channel"}]
-        assert body["semantic"]["metric"]["metric_id"] == "pv"
-        assert body["semantic"]["event"]["event_name"] == "app_launch"
-        assert body["explain"]["turn_explain"]["explicit_fields"] == ["group_by"]
-        assert body["explain"]["turn_explain"]["applied_patch"]["group_by"] == ["channel"]
+        assert body["resolved_intent"]["window"] == {"group_by": "users.region", "limit": 3}
 
-    def test_nl2dsl_applies_user_preference_rerank_after_recall(self, client):
+        gen_intent = gen_mock.call_args.args[1]
+        assert gen_intent["window"]["limit"] == 3
+
+    def test_nl2sql_global_topn(self, client):
+        """「销售额最高的前5」→ order_by TopN"""
+        intent = SQLIntentJson(
+            metric_extractions=[Extraction(text="销售额")],
+            order_extractions=[Extraction(text="销售额最高的前5")],
+        )
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql() as gen_mock:
+                resp = client.post("/nl2sql", json={"text": "销售额最高的前5", "project_id": 55})
+
+        body = resp.json()
+        assert body["status"] == "success"
+        intent_out = body["resolved_intent"]
+        assert intent_out["order_by"]["metric"] == "revenue"
+        assert intent_out["order_by"]["direction"] == "DESC"
+        assert intent_out["order_by"]["limit"] == 5
+
+        gen_intent = gen_mock.call_args.args[1]
+        assert gen_intent["order_by"]["metric_expr"] == "sum(orders.amount)"
+
+    def test_nl2sql_applies_user_preference_rerank_after_recall(self, client):
         import app as app_module
 
         for _ in range(6):
             app_module.user_preference_store.record_selection(
-                55, "user_pref", event="payment_submit"
+                55, "user_pref", metric="order_count"
             )
 
-        extraction = ExtractionsJson(
-            event_extractions=[Extraction(text="支付")],
-            region_filter=["ROW"],
+        intent = SQLIntentJson(metric_extractions=[Extraction(text="销售额")])
+        # 低置信指标：revenue 55 分，order_count 54 分
+        svc = _make_service(
+            metric_matcher=FakeMatcher({
+                "销售额": _mr(None, 55.0, candidates=[("revenue", 55.0), ("order_count", 54.0)]),
+            }),
         )
-        mock_service = mock.MagicMock()
 
-        def _resolve(mtype, extractions, default):
-            if mtype.value == "event":
-                return ResolvedResult(
-                    value="purchase_success",
-                    score=55.0,
-                    method="fuzzy_low_confidence",
-                    candidates=[
-                        {"value": "purchase_success", "score": 55.0},
-                        {"value": "payment_submit", "score": 54.0},
-                    ],
-                    needs_confirmation=True,
-                )
-            return ResolvedResult(
-                value="pv" if mtype.value == "metric" else "country",
-                score=95.0,
-                method="exact",
-                candidates=[],
-                needs_confirmation=False,
-            )
-
-        mock_service.resolve_with_candidates.side_effect = _resolve
-        mock_service.resolve_time.return_value = (7, {"method": "default", "n": 7})
-
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                resp = client.post("/nl2dsl", json={
-                    "text": "支付情况",
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with mock.patch("app.get_matcher_service", return_value=svc):
+                resp = client.post("/nl2sql", json={
+                    "text": "销售额情况",
                     "project_id": 55,
                     "user_id": "user_pref",
                 })
 
         body = resp.json()
         assert body["status"] == "needs_confirmation"
-        assert body["candidates"]["event"][0]["value"] == "payment_submit"
-        assert body["explain"]["resolver_explain"]["event"]["user_preference_bias"]["applied"] is True
+        # 偏好 rerank：order_count（6 次使用）加权后排到第一
+        assert body["candidates"]["metrics"][0]["value"] == "order_count"
+        assert body["explain"]["resolver_explain"]["metric"]["user_preference_bias"]["applied"] is True
 
 
 # ==================== Tests: Early Exit ====================
 
-class TestNL2DSLEarlyExit:
+class TestNL2SQLEarlyExit:
 
-    def test_nl2dsl_early_exit_no_event(self, client):
-        extraction = ExtractionsJson(
-            metric_extractions=[Extraction(text="PV")],
-            event_extractions=[],
-            region_filter=["ROW"],
-        )
+    def test_nl2sql_early_exit_no_signal(self, client):
+        intent = SQLIntentJson()
 
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            resp = client.post("/nl2dsl", json={
-                "text": "PV数据",
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            resp = client.post("/nl2sql", json={
+                "text": "你好",
                 "project_id": 55,
             })
 
         body = resp.json()
         assert body["status"] == "early_exit"
         assert body["message"]
-        assert "event" in body["message"]
+        assert "表" in body["message"] or "指标" in body["message"]
 
-    def test_nl2dsl_early_exit_records_message(self, client):
+    def test_nl2sql_early_exit_records_message(self, client):
         import app as app_module
 
-        extraction = ExtractionsJson(
-            event_extractions=[],
-            region_filter=["ROW"],
-        )
+        intent = SQLIntentJson()
 
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            resp = client.post("/nl2dsl", json={
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            resp = client.post("/nl2sql", json={
                 "text": "some query",
                 "project_id": 55,
             })
@@ -423,36 +404,35 @@ class TestNL2DSLEarlyExit:
 
 # ==================== Tests: Confirmation Flow ====================
 
-class TestNL2DSLConfirmation:
+class TestNL2SQLConfirmation:
     @staticmethod
     def _seed_previous_state():
         import app as app_module
 
         ctx = app_module.session_manager.create_or_get(None, "user_1", 55)
+        # group_by 用 orders.channel：确认切换主表后（如 products）仍可 join，避免无关的 join 确认
         prev_qs = QueryState(
             project_id=55,
-            event="app_launch",
-            metric="pv",
+            tables=["orders"],
+            metrics=["revenue"],
             time_range={"type": "last_n_days", "n": 7},
-            region_filter=["ROW"],
-            group_by=["country"],
+            group_by=["orders.channel"],
             filters=[],
             turn_type="new_query",
         )
         app_module.session_manager.update_query_state(ctx.session_id, prev_qs)
         return ctx, prev_qs
 
-    def test_nl2dsl_needs_confirmation(self, client):
-        extraction = ExtractionsJson(
-            event_extractions=[Extraction(text="purchase")],
-            region_filter=["ROW"],
-        )
-        mock_service = _mock_low_confidence_resolver()
+    def test_nl2sql_needs_confirmation(self, client):
+        import app as app_module
 
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                resp = client.post("/nl2dsl", json={
-                    "text": "purchase的情况",
+        intent = SQLIntentJson(table_extractions=[Extraction(text="商品表")], metric_extractions=[Extraction(text="销售额")])
+        svc = _low_confidence_table_service()
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with mock.patch("app.get_matcher_service", return_value=svc):
+                resp = client.post("/nl2sql", json={
+                    "text": "商品表的销售额",
                     "project_id": 55,
                 })
 
@@ -460,59 +440,53 @@ class TestNL2DSLConfirmation:
         assert body["status"] == "needs_confirmation"
         assert body["task_id"] is not None
         assert body["candidates"] is not None
-        assert "event" in body["candidates"]
+        assert "tables" in body["candidates"]
 
-    def test_nl2dsl_confirmation_then_reply(self, client):
-        import app as app_module
+        # pending task 落在 session 上
+        sid = body["session_id"]
+        ctx = app_module.session_manager.get_session(sid)
+        assert ctx.pending_task_id == body["task_id"]
 
-        extraction = ExtractionsJson(
-            event_extractions=[Extraction(text="purchase")],
-            region_filter=["ROW"],
-        )
-        mock_service = _mock_low_confidence_resolver()
+    def test_nl2sql_confirmation_then_reply(self, client):
+        intent = SQLIntentJson(table_extractions=[Extraction(text="商品表")], metric_extractions=[Extraction(text="销售额")])
+        svc = _low_confidence_table_service()
 
-        # 第一次请求：触发确认
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                resp1 = client.post("/nl2dsl", json={
-                    "text": "purchase的情况",
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with mock.patch("app.get_matcher_service", return_value=svc):
+                resp1 = client.post("/nl2sql", json={
+                    "text": "商品表的销售额",
                     "project_id": 55,
                 })
 
         body1 = resp1.json()
         sid = body1["session_id"]
-        task_id = body1["task_id"]
         assert body1["status"] == "needs_confirmation"
 
-        # 第二次请求：用户回复确认
-        with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
-            with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
-                resp2 = client.post("/nl2dsl", json={
-                    "text": "1",
-                    "project_id": 55,
-                    "session_id": sid,
-                })
+        # 用户回复 "1" → 确认 products → 生成 SQL
+        with _mock_generate_sql():
+            resp2 = client.post("/nl2sql", json={
+                "text": "1",
+                "project_id": 55,
+                "session_id": sid,
+            })
 
         body2 = resp2.json()
         assert body2["status"] == "success"
-        assert "confirmed" in body2.get("message", "") or body2["status"] == "success"
         assert body2["explain"]["turn_explain"]["mode"] == "confirmation"
-        assert body2["explain"]["turn_explain"]["field_sources"]["event"] == "confirmed"
-        assert body2["explain"]["turn_explain"]["confirmed_fields"]["event"] == "purchase_success"
+        assert body2["explain"]["turn_explain"]["field_sources"]["tables"] == "confirmed"
+        assert body2["explain"]["turn_explain"]["confirmed_fields"]["tables"] == "products"
+        assert body2["resolved_intent"]["tables"] == ["products"]
 
-    def test_nl2dsl_followup_confirmation_then_reply(self, client):
+    def test_nl2sql_followup_confirmation_then_reply(self, client):
         ctx, _ = self._seed_previous_state()
 
-        extraction = ExtractionsJson(
-            event_extractions=[Extraction(text="purchase")],
-            region_filter=["ROW"],
-        )
-        mock_service = _mock_low_confidence_resolver()
+        intent = SQLIntentJson(table_extractions=[Extraction(text="商品表")])
+        svc = _low_confidence_table_service()
 
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                resp1 = client.post("/nl2dsl", json={
-                    "text": "对比purchase",
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with mock.patch("app.get_matcher_service", return_value=svc):
+                resp1 = client.post("/nl2sql", json={
+                    "text": "对比商品表",
                     "project_id": 55,
                     "session_id": ctx.session_id,
                 })
@@ -521,39 +495,33 @@ class TestNL2DSLConfirmation:
         assert body1["status"] == "needs_confirmation"
         assert body1["explain"]["turn_explain"]["mode"] == "followup_patch"
 
-        with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
-            with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
-                resp2 = client.post("/nl2dsl", json={
-                    "text": "1",
-                    "project_id": 55,
-                    "session_id": ctx.session_id,
-                })
+        with _mock_generate_sql():
+            resp2 = client.post("/nl2sql", json={
+                "text": "1",
+                "project_id": 55,
+                "session_id": ctx.session_id,
+            })
 
         body2 = resp2.json()
         assert body2["status"] == "success"
-        assert body2["semantic"]["event"]["event_name"] == "purchase_success"
-        assert body2["semantic"]["metric"]["metric_id"] == "pv"
-        assert body2["semantic"]["group_by"] == [{"dimension_id": "country"}]
+        assert body2["resolved_intent"]["tables"] == ["products"]
+        assert body2["resolved_intent"]["metrics"] == ["revenue"]
         assert body2["explain"]["turn_explain"]["mode"] == "confirmation"
-        assert body2["explain"]["turn_explain"]["field_sources"]["event"] == "confirmed"
-        assert "metric" in body2["explain"]["turn_explain"]["inherited_fields"]
-        assert body2["explain"]["turn_explain"]["confirmed_fields"]["event"] == "purchase_success"
+        assert body2["explain"]["turn_explain"]["field_sources"]["tables"] == "confirmed"
+        assert "metrics" in body2["explain"]["turn_explain"]["inherited_fields"]
+        assert body2["explain"]["turn_explain"]["confirmed_fields"]["tables"] == "products"
 
-    def test_nl2dsl_confirmation_after_session_restore(self, client):
+    def test_nl2sql_confirmation_after_session_restore(self, client):
         import app as app_module
         from service.session_manager import SessionManager
 
-        extraction = ExtractionsJson(
-            event_extractions=[Extraction(text="purchase")],
-            region_filter=["ROW"],
-        )
-        mock_service = _mock_low_confidence_resolver()
+        intent = SQLIntentJson(table_extractions=[Extraction(text="商品表")], metric_extractions=[Extraction(text="销售额")])
+        svc = _low_confidence_table_service()
 
-        # 第一次请求：触发确认并落盘
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                resp1 = client.post("/nl2dsl", json={
-                    "text": "purchase的情况",
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with mock.patch("app.get_matcher_service", return_value=svc):
+                resp1 = client.post("/nl2sql", json={
+                    "text": "商品表的销售额",
                     "project_id": 55,
                 })
 
@@ -561,7 +529,7 @@ class TestNL2DSLConfirmation:
         sid = body1["session_id"]
         assert body1["status"] == "needs_confirmation"
 
-        # 模拟服务重启：清空内存 session 和 task，再从同一路径恢复
+        # 模拟服务重启：清空内存 session/task，再从同一路径恢复
         original_session_manager = app_module.session_manager
         original_task_manager = app_module.task_manager
         app_module.session_manager = SessionManager(
@@ -573,68 +541,18 @@ class TestNL2DSLConfirmation:
         )
 
         try:
-            with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
-                with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
-                    resp2 = client.post("/nl2dsl", json={
-                        "text": "1",
-                        "project_id": 55,
-                        "session_id": sid,
-                    })
+            with _mock_generate_sql():
+                resp2 = client.post("/nl2sql", json={
+                    "text": "1",
+                    "project_id": 55,
+                    "session_id": sid,
+                })
         finally:
-            # 恢复 fixture 中的隔离实例，避免影响后续测试
             app_module.session_manager = original_session_manager
             app_module.task_manager = original_task_manager
 
         body2 = resp2.json()
         assert body2["status"] == "success"
-
-
-# ==================== Tests: Fallback ====================
-
-class TestNL2DSLFallback:
-
-    def test_nl2dsl_fallback_on_low_score(self, client):
-        extraction = ExtractionsJson(
-            event_extractions=[Extraction(text="unknown_thing")],
-            region_filter=["ROW"],
-        )
-        mock_service = _mock_low_score_resolver()
-
-        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=extraction):
-            with mock.patch("app.get_matcher_service", return_value=mock_service):
-                with mock.patch("service.query_orchestrator.render_exec_dsl", return_value={"content": {"queries": []}}):
-                    with mock.patch("service.query_orchestrator.validate_region"), mock.patch("service.query_orchestrator.validate_region_consistency"):
-                        resp = client.post("/nl2dsl", json={
-                            "text": "unknown query",
-                            "project_id": 55,
-                        })
-
-        body = resp.json()
-        assert body["status"] == "success"
-        # 使用了 default 值（app_launch / pv / country）
-        assert body["semantic"]["event"]["event_name"] == "app_launch"
-        assert body["semantic"]["metric"]["metric_id"] == "pv"
-
-
-# ==================== Tests: Bearer Query ====================
-
-class TestBearerQuery:
-
-    def test_query_bearer_success(self, client):
-        with mock.patch("app.execute_query", new_callable=mock.AsyncMock, return_value={"data": "mock"}):
-            resp = client.post("/query/bearer", json={"exec_dsl": {"content": {}}})
-
-        body = resp.json()
-        assert body["success"] is True
-        assert body["result"] == {"data": "mock"}
-
-    def test_query_bearer_failure(self, client):
-        with mock.patch("app.execute_query", new_callable=mock.AsyncMock, side_effect=ValueError("API error")):
-            resp = client.post("/query/bearer", json={"exec_dsl": {"content": {}}})
-
-        body = resp.json()
-        assert body["success"] is False
-        assert "API error" in body["error"]
 
 
 # ==================== Tests: Session Endpoints ====================
@@ -678,3 +596,96 @@ class TestSessionEndpoints:
     def test_delete_session_not_found(self, client):
         resp = client.delete("/sessions/nonexistent")
         assert resp.status_code == 404
+
+
+# ==================== Tests: Cross-Encoder Rerank ====================
+
+class TestCrossEncoderRerank:
+    """RERANKER_ENABLED=true 时低置信表名被 cross-encoder 静默终选"""
+
+    def test_low_confidence_auto_accepted_by_reranker(self, client, monkeypatch):
+        monkeypatch.setenv("RERANKER_ENABLED", "true")
+
+        from service import reranker as reranker_module
+
+        intent = SQLIntentJson(
+            table_extractions=[Extraction(text="商品表")],
+            metric_extractions=[Extraction(text="销售额")],
+        )
+        svc = _low_confidence_table_service()
+
+        llm_rerank = {"scores": [
+            {"value": "products", "relevance": 92, "reason": "商品表即产品表"},
+            {"value": "orders", "relevance": 35, "reason": "订单表与商品表不同"},
+        ]}
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with mock.patch("app.get_matcher_service", return_value=svc):
+                with mock.patch.object(reranker_module, "_rerank_via_llm", return_value=llm_rerank):
+                    with _mock_generate_sql() as gen_mock:
+                        resp = client.post("/nl2sql", json={
+                            "text": "商品表的销售额",
+                            "project_id": 55,
+                        })
+
+        body = resp.json()
+        assert body["status"] == "success"  # 未触发确认流，被终选采纳
+        assert body["resolved_intent"]["tables"] == ["products"]
+        assert "cross_encoder" in body["explain"]["resolver_explain"]["table"]["method"]
+        rexplain = body["explain"]["resolver_explain"]["table"]["cross_encoder_rerank"]
+        assert rexplain["applied"] is True
+        assert rexplain["auto_accept"] is True
+        assert rexplain["best"] == "products"
+        # 生成 SQL 收到的是终选后的主表
+        gen_intent = gen_mock.call_args.args[1]
+        assert gen_intent["base_table"] == "products"
+
+    def test_reranker_disabled_by_default_keeps_confirmation(self, client, monkeypatch):
+        monkeypatch.delenv("RERANKER_ENABLED", raising=False)
+
+        from service import reranker as reranker_module
+
+        intent = SQLIntentJson(
+            table_extractions=[Extraction(text="商品表")],
+            metric_extractions=[Extraction(text="销售额")],
+        )
+        svc = _low_confidence_table_service()
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with mock.patch("app.get_matcher_service", return_value=svc):
+                with mock.patch.object(reranker_module, "_rerank_via_llm") as rerank_mock:
+                    resp = client.post("/nl2sql", json={
+                        "text": "商品表的销售额",
+                        "project_id": 55,
+                    })
+
+        assert resp.json()["status"] == "needs_confirmation"
+        rerank_mock.assert_not_called()  # 默认关闭，LLM 不被调用
+
+
+class TestWindowDemoteToOrder:
+    """window 文本含方向词（最高/最低）→ 降级为全局 TopN"""
+
+    def test_window_with_direction_word_demotes(self, client):
+        intent = SQLIntentJson(
+            metric_extractions=[Extraction(text="销售额")],
+            group_by_extractions=[Extraction(text="品类")],
+            window_extractions=[Extraction(text="各品类销售额最高的前5")],
+        )
+
+        with mock.patch("service.query_orchestrator.extract_llm_async", new_callable=mock.AsyncMock, return_value=intent):
+            with _mock_generate_sql() as gen_mock:
+                resp = client.post("/nl2sql", json={"text": "各品类销售额最高的前5", "project_id": 55})
+
+        body = resp.json()
+        assert body["status"] == "success"
+        intent_out = body["resolved_intent"]
+        # window 未建立，order_by 建立（指标回退到主指标 revenue）
+        assert intent_out["window"] is None
+        assert intent_out["order_by"]["metric"] == "revenue"
+        assert intent_out["order_by"]["direction"] == "DESC"
+        assert intent_out["order_by"]["limit"] == 5
+
+        gen_intent = gen_mock.call_args.args[1]
+        assert gen_intent["order_by"]["limit"] == 5
+        assert gen_intent["window"] is None

@@ -8,47 +8,57 @@ from common.text_utils import (
     normalize,
     tokenize_mixed,
 )
-from matcher.dimension_matcher import (
-    DimensionMatcher,
-    build_dimension_matcher_from_catalog,
-)
-from matcher.event_matcher import EventMatcher, build_event_matcher_from_catalog
-from matcher.metric_matcher import MetricMatcher, build_metric_matcher_from_catalog
+from matcher.column_matcher import ColumnMatcher, build_column_matcher_from_schema
+from matcher.schema_loader import load_sql_schema
+from matcher.sql_metric_matcher import SQLMetricMatcher, build_sql_metric_matcher_from_schema
+from matcher.table_matcher import TableMatcher, build_table_matcher_from_schema
 from matcher.time_matcher import TimeMatcher
 
 # =========================
 # 测试数据
 # =========================
 
-MOCK_EVENTS = {
-    "app_launch": {
-        "aliases": ["应用启动", "启动应用", "app启动", "打开app", "打开应用"]
+MOCK_TABLES = {
+    "orders": {
+        "aliases": ["订单", "订单表", "下单", "order record"],
+        "time_column": "created_at",
+        "columns": {},
     },
-    "payment_success": {
-        "aliases": ["支付成功", "支付完成", "payment success"]
-    },
-    "video_play_start": {
-        "aliases": ["开始播放", "视频开始播放", "video play start"]
+    "users": {
+        "aliases": ["用户", "用户表", "会员"],
+        "columns": {},
     },
 }
 
-MOCK_DIMENSIONS = {
-    "country": {
-        "aliases": ["country", "国家", "地区"],
-        "property_name": "country",
+MOCK_COLUMNS = {
+    "users.region": {
+        "table": "users",
+        "column": "region",
+        "type": "LowCardinality(String)",
+        "aliases": ["region", "地区", "区域"],
     },
-    "city": {
-        "aliases": ["city", "城市"],
-        "property_name": "city",
+    "users.vip_level": {
+        "table": "users",
+        "column": "vip_level",
+        "type": "LowCardinality(String)",
+        "aliases": ["会员等级", "VIP等级", "等级"],
+    },
+    "orders.amount": {
+        "table": "orders",
+        "column": "amount",
+        "type": "Float64",
+        "aliases": ["金额", "订单金额"],
     },
 }
 
 MOCK_METRICS = {
-    "pv": {
-        "aliases": ["PV", "浏览量", "访问量"],
+    "revenue": {
+        "aliases": ["销售额", "营收", "GMV"],
+        "expr": "sum(orders.amount)",
     },
-    "uv": {
-        "aliases": ["UV", "独立访客", "访客数"],
+    "order_count": {
+        "aliases": ["订单量", "订单数", "单量"],
+        "expr": "count()",
     },
 }
 
@@ -85,19 +95,18 @@ class TestTextUtils:
 
     def test_tokenize_mixed_chinese(self):
         """测试中文分词"""
-        tokens = tokenize_mixed("应用启动")
+        tokens = tokenize_mixed("订单表")
         assert len(tokens) > 0
 
     def test_tokenize_mixed_combined(self):
         """测试中英混合分词"""
-        tokens = tokenize_mixed("app_launch启动")
-        assert "app" in tokens
-        assert "launch" in tokens
-        assert "启动" in tokens
+        tokens = tokenize_mixed("orders订单")
+        assert "orders" in tokens
+        assert len(tokens) > 1
 
     def test_contains_chinese_true(self):
         """测试检测中文 - 包含中文"""
-        assert contains_chinese("应用启动") is True
+        assert contains_chinese("订单表") is True
 
     def test_contains_chinese_false(self):
         """测试检测中文 - 不包含中文"""
@@ -105,101 +114,99 @@ class TestTextUtils:
 
     def test_is_single_chinese_char_true(self):
         """测试单字中文 - 是单字"""
-        assert is_single_chinese_char("应") is True
+        assert is_single_chinese_char("订") is True
 
     def test_is_single_chinese_char_false(self):
         """测试单字中文 - 不是单字"""
-        assert is_single_chinese_char("应用") is False
+        assert is_single_chinese_char("订单") is False
         assert is_single_chinese_char("app") is False
 
 
 # =========================
-# EventMatcher 测试
+# TableMatcher 测试
 # =========================
 
-class TestEventMatcher:
-    """测试事件匹配器"""
+class TestTableMatcher:
+    """测试表匹配器"""
 
     @pytest.fixture
     def matcher(self):
-        return build_event_matcher_from_catalog(MOCK_EVENTS)
+        return build_table_matcher_from_schema(MOCK_TABLES)
 
-    def test_exact_match(self, matcher: EventMatcher):
-        """测试精确匹配"""
-        result = matcher.match("app_launch")
-        assert result.matched == "app_launch"
+    def test_exact_match(self, matcher: TableMatcher):
+        result = matcher.match("orders")
+        assert result.matched == "orders"
         assert result.score == 100.0
 
-    def test_alias_match(self, matcher: EventMatcher):
-        """测试别名匹配"""
-        result = matcher.match("应用启动")
-        assert result.matched == "app_launch"
+    def test_alias_match(self, matcher: TableMatcher):
+        result = matcher.match("订单表")
+        assert result.matched == "orders"
         assert result.score == 100.0
 
-    def test_fuzzy_match(self, matcher: EventMatcher):
-        """测试模糊匹配"""
-        result = matcher.match("app启动")
-        assert result.matched is not None
+    def test_fuzzy_match(self, matcher: TableMatcher):
+        """英文 typo：token 召回 + RapidFuzz 重排（不依赖 jieba 全局词典状态）"""
+        result = matcher.match("order recrd")
+        assert result.matched == "orders"
+        assert 70.0 <= result.score < 100.0
 
-    def test_no_match(self, matcher: EventMatcher):
-        """测试无匹配"""
+    def test_no_match(self, matcher: TableMatcher):
         result = matcher.match("xyz123不存在的")
-        # 可能返回 None 或低分匹配
         assert result.score < 100.0
 
 
 # =========================
-# DimensionMatcher 测试
+# ColumnMatcher 测试
 # =========================
 
-class TestDimensionMatcher:
-    """测试维度匹配器"""
+class TestColumnMatcher:
+    """测试列匹配器（doc = table.column）"""
 
     @pytest.fixture
     def matcher(self):
-        return build_dimension_matcher_from_catalog(MOCK_DIMENSIONS)
+        return build_column_matcher_from_schema(MOCK_COLUMNS)
 
-    def test_exact_match(self, matcher: DimensionMatcher):
-        """测试精确匹配"""
-        result = matcher.match("country")
-        assert result.matched == "country"
+    def test_exact_match(self, matcher: ColumnMatcher):
+        result = matcher.match("region")
+        assert result.matched == "users.region"
 
-    def test_chinese_alias_match(self, matcher: DimensionMatcher):
-        """测试中文别名匹配"""
-        result = matcher.match("国家")
-        assert result.matched == "country"
+    def test_chinese_alias_match(self, matcher: ColumnMatcher):
+        result = matcher.match("地区")
+        assert result.matched == "users.region"
 
-    def test_match_property(self, matcher: DimensionMatcher):
-        """测试匹配 property_name"""
-        prop_name, score, explain = matcher.match_property("country")
-        assert prop_name == "country"
+    def test_qualified_names_distinguish_tables(self, matcher: ColumnMatcher):
+        """同名列可区分归属表：金额 → orders.amount 而不是别的表的列"""
+        result = matcher.match("金额")
+        assert result.matched == "orders.amount"
+
+    def test_get_doc(self, matcher: ColumnMatcher):
+        doc = matcher.get_doc("users.region")
+        assert doc is not None
+        assert doc["table"] == "users"
+        assert doc["column"] == "region"
 
 
 # =========================
-# MetricMatcher 测试
+# SQLMetricMatcher 测试
 # =========================
 
-class TestMetricMatcher:
-    """测试指标匹配器"""
+class TestSQLMetricMatcher:
+    """测试业务指标匹配器"""
 
     @pytest.fixture
     def matcher(self):
-        return build_metric_matcher_from_catalog(MOCK_METRICS)
+        return build_sql_metric_matcher_from_schema(MOCK_METRICS)
 
-    def test_pv_match(self, matcher: MetricMatcher):
-        """测试 PV 匹配"""
-        result = matcher.match("PV")
-        assert result.matched == "pv"
+    def test_revenue_match(self, matcher: SQLMetricMatcher):
+        result = matcher.match("销售额")
+        assert result.matched == "revenue"
 
-    def test_uv_match(self, matcher: MetricMatcher):
-        """测试 UV 匹配"""
-        result = matcher.match("UV")
-        assert result.matched == "uv"
+    def test_order_count_match(self, matcher: SQLMetricMatcher):
+        result = matcher.match("订单量")
+        assert result.matched == "order_count"
 
-    def test_chinese_alias_match(self, matcher: MetricMatcher):
-        """测试中文别名匹配"""
-        result = matcher.match("浏览量")
-        assert result.matched == "pv"
+    def test_english_alias_match(self, matcher: SQLMetricMatcher):
+        result = matcher.match("GMV")
+        assert result.matched == "revenue"
 
 
 # =========================
@@ -214,40 +221,68 @@ class TestTimeMatcher:
         return TimeMatcher()
 
     def test_last_n_days_chinese(self, matcher: TimeMatcher):
-        """测试中文时间表达式"""
         result = matcher.match("近7天")
         assert result.days == 7
         assert result.time_type == "last_n_days"
 
     def test_last_n_days_english(self, matcher: TimeMatcher):
-        """测试英文时间表达式"""
         result = matcher.match("last 30 days")
         assert result.days == 30
         assert result.time_type == "last_n_days"
 
     def test_yesterday(self, matcher: TimeMatcher):
-        """测试昨天"""
         result = matcher.match("昨天")
         assert result.days == 1
         assert result.time_type == "yesterday"
 
     def test_today(self, matcher: TimeMatcher):
-        """测试今天"""
         result = matcher.match("今天")
         assert result.days == 1
         assert result.time_type == "today"
 
     def test_this_week(self, matcher: TimeMatcher):
-        """测试本周"""
         result = matcher.match("本周")
         assert result.days == 7
         assert result.time_type == "this_week"
 
     def test_default(self, matcher: TimeMatcher):
-        """测试默认值"""
         result = matcher.match("无效输入")
         assert result.days == 7
         assert result.time_type == "default"
+
+
+# =========================
+# SchemaLoader 测试
+# =========================
+
+class TestSchemaLoader:
+    """测试 schema YAML 加载（真实 demo catalog）"""
+
+    @pytest.fixture
+    def schema(self):
+        return load_sql_schema("catalog")
+
+    def test_tables_loaded(self, schema):
+        assert "orders" in schema.tables
+        assert "users" in schema.tables
+        assert "products" in schema.tables
+
+    def test_columns_qualified_names(self, schema):
+        assert "users.region" in schema.columns
+        assert schema.columns["users.region"]["table"] == "users"
+
+    def test_joins_loaded(self, schema):
+        # YAML 1.1 会把裸 on 解析为布尔，condition key 必须可用
+        assert len(schema.joins) == 2
+        assert schema.joins[0]["condition"] == "orders.user_id = users.id"
+
+    def test_metrics_expr(self, schema):
+        assert schema.metrics["revenue"]["expr"] == "sum(orders.amount)"
+
+    def test_find_join(self, schema):
+        j = schema.find_join("users", "orders")
+        assert j is not None
+        assert j["condition"] == "orders.user_id = users.id"
 
 
 # =========================

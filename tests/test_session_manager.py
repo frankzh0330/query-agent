@@ -31,11 +31,10 @@ class TestSessionManager:
             "type": "query_state",
             "data": {
                 "project_id": 55,
-                "event": "app_launch",
-                "metric": "pv",
+                "tables": ["orders"],
+                "metrics": ["revenue"],
                 "time_range": {"type": "last_n_days", "n": 7},
-                "region_filter": ["ROW"],
-                "group_by": ["country"],
+                "group_by": ["users.region"],
                 "filters": [],
                 "turn_type": "followup_patch",
             },
@@ -56,7 +55,7 @@ class TestSessionManager:
         assert len(ctx.messages) == 1
         assert ctx.messages[0].content == "hello from file"
         assert ctx.last_query_state is not None
-        assert ctx.last_query_state.event == "app_launch"
+        assert ctx.last_query_state.tables == ["orders"]
         assert ctx.last_turn_type == "followup_patch"
         assert ctx.pending_task_id == "task_123"
         assert ctx.last_user_query == "hello from file"
@@ -109,7 +108,7 @@ class TestSessionManager:
         sample_query_state.turn_type = "followup_patch"
         session_manager.update_query_state(ctx.session_id, sample_query_state)
         assert ctx.last_query_state is not None
-        assert ctx.last_query_state.event == "app_launch"
+        assert ctx.last_query_state.tables == ["orders"]
         assert ctx.last_turn_type == "followup_patch"
 
     def test_update_query_state_persists_to_jsonl(self, session_manager, sample_query_state):
@@ -120,7 +119,7 @@ class TestSessionManager:
         records = session_manager.storage.read_tail(ctx.session_id)
         state_records = [r for r in records if r.get("type") == "query_state"]
         assert len(state_records) == 1
-        assert state_records[0]["data"]["event"] == "app_launch"
+        assert state_records[0]["data"]["tables"] == ["orders"]
         assert state_records[0]["turn_type"] == "followup_patch"
 
     def test_update_pending_task_stores_in_memory(self, session_manager):
@@ -146,7 +145,7 @@ class TestSessionManager:
         assert "recent_queries" in context
         assert "查询PV" in context["recent_queries"]
         assert "last_query_state" in context
-        assert context["last_query_state"]["event"] == "app_launch"
+        assert context["last_query_state"]["tables"] == ["orders"]
         assert context["last_turn_type"] == "new_query"
         assert context["last_user_query"] == "查询PV"
         assert context["turn_index"] == 1

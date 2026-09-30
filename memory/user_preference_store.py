@@ -10,10 +10,10 @@ from typing import Any, Dict, Tuple
 logger = logging.getLogger(__name__)
 
 _FIELD_TO_BUCKET = {
-    "event": "events",
+    "table": "tables",
     "metric": "metrics",
-    "group_by": "dimensions",
-    "dimension": "dimensions",
+    "column": "columns",
+    "group_by": "columns",
 }
 _MAX_BIAS_SCORE = 6.0
 
@@ -30,9 +30,9 @@ class UserPreferenceStore:
         project_id: int,
         user_id: str | None,
         *,
-        event: str | None = None,
+        table: str | None = None,
         metric: str | None = None,
-        group_by: list[str] | None = None,
+        columns: list[str] | None = None,
     ) -> None:
         if not user_id:
             return
@@ -40,15 +40,15 @@ class UserPreferenceStore:
         data = self._load(project_id, user_id)
         updated = False
 
-        if event:
-            self._increment(data["events"], event)
+        if table:
+            self._increment(data["tables"], table)
             updated = True
         if metric:
             self._increment(data["metrics"], metric)
             updated = True
-        if group_by:
-            for dimension in group_by:
-                self._increment(data["dimensions"], dimension)
+        if columns:
+            for column in columns:
+                self._increment(data["columns"], column)
                 updated = True
 
         if updated:
@@ -118,12 +118,12 @@ class UserPreferenceStore:
     def _load(self, project_id: int, user_id: str) -> Dict[str, Dict[str, int]]:
         path = self._path(project_id, user_id)
         if not path.exists():
-            return {"events": {}, "metrics": {}, "dimensions": {}}
+            return {"tables": {}, "metrics": {}, "columns": {}}
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             logger.warning("Failed to load user preferences: project=%s user=%s", project_id, user_id)
-            return {"events": {}, "metrics": {}, "dimensions": {}}
+            return {"tables": {}, "metrics": {}, "columns": {}}
 
     def _save(self, project_id: int, user_id: str, data: Dict[str, Dict[str, int]]) -> None:
         path = self._path(project_id, user_id)

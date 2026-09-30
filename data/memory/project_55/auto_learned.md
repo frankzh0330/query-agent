@@ -1,0 +1,1 @@
+- [constraint] 用户说的'交易表'在本项目对应 orders 表（表名匹配失败后经指标推断为 orders），后续可将'交易表'直接映射到 orders

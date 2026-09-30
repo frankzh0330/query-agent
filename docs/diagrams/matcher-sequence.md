@@ -2,28 +2,28 @@
 
 ```mermaid
 sequenceDiagram
-    participant API as FastAPI /nl2dsl
+    participant API as FastAPI /nl2sql
     participant MS as MatcherService
-    participant Matcher as Event/Metric/Dimension Matcher
+    participant Matcher as Table/Column/Metric Matcher
     participant Pipeline as BaseMatcher Pipeline
     participant Index as Inverted Index
     participant Fuzz as RapidFuzz
-    participant Catalog as Catalog YAML
+    participant Schema as sql_schema.yaml
     participant Pref as UserPreferenceStore
 
     rect rgb(227, 242, 253)
-    Note over API,Catalog: Initialization - build matcher indexes
+    Note over API,Schema: Initialization - build matcher indexes
     API->>MS: MatcherService(catalog_path)
-    MS->>Catalog: Load metrics, events, dimensions
-    Catalog-->>MS: Catalog object with entities and aliases
-    MS->>Matcher: Build indexes
+    MS->>Schema: load tables / columns / joins / metrics
+    Schema-->>MS: SQLSchema (qualified columns + aliases)
+    MS->>Matcher: Build indexes (table / table.column / metric)
     Matcher->>Pipeline: Build exact alias table and inverted index
     Pipeline->>Index: Store token -> document IDs
     end
 
     rect rgb(232, 245, 233)
     Note over API,Fuzz: Runtime - resolve one extracted field
-    API->>MS: resolve_from_extractions(type, extractions, default)
+    API->>MS: resolve_with_candidates(type, extractions, default)
     MS->>MS: Pick first extraction text
     MS->>Matcher: match(query)
     Matcher->>Pipeline: Stage 1 exact alias lookup
@@ -42,6 +42,14 @@ sequenceDiagram
         end
     end
     Matcher-->>MS: ResolvedResult with candidates and explain
+    MS->>MS: threshold policy: >=80 accept, 40-80 confirm, <40 drop
+    end
+
+    rect rgb(255, 243, 224)
+    Note over MS,Schema: Table and join inference
+    MS->>MS: infer_main_table (explicit / metric expr / column votes)
+    MS->>Schema: infer_joins(base_table, qualified_columns)
+    Schema-->>MS: normalized join steps or missing path
     end
 
     rect rgb(255, 249, 196)

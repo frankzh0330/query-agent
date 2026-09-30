@@ -79,7 +79,7 @@
 
 主要文件：
 
-- [tests/evals/nl2dsl_cases.yaml](../tests/evals/nl2dsl_cases.yaml)
+- [tests/evals/nl2sql_cases.yaml](../tests/evals/nl2sql_cases.yaml)
 - [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
 
 这套 harness 更接近“golden cases”，不是单纯 unit test。
@@ -90,7 +90,7 @@
 
 - `setup`
 - 一个或多个 `steps`
-- 预期的 `status / turn_mode / semantic fields`
+- 预期的 `status / turn_mode / resolved_intent 字段`
 
 结构示例：
 
@@ -100,34 +100,32 @@ cases:
     setup:
       last_query_state:
         project_id: 55
-        event: app_launch
-        metric: pv
+        tables: ["orders"]
+        metrics: ["revenue"]
         time_range:
           type: last_n_days
           n: 7
-        region_filter: ["ROW"]
-        group_by: ["country"]
+        group_by: ["orders.channel"]
         filters: []
         turn_type: new_query
     steps:
-      - text: 对比 purchase
+      - text: 对比商品表
         project_id: 55
         extraction:
-          event_extractions: ["purchase"]
-          region_filter: ["ROW"]
-        resolver: low_confidence_event
+          table_extractions: ["商品表"]
+        resolver: low_confidence_table
         expect:
           status: needs_confirmation
           turn_mode: followup_patch
-          candidates_contains: event
+          candidates_contains: tables
       - text: "1"
         project_id: 55
         expect:
           status: success
           turn_mode: confirmation
-          semantic:
-            event: purchase_success
-            metric: pv
+          resolved_intent:
+            tables: ["products"]
+            metrics: ["revenue"]
 ```
 
 ## Harness 现在能模拟什么
@@ -135,31 +133,36 @@ cases:
 当前 runner 已支持：
 
 - 预置 `last_query_state`
-- mocked extraction output
-- mocked resolver scenario
+- mocked extraction output（`SQLIntentJson` 片段）
+- mocked resolver scenario（高置信 / 低置信表名）
+- mocked SQL 生成（harness 锁定确定性内核：matcher、阈值、状态合并、确认流、持久化）
 - 多步 session 连续性
 - `project_memory` setup
 - `restart_before: true` 重启模拟
 - 对以下内容做断言：
   - `status`
   - `turn_mode`
-  - `semantic.event`
-  - `semantic.metric`
-  - `semantic.region_filter`
-  - `semantic.group_by`
-  - `semantic.time_range.n`
+  - `resolved_intent.tables`
+  - `resolved_intent.metrics`
+  - `resolved_intent.group_by`
+  - `resolved_intent.time_range.n`
+  - `resolved_intent.window`（分组排名）
+  - `resolved_intent.filters`
+  - join 推断结果进入 SQL 生成入参（`sql_intent_contains_join`）
   - candidate presence
 
 ## 当前已覆盖场景
 
 当前 end-to-end case 已覆盖：
 
-- basic new query
-- follow-up change time
-- follow-up change metric
-- follow-up confirmation flow
-- project memory context injection
-- confirmation after restart
+- 基础新查询（显式表名 / 从指标推断表名）
+- follow-up 修改时间
+- follow-up 修改指标
+- follow-up 增加分组排名窗口（每组 Top-N）
+- join 推断（列在其他表 -> 从 schema 配置推断 join）
+- follow-up + 确认流
+- 项目记忆注入
+- 重启后确认恢复
 
 这意味着，最重要的“agent 化”链路现在已经有了回归保护。
 
