@@ -43,7 +43,8 @@ class TelegramGateway(BaseGateway):
             try:
                 await self._poll_updates()
             except Exception as e:
-                logger.error(f"Error polling updates: {e}")
+                # 带异常类型名，避免 httpx 超时类异常 str() 为空导致日志不可诊断
+                logger.warning("Error polling updates: %s: %s", type(e).__name__, e)
                 await asyncio.sleep(5)
 
     async def stop(self) -> None:
@@ -59,18 +60,26 @@ class TelegramGateway(BaseGateway):
             "timeout": 30,
         }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, params=params, timeout=35)
-            data = response.json()
+        try:
+            async with httpx.AsyncClient() as client:
+                # 客户端超时放宽到 60s：长轮询 30s + 网络抖动余量
+                response = await client.get(url, params=params, timeout=60)
+        except httpx.TransportError as e:
+            # TimeoutException 的父类，再覆盖 ReadError/ConnectError 等网络层抖动：
+            # 长轮询循环本来就会重试，静默降为 DEBUG 即可
+            logger.debug("Poll transport error (retrying): %s: %s", type(e).__name__, e)
+            return
 
-            if not data.get("ok"):
-                logger.error(f"Failed to get updates: {data}")
-                return
+        data = response.json()
 
-            updates = data.get("result", [])
-            for update in updates:
-                self._offset = update.get("update_id", self._offset)
-                await self.handle_message(update)
+        if not data.get("ok"):
+            logger.error(f"Failed to get updates: {data}")
+            return
+
+        updates = data.get("result", [])
+        for update in updates:
+            self._offset = update.get("update_id", self._offset)
+            await self.handle_message(update)
 
     async def handle_message(self, update: Dict[str, Any]) -> None:
         """处理消息：Ingress 清洗 → 入队"""
@@ -115,26 +124,26 @@ class TelegramGateway(BaseGateway):
             return self._format_confirmation(nl2sql_result)
 
         if status == "early_exit":
-            return nl2sql_result.get("message", "无法处理该查询")
+            return nl2sql_result.get("message", "Unable to process this query.")
 
         # 正常结果：展示生成的 SQL 与解析意图
         intent = nl2sql_result.get("resolved_intent", {})
         sql = nl2sql_result.get("sql", "")
 
-        lines = ["\U0001F4C4 已生成 ClickHouse SQL"]
+        lines = ["\U0001F4C4 ClickHouse SQL generated"]
 
         if intent.get("tables"):
-            lines.append(f"表: {', '.join(intent['tables'])}")
+            lines.append(f"Table: {', '.join(intent['tables'])}")
         if intent.get("metrics"):
-            lines.append(f"指标: {', '.join(intent['metrics'])}")
+            lines.append(f"Metrics: {', '.join(intent['metrics'])}")
         if intent.get("group_by"):
-            lines.append(f"分组: {', '.join(intent['group_by'])}")
+            lines.append(f"Group by: {', '.join(intent['group_by'])}")
         if intent.get("filters"):
             f_strs = [f"{f.get('column')} {f.get('op')} {f.get('value')}" for f in intent["filters"]]
-            lines.append(f"过滤: {', '.join(f_strs)}")
+            lines.append(f"Filters: {', '.join(f_strs)}")
         tr = intent.get("time_range") or {}
         if tr:
-            lines.append(f"时间: {tr.get('type', 'last_n_days')} n={tr.get('n', '?')}")
+            lines.append(f"Time: {tr.get('type', 'last_n_days')} n={tr.get('n', '?')}")
 
         # AST 分析摘要（护栏效果可视化：扫描量估算 + 警告码）
         summary = self._format_ast_summary(nl2sql_result)
@@ -142,7 +151,7 @@ class TelegramGateway(BaseGateway):
             lines.append(summary)
 
         lines.append("")
-        lines.append(sql or "（SQL 为空）")
+        lines.append(sql or "(empty SQL)")
         return "\n".join(lines)
 
     @staticmethod
@@ -156,13 +165,13 @@ class TelegramGateway(BaseGateway):
                 return ""
             scanned = cost.get("estimated_rows_scanned", 0)
             scan_str = f"{scanned / 1_000_000:.0f}M" if scanned >= 1_000_000 else f"{scanned / 1_000:.0f}K"
-            parts = [f"📊 估算扫描 ~{scan_str} 行"]
+            parts = [f"📊 Est. scan ~{scan_str} rows"]
             if cost.get("join_count"):
                 parts.append(f"join x{cost['join_count']}")
             warnings = [w.get("code", "") for w in ast.get("warnings", [])]
-            parts.append("⚠️ " + ", ".join(warnings) if warnings else "✅ 无警告")
+            parts.append("⚠️ " + ", ".join(warnings) if warnings else "✅ No warnings")
             if gen.get("repaired"):
-                parts.append("🔧 已自动修复")
+                parts.append("🔧 Auto-repaired")
             return " · ".join(parts)
         except Exception:
             return ""
@@ -194,10 +203,10 @@ class TelegramGateway(BaseGateway):
 
         lines = []
         for field_name, cands in candidates.items():
-            field_display = {"tables": "表", "metrics": "指标", "join": "关联表"}.get(field_name, field_name)
-            lines.append(f"请选择{field_display}:")
+            field_display = {"tables": "table", "metrics": "metric", "join": "bridging table"}.get(field_name, field_name)
+            lines.append(f"Please choose a {field_display}:")
             for i, c in enumerate(cands[:5], 1):
-                lines.append(f"  {i}. {c['value']} (匹配度 {c['score']:.0f}%)")
-        lines.append("回复编号或名称即可")
+                lines.append(f"  {i}. {c['value']} (match {c['score']:.0f}%)")
+        lines.append("Reply with a number or a name.")
 
         return "\n".join(lines)

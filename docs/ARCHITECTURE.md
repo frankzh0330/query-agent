@@ -535,6 +535,17 @@ Current coverage includes:
 
 This is intentionally closer to “golden cases” than isolated unit tests.
 
+The pytest harness mocks the LLM extraction and SQL generation, so it evaluates matcher resolution,
+state merging, the confirmation flow and the inputs handed to SQL generation, and it runs offline in seconds.
+Cases marked `xfail` assert the *correct* behavior for known gaps (strict, so a fix forces the marker off).
+
+### Live LLM Eval
+
+[scripts/live_eval.py](../scripts/live_eval.py) replays the same cases against the real LLM and reports
+per-case pass/fail, SQL static validity, whether the resolved metric expressions appear in the SQL, and latency.
+It measures what the mocked harness cannot (extraction and SQL quality). LLM output varies between runs, so a
+result is a sample, not a stable accuracy figure, and "SQL is valid" does not mean "SQL is correct".
+
 ## Catalog and Metadata
 
 The checked-in YAML catalog is mainly a demo/development artifact.
@@ -550,6 +561,54 @@ This matters because real deployments may have:
 - tens of thousands of events
 - multiple dimensions/properties per event
 - project-specific vocabularies and constraints
+
+## Filter Value Resolution
+
+A filter such as "paid by credit card" has two parts to resolve: the **column**
+(`payments.payment_type`) and the **value** (`credit_card`). The LLM only copies the
+user's words, so the value it extracts (`credit card`) rarely equals what is stored.
+Getting this wrong produces SQL that passes static validation but returns nothing or the
+wrong rows, which the live eval surfaced (see [Evaluation Strategy](#evaluation-strategy)).
+
+### What this repository does
+
+- **Column**: [orchestrator](../service/query_orchestrator.py) accepts a filter column only on a
+  high-confidence match (score >= 80). Low-confidence or unmatched columns are never guessed
+  from the recall list; the request ends with `early_exit` and the closest columns, so the user
+  can rephrase. (A hallucinated `user_type` used to be fuzzy-matched to `orders.user_id`.)
+- **Value**: columns may declare `enum_values` in [catalog/sql_schema.yaml](../catalog/sql_schema.yaml).
+  `SQLSchema.normalize_enum_value()` maps the extracted value to a declared one
+  deterministically: exact, then case/space/hyphen-insensitive (`Credit-Card` -> `credit_card`),
+  then RapidFuzz >= 90 (`cancelled` -> `canceled`). A value that matches nothing is passed through and
+  recorded in `explain`; it does not block the query.
+
+### Why hand-written enums do not scale
+
+`enum_values` fits low-cardinality, stable columns (`status`, `payment_type`, `vip_level`).
+It does not fit high-cardinality or changing columns (brand, city, product name), and nobody can
+maintain a hand-written list for every column of a real warehouse. It is a demo-scale choice.
+
+### How production systems approach it
+
+| Approach | Idea | Reference |
+|---|---|---|
+| Cached frequent values + fuzzy match | Pick searchable text columns by cardinality/type, cache the most frequent values, match filters with edit distance, generate synonyms/abbreviations with an LLM | [SQLGenie (ACL 2025 Industry)](https://aclanthology.org/2025.acl-industry.71.pdf) |
+| Index all values | LSH plus semantic embeddings, hierarchical retrieval; give the LLM only the relevant value subset (offline index, online retrieval) | [CHESS](https://scalingintelligence.stanford.edu/pubs/CHESSpaper.pdf), [XiYan-SQL](https://arxiv.org/pdf/2411.08599), [DeepEye-SQL](https://arxiv.org/pdf/2510.17586) |
+| Sample values in the prompt | 3-5 representative values for low-cardinality categorical columns | [DexterSQL](https://arxiv.org/pdf/2608.11889) |
+| Semantic-layer aliases | Humans maintain metric, dimension and value aliases/synonyms, backed by golden-query regression tests | [Semantic Layers Make Enterprise Text-to-SQL Safer](https://datalakehousehub.com/blog/2026-05-semantic-layers-text-to-sql/), [dbt: Semantic Layer vs. Text-to-SQL](https://docs.getdbt.com/blog/semantic-layer-vs-text-to-sql-2026) |
+
+These are usually combined: low-cardinality columns get sample values or a cached list, high-cardinality
+columns get a value index, and business vocabulary lives in the semantic layer.
+
+The public material is thin on operational details (how values that change over time are refreshed, how
+ambiguous values are disambiguated with the user). Treat those as open design questions, not established practice.
+
+### Intended direction for this project
+
+Replace the hand-written `enum_values` with values synced from the warehouse (distinct/top-K per eligible column,
+refreshed on the same schedule as the metadata sync), keep `normalize_enum_value()` as the deterministic
+first pass, and add an embedding or LSH value index for high-cardinality columns. Ambiguous or unmatched values should
+go through the confirmation flow instead of being passed through.
 
 ## Evolution Roadmap
 

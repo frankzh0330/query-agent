@@ -383,7 +383,7 @@ class TestNL2SQLEarlyExit:
         body = resp.json()
         assert body["status"] == "early_exit"
         assert body["message"]
-        assert "表" in body["message"] or "指标" in body["message"]
+        assert "table" in body["message"].lower() or "metric" in body["message"].lower()
 
     def test_nl2sql_early_exit_records_message(self, client):
         import app as app_module

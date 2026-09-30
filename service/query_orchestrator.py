@@ -105,7 +105,7 @@ class QueryOrchestrator:
             self.session.add_message(ctx.session_id, "user", req.text, metadata={"error": "extraction_failed"})
             return self._make_response(
                 extraction_json={}, status="early_exit", session_id=ctx.session_id,
-                message="没能从您的输入中识别出查询意图，请换个说法（例如：revenue by region last 7 days）",
+                message="Could not identify a query intent in your message. Please rephrase (e.g. \"revenue by region last 7 days\").",
                 explain={"extraction_error": str(e)[:200]},
             )
         timing["layer1_llm_extraction_s"] = round(time.time() - layer1_start, 3)
@@ -132,7 +132,7 @@ class QueryOrchestrator:
             return self._make_response(
                 extraction_json=extraction_json.model_dump(), status="early_exit",
                 session_id=ctx.session_id,
-                message="您目前没有输入任何表、指标或查询条件，无法生成 SQL 哦",
+                message="You have not entered any table, metric or query condition, so no SQL can be generated.",
             )
 
         # 5. Follow-up 路径
@@ -258,7 +258,7 @@ class QueryOrchestrator:
             return self._make_response(
                 extraction_json=extraction_json.model_dump(), status="early_exit",
                 session_id=ctx.session_id,
-                message="无法确定要查询的表，请说明表名或使用已知指标（如销售额/订单量）",
+                message="Could not determine which table to query. Please name a table or use a known metric (e.g. revenue, number of orders).",
                 explain={"resolver_explain": {**resolver_explain, "table_inference": table_infer_explain}},
             )
         query_state.tables = [base_table]
@@ -297,7 +297,7 @@ class QueryOrchestrator:
         ))
 
         if req.chat_id and notify_fn:
-            await notify_fn(req.chat_id, f"SQL 已生成，请查收 👇")
+            await notify_fn(req.chat_id, "SQL generated 👇")
 
         return self._make_response(
             extraction_json=extraction_json.model_dump(),
@@ -389,7 +389,7 @@ class QueryOrchestrator:
         all_confirmed = all(f in task.user_selection for f in task.candidates)
         if not all_confirmed:
             remaining = {f: c for f, c in task.candidates.items() if f not in task.user_selection}
-            hint_msg = f"已确认: {confirmed_values}\n" + self._format_candidates_message(remaining)
+            hint_msg = f"Confirmed: {confirmed_values}\n" + self._format_candidates_message(remaining)
             return self._make_response(
                 extraction_json=task.extraction, status="needs_confirmation",
                 session_id=ctx.session_id, message=hint_msg,
@@ -414,7 +414,7 @@ class QueryOrchestrator:
 
         sql, gen_explain, join_error = await self._generate_sql_from_state(task.raw_query, qs, service)
         if join_error:
-            hint_msg = f"仍无法确定 join 关系: {join_error['missing']}"
+            hint_msg = f"Still unable to determine the join relationship: {join_error['missing']}"
             return self._make_response(
                 extraction_json=task.extraction, status="needs_confirmation",
                 session_id=ctx.session_id, message=hint_msg,
@@ -446,7 +446,7 @@ class QueryOrchestrator:
                 "sql_generation": gen_explain,
             },
             session_id=ctx.session_id, status="success",
-            message=f"已按您的选择生成 SQL: {task.user_selection}",
+            message=f"SQL generated from your selection: {task.user_selection}",
         )
 
     # ==================== 确认任务创建 ====================
@@ -471,7 +471,7 @@ class QueryOrchestrator:
         )
         self.session.update_pending_task(ctx.session_id, task.task_id)
 
-        confirm_msg = self._format_candidates_message(pending_fields) + "\n回复编号或名称即可"
+        confirm_msg = self._format_candidates_message(pending_fields) + "\nReply with a number or a name."
         if req.chat_id and notify_fn:
             await notify_fn(req.chat_id, confirm_msg)
 
@@ -495,10 +495,10 @@ class QueryOrchestrator:
         )
         self.session.update_pending_task(ctx.session_id, task.task_id)
 
-        field_display = {"tables": "表", "metrics": "指标"}.get(field_name, field_name)
-        lines = [f"请选择{field_display}:"]
-        lines += [f"  {i}. {c['value']} (匹配度 {c['score']:.0f}%)" for i, c in enumerate(resolved_result.candidates[:5], 1)]
-        lines.append("回复编号或名称即可")
+        field_display = {"tables": "table", "metrics": "metric"}.get(field_name, field_name)
+        lines = [f"Please choose a {field_display}:"]
+        lines += [f"  {i}. {c['value']} (match {c['score']:.0f}%)" for i, c in enumerate(resolved_result.candidates[:5], 1)]
+        lines.append("Reply with a number or a name.")
 
         return self._make_response(
             extraction_json=extraction_json.model_dump(), status="needs_confirmation",
@@ -522,7 +522,7 @@ class QueryOrchestrator:
             return self._make_response(
                 extraction_json=extraction_json.model_dump(), status="early_exit",
                 session_id=ctx.session_id,
-                message=f"无法确定 {join_error['missing']} 与主表的关联关系，请在 schema 配置中补充 joins",
+                message=f"Cannot determine how {join_error['missing']} relates to the base table. Please add the join to the schema config.",
                 explain={"resolver_explain": resolver_explain},
             )
 
@@ -534,9 +534,9 @@ class QueryOrchestrator:
         )
         self.session.update_pending_task(ctx.session_id, task.task_id)
 
-        lines = [f"表 {query_state.tables[0]} 与 {', '.join(join_error['missing'])} 之间未配置直接 join，请选择关联表:"]
+        lines = [f"No direct join is configured between table {query_state.tables[0]} and {', '.join(join_error['missing'])}. Please choose a bridging table:"]
         lines += [f"  {i}. {c['value']}" for i, c in enumerate(candidates[:5], 1)]
-        lines.append("回复编号或名称即可")
+        lines.append("Reply with a number or a name.")
 
         return self._make_response(
             extraction_json=extraction_json.model_dump(), status="needs_confirmation",
@@ -741,9 +741,9 @@ class QueryOrchestrator:
         """过滤列无法可靠解析 → 澄清（不静默猜列）。early_exit 通道，网关会把 message 回给用户。"""
         parts = []
         for u in unresolved:
-            hint = f"（相近的列: {', '.join(u['candidates'])}）" if u["candidates"] else ""
+            hint = f" (similar columns: {', '.join(u['candidates'])})" if u["candidates"] else ""
             parts.append(f"'{u['text']}'{hint}")
-        msg = ("无法把以下过滤条件对应到已知的列，请换个说法或直接使用列名: "
+        msg = ("Could not map the following filters to a known column. Please rephrase or use a column name: "
                + "; ".join(parts))
         self.session.add_message(ctx.session_id, "user", text, metadata={"error": "unresolved_filter_column"})
         return self._make_response(
@@ -942,17 +942,17 @@ class QueryOrchestrator:
 
     def _format_candidates_message(self, pending_fields: dict) -> str:
         """格式化候选提示消息"""
-        field_display_map = {"tables": "表", "metrics": "指标", "join": "关联表"}
+        field_display_map = {"tables": "table", "metrics": "metric", "join": "bridging table"}
         lines = []
         for field_name, cands in pending_fields.items():
-            lines.append(f"请选择{field_display_map.get(field_name, field_name)}:")
+            lines.append(f"Please choose a {field_display_map.get(field_name, field_name)}:")
             for i, c in enumerate(cands[:5], 1):
-                lines.append(f"  {i}. {c['value']} (匹配度 {c['score']:.0f}%)")
+                lines.append(f"  {i}. {c['value']} (match {c['score']:.0f}%)")
         return "\n".join(lines)
 
     def _format_unmatched_message(self, candidates: dict) -> str:
         """格式化未匹配候选的消息"""
-        lines = ["未能识别您的选择，请回复编号或名称:"]
+        lines = ["Could not recognize your choice. Reply with a number or a name:"]
         lines.append(self._format_candidates_message(candidates))
         return "\n".join(lines)
 
@@ -962,7 +962,7 @@ class QueryOrchestrator:
         return self._make_response(
             extraction_json=extraction_json.model_dump() if hasattr(extraction_json, "model_dump") else extraction_json,
             status="early_exit", session_id=ctx.session_id,
-            message=f"无法生成通过校验的 SQL，请换个说法再试。原因: {reason}",
+            message=f"Could not generate SQL that passes validation. Please rephrase and try again. Reason: {reason}",
             explain={"resolver_explain": resolver_explain or {}, "sql_generation": gen_explain},
         )
 

@@ -54,17 +54,17 @@ Gateway
 ## Example Session
 
 ```text
-Q1: 近7天各地区的销售额
+Q1: Revenue by region for the last 7 days
 -> SELECT users.region AS region, sum(orders.amount) AS revenue
    FROM orders JOIN users ON orders.user_id = users.id
    WHERE orders.created_at >= now() - INTERVAL 7 DAY
    GROUP BY users.region ORDER BY revenue DESC LIMIT 100
 
-Q2: 改成只看VIP用户，每个地区前3
--> patch: filters += [users.vip_level = 'vip'], window = {users.region, top 3}
--> SELECT users.region, sum(orders.amount) AS revenue
+Q2: only gold members, top 3 per region
+-> patch: filters += [users.vip_level = 'gold'], window = {users.region, top 3}
+-> SELECT users.region AS region, sum(orders.amount) AS revenue
    FROM orders JOIN users ON orders.user_id = users.id
-   WHERE users.vip_level = 'vip' AND orders.created_at >= now() - INTERVAL 7 DAY
+   WHERE users.vip_level = 'gold' AND orders.created_at >= now() - INTERVAL 7 DAY
    GROUP BY users.region ORDER BY revenue DESC LIMIT 3 BY users.region
 ```
 
@@ -158,7 +158,7 @@ MESSAGE_BUS_BACKEND=redis docker-compose up --build
 
 ```bash
 curl -X POST localhost:8000/nl2sql -H 'Content-Type: application/json' -d '{
-  "text": "近7天各地区的销售额",
+  "text": "Revenue by region for the last 7 days",
   "project_id": 55
 }'
 ```

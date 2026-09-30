@@ -200,7 +200,7 @@ def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> Analy
     used_tables = {t.name for t in qualified.find_all(exp.Table)}
     unknown_tables = used_tables - set(ctx.tables_columns)
     if unknown_tables:
-        result.errors.append(f"unknown_table: {sorted(unknown_tables)} 不在 schema 白名单")
+        result.errors.append(f"unknown_table: {sorted(unknown_tables)} is not in the schema whitelist")
 
     required_tables = {intent.get("base_table")} - {None}
     for j in intent.get("joins", []):
@@ -208,12 +208,12 @@ def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> Analy
     required_tables -= {None}
     missing_tables = required_tables - used_tables
     if missing_tables:
-        result.errors.append(f"missing_table: 意图要求的表未出现在 SQL 中: {sorted(missing_tables)}")
+        result.errors.append(f"missing_table: tables required by the intent do not appear in the SQL: {sorted(missing_tables)}")
     extra_tables = used_tables - required_tables
     if extra_tables:
         result.warnings.append({
             "code": "extra_table", "tables": sorted(extra_tables),
-            "message": "SQL 引用了意图之外的表（可能是多余 join）",
+            "message": "SQL references tables outside the intent (possibly an extra join)",
         })
 
     # ==================== 列存在性 ====================
@@ -222,14 +222,14 @@ def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> Analy
         if table is None or table not in ctx.tables_columns:
             continue
         if col.name not in ctx.tables_columns[table]:
-            result.errors.append(f"unknown_column: {table}.{col.name} 不在 schema 中")
+            result.errors.append(f"unknown_column: {table}.{col.name} is not in the schema")
 
     # ==================== join 一致性 ====================
     joins = list(qualified.find_all(exp.Join))
     for join in joins:
         on = join.args.get("on")
         if on is None:
-            result.errors.append("cartesian_join: JOIN 缺少 ON 条件")
+            result.errors.append("cartesian_join: JOIN has no ON condition")
             continue
         on_cols = [c for c in on.find_all(exp.Column)]
         on_tables = {_resolve_table(c, alias_map) for c in on_cols}
@@ -237,7 +237,7 @@ def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> Analy
         if len(on_tables) >= 2:
             pair = frozenset(list(on_tables)[:2])
             if pair not in ctx.join_pairs:
-                result.errors.append(f"undeclared_join_edge: {sorted(pair)} 不在 schema joins 配置中")
+                result.errors.append(f"undeclared_join_edge: {sorted(pair)} is not in the schema joins config")
                 continue
             qualified_cols = [c for c in on_cols if _resolve_table(c, alias_map)]
             if len(qualified_cols) == 2:
@@ -246,7 +246,7 @@ def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> Analy
                 )
                 if key_pair not in ctx.join_key_pairs:
                     result.errors.append(
-                        f"join_key_mismatch: ON {sorted(key_pair)} 与 schema 声明的 join 条件不一致"
+                        f"join_key_mismatch: ON {sorted(key_pair)} does not match the join condition declared in the schema"
                     )
 
     # ==================== 实体保真 ====================
@@ -258,7 +258,7 @@ def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> Analy
         needle = _norm(m.get("expr", ""))
         if needle and needle not in all_nodes_norm:
             result.errors.append(
-                f"missing_metric_expr: 指标 {m.get('id')} 的表达式 {m.get('expr')} 未出现在 SQL 中"
+                f"missing_metric_expr: expression {m.get('expr')} of metric {m.get('id')} does not appear in the SQL"
             )
 
     ast_predicates = _collect_predicates(qualified, alias_map)
@@ -266,7 +266,7 @@ def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> Analy
         needle = _predicate_key(f.get("column", ""), f.get("op", "="), f.get("value"))
         if needle and needle not in ast_predicates:
             result.errors.append(
-                f"missing_filter: 过滤条件 {f.get('column')} {f.get('op')} {f.get('value')} 未出现在 SQL 中"
+                f"missing_filter: filter {f.get('column')} {f.get('op')} {f.get('value')} does not appear in the SQL"
             )
 
     # ==================== 时间过滤（成本相关警告）====================
@@ -280,7 +280,7 @@ def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> Analy
         if not has_time:
             result.warnings.append({
                 "code": "missing_time_filter",
-                "message": f"{base}.{time_col} 未被任何条件引用，可能全表扫描",
+                "message": f"{base}.{time_col} is not referenced by any condition; possible full table scan",
             })
 
     # ==================== GROUP BY 一致性（CK 宽松，仅警告）====================
@@ -299,7 +299,7 @@ def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> Analy
                     seen_group_warnings.add(col_norm)
                     result.warnings.append({
                         "code": "non_grouped_column", "column": col_norm,
-                        "message": f"非聚合列 {col_norm} 不在 GROUP BY 中（ClickHouse 宽松，但通常非本意）",
+                        "message": f"non-aggregated column {col_norm} is not in GROUP BY (ClickHouse allows it, but it is usually unintended)",
                     })
 
     # ==================== 静态成本 ====================
@@ -320,20 +320,20 @@ def analyze_sql(sql: str, ctx: AnalysisContext, intent: Dict[str, Any]) -> Analy
             if not referenced:
                 result.warnings.append({
                     "code": "full_scan_on_fact_table", "table": t,
-                    "message": f"大表 {t}({ctx.est_rows[t]} 行) 的时间列 {t_time} 未被过滤，存在全表扫描风险",
+                    "message": f"large table {t} ({ctx.est_rows[t]} rows): time column {t_time} is not filtered; full scan risk",
                 })
 
     if scanned > _LARGE_SCAN_ROWS:
         result.warnings.append({
             "code": "large_scan", "estimated_rows": scanned,
-            "message": f"估算扫描量约 {scanned:,} 行（无选择率折减），建议确认时间/过滤条件",
+            "message": f"estimated scan of about {scanned:,} rows (no selectivity reduction); consider checking time/filter conditions",
         })
     if join_count > _MAX_JOINS:
         result.warnings.append({"code": "too_many_joins", "join_count": join_count,
-                                "message": f"join 数量 {join_count} 超过 {_MAX_JOINS}"})
+                                "message": f"join count {join_count} exceeds {_MAX_JOINS}"})
     if subquery_count > _MAX_SUBQUERY_DEPTH:
         result.warnings.append({"code": "deep_nesting", "subquery_count": subquery_count,
-                                "message": f"子查询嵌套 {subquery_count} 层，超过 {_MAX_SUBQUERY_DEPTH}"})
+                                "message": f"subquery nesting depth {subquery_count} exceeds {_MAX_SUBQUERY_DEPTH}"})
 
     result.cost = {
         "estimated_rows_scanned": scanned,
