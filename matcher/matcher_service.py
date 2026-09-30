@@ -25,8 +25,19 @@ class ResolvedResult:
 
 
 # 需要确认的置信度区间
-_CONFIRM_SCORE_HIGH = 80.0
-_CONFIRM_SCORE_LOW = 40.0
+# 按实体类型校准的确认阈值：(auto_accept_high, confirm_low)
+# metric 错配代价最高（口径错则数字全错）→ auto-accept 收紧到 90；
+# table/column 的模糊命中大多是前缀/复数形态，80 即可
+_TYPE_CONFIRM_SCORES = {
+    MatcherType.TABLE: (80.0, 40.0),
+    MatcherType.METRIC: (90.0, 40.0),
+    MatcherType.COLUMN: (80.0, 40.0),
+}
+_DEFAULT_CONFIRM_SCORES = (80.0, 40.0)
+
+# top1 领先第二名不足该分值时，即使过 auto-accept 线也进确认流
+# （确定性并列歧义检测，如 orders/products 各 90 分的并列场景）
+_TIE_MARGIN = 10.0
 
 
 class MatcherService:
@@ -51,14 +62,20 @@ class MatcherService:
     # ==================== 带候选的解析方法 ====================
 
     def resolve_with_candidates(
-        self, matcher_type: MatcherType, extractions: list, default: Optional[str] = None
+        self, matcher_type: MatcherType, extractions: list, default: Optional[str] = None,
+        base_table: Optional[str] = None,
     ) -> ResolvedResult:
         """从 LLM 提取结果中解析，返回完整候选和置信度
 
-        判断规则（确定性代码，不依赖 LLM）：
-        - score >= 80 → 直接用，不需确认
-        - score 在 40-80 → 需要用户确认
-        - score < 40 → 直接用 default，不确认（候选太模糊没价值）
+        exact 别名冲突（同名别名命中多实体）的消歧策略：
+        - 仅列冲突且恰为两路、且有基表上下文时：按 join 图距离唯一最近者确定性胜出
+          （revenue 语境下 "region" -> users.region，1 跳 vs sellers 2 跳）
+        - >=3 路（time/date/id 这类超泛化词）或无基表/距离并列 -> 确认流
+
+        判断规则（确定性代码，不依赖 LLM，阈值按实体类型校准）：
+        - score >= 类型 auto-accept 线 且领先第二名 >= 10 分 → 直接用
+        - 分数在确认带内（或与第二名并列）→ 需要用户确认
+        - score < 确认带下限 → 直接用 default，不确认（候选太模糊没价值）
         """
         if not extractions:
             return ResolvedResult(
@@ -73,17 +90,43 @@ class MatcherService:
         result = matcher.match(query_text)
         candidates = self._extract_candidates(result)
 
+        # exact 冲突：确定性消歧（两路 + 基表上下文 + 唯一最近），否则进确认流
+        if result.explain.get("method") == "exact_alias_collision":
+            candidates = [
+                {"value": c["name"], "score": float(c["score"])}
+                for c in result.explain.get("collision_candidates", [])
+            ]
+            resolved = self._resolve_exact_collision(matcher_type, base_table, candidates)
+            if resolved is not None:
+                return ResolvedResult(
+                    value=resolved, score=100.0,
+                    method="exact_collision_distance_resolved",
+                    candidates=candidates, needs_confirmation=False,
+                )
+            return ResolvedResult(
+                value=default or "", score=100.0,
+                method="exact_alias_collision",
+                candidates=candidates, needs_confirmation=True,
+            )
+
+        high, low = _TYPE_CONFIRM_SCORES.get(matcher_type, _DEFAULT_CONFIRM_SCORES)
+        # 并列歧义：top1 与 top2 分差过小（exact 命中无候选列表，不受影响）
+        tied = (
+            len(candidates) >= 2
+            and float(candidates[1].get("score", 0.0)) >= result.score - _TIE_MARGIN
+        )
+
         if result.matched:
-            if result.score >= _CONFIRM_SCORE_HIGH:
+            if result.score >= high and not tied:
                 return ResolvedResult(
                     value=result.matched, score=result.score,
                     method="exact" if result.score == 100.0 else "fuzzy",
                     candidates=candidates, needs_confirmation=False,
                 )
-            elif result.score >= _CONFIRM_SCORE_LOW:
+            elif result.score >= low or tied:
                 return ResolvedResult(
                     value=result.matched, score=result.score,
-                    method="fuzzy_low_confidence",
+                    method="fuzzy_tied" if tied and result.score >= high else "fuzzy_low_confidence",
                     candidates=candidates, needs_confirmation=True,
                 )
             else:
@@ -93,7 +136,7 @@ class MatcherService:
                     candidates=candidates, needs_confirmation=False,
                 )
         else:
-            if candidates and result.score >= _CONFIRM_SCORE_LOW:
+            if candidates and result.score >= low:
                 return ResolvedResult(
                     value=default or "", score=result.score,
                     method="below_threshold",
@@ -186,6 +229,48 @@ class MatcherService:
         }
         return steps, explain
 
+    # ==================== exact 冲突消歧 ====================
+
+    def _resolve_exact_collision(
+        self, matcher_type: MatcherType, base_table: Optional[str], candidates: List[Dict[str, Any]]
+    ) -> Optional[str]:
+        """两路列冲突 + 基表上下文 → join 图距离唯一最近者胜出；其余情况返回 None（确认流）"""
+        if matcher_type != MatcherType.COLUMN or base_table is None or len(candidates) != 2:
+            return None
+        dists = []
+        for c in candidates:
+            table = str(c["value"]).split(".")[0]
+            d = self._join_distance(base_table, table)
+            if d is None:
+                return None  # 不可达（无声明 join 路径）→ 不猜
+            dists.append((d, str(c["value"])))
+        dists.sort()
+        if dists[0][0] < dists[1][0]:
+            return dists[0][1]
+        return None  # 距离并列 → 确认流
+
+    def _join_distance(self, from_table: str, to_table: str, max_hops: int = 4) -> Optional[int]:
+        """join 图 BFS 距离（同表 0；不可达 None）"""
+        if from_table == to_table:
+            return 0
+        graph = self.schema.join_graph
+        visited = {from_table}
+        frontier = [from_table]
+        for hop in range(1, max_hops + 1):
+            nxt = []
+            for t in frontier:
+                for edge in graph.get(t, []):
+                    peer = edge["peer"]
+                    if peer == to_table:
+                        return hop
+                    if peer not in visited:
+                        visited.add(peer)
+                        nxt.append(peer)
+            frontier = nxt
+            if not frontier:
+                break
+        return None
+
     # ==================== 查询辅助 ====================
 
     def get_metric_expr(self, metric_id: str) -> str:
@@ -218,8 +303,9 @@ class MatcherService:
                 for c in top5
             ]
         if top_recall:
+            # 优先用 IDF 加权分排序，兼容旧 explain 只有 hit_count 的场景
             return [
-                {"value": c["name"], "score": float(c.get("hit_count", 0))}
+                {"value": c["name"], "score": float(c.get("score", c.get("hit_count", 0)))}
                 for c in top_recall[:5]
             ]
         return []

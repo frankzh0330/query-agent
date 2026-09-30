@@ -206,8 +206,12 @@ def _assert_expectations(body: dict, expect: dict, gen_mock: mock.AsyncMock | No
     if "order_limit" in intent_expect:
         assert resolved["order_by"]["limit"] == intent_expect["order_limit"]
     if "window_group" in intent_expect:
+        assert resolved.get("window") is not None, (
+            f"window intent missing (window_group={intent_expect['window_group']})"
+        )
         assert resolved["window"]["group_by"] == intent_expect["window_group"]
     if "window_limit" in intent_expect:
+        assert resolved.get("window") is not None, "window intent missing"
         assert resolved["window"]["limit"] == intent_expect["window_limit"]
     if "filter_column" in intent_expect:
         assert resolved["filters"][0]["column"] == intent_expect["filter_column"]

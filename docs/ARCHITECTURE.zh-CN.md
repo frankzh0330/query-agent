@@ -23,7 +23,8 @@
 │                       NL2SQL Pipeline                       │
 │   llm_extractions.py                                        │
 │   matcher_service.py + table/column/metric matchers         │
-│   sql_generator.py · sql_validator.py                       │
+│   reranker.py（可选）                                       │
+│   sql_generator.py · sql_validator.py · sql_ast_analyzer.py │
 ├──────────────────────────────────────────────────────────────┤
 │                        Memory Layer                         │
 │   long_term_memory.py · memory_writer.py                    │
@@ -85,7 +86,8 @@ flowchart TD
     R --> S1
     S1 --> J["Join 推断 (schema 配置)"]
     J --> G["LLM SQL 生成<br/>(ClickHouse, grounded)"]
-    G --> V["sqlglot 校验"]
+    G --> V["sqlglot 校验<br/>+ AST 分析"]
+    V -->|"失败: 错误回灌"| G
     V --> O["ClickHouse SQL"]
     V --> ML["Async MemoryWriter"]
 ```
@@ -130,19 +132,22 @@ flowchart TD
 主要文件：[matcher/matcher_service.py](../matcher/matcher_service.py) 及具体 matcher
 （[table_matcher.py](../matcher/table_matcher.py)、[column_matcher.py](../matcher/column_matcher.py)、
 [sql_metric_matcher.py](../matcher/sql_metric_matcher.py)、[time_matcher.py](../matcher/time_matcher.py)），
-全部构建在 [matcher/base.py](../matcher/base.py)（倒排索引 + RapidFuzz + 同义词）之上，
+全部构建在 [matcher/base.py](../matcher/base.py)（IDF 加权倒排索引 + edit-distance typo 探测 + RapidFuzz 重排 + 同义词）之上，
 元数据来自 [matcher/schema_loader.py](../matcher/schema_loader.py)。
 
 职责：
 
 - 解析 `table / table.column / metric_id / time_range`，带分数与候选
-- 阈值策略（确定性，不依赖 LLM）：≥ 80 直接用，40-80 触发确认，< 40 丢弃/回退
+- 阈值策略（确定性，不依赖 LLM），按实体类型校准：metric ≥ 90 直接用（指标错则数字全错），table/column ≥ 80；确认带内触发用户确认，< 40 丢弃/回退；并列守卫在 top1/top2 分差 <10 时即使过线也进确认
+- 召回为 IDF 加权（BM25-lite）：命中数打平时判别性 token 胜过泛化 token（table/amount/id）；零命中且 ≥4 字符的 token 做 edit-distance-1 词表探测（'orde tablez' -> orders），权重 0.75 折
+- exact 别名冲突（同一别名挂多个实体，如 amount 在 orders/payments、time 在三张表）建索引时检测、查询时暴露：两路列冲突且有基表上下文时按 join 图距离确定性消歧（orders 语境下 region -> users.region）；3 路超泛化词或距离并列升级确认流并给出全部候选——绝不静默 first-wins
 - 用户不提表名时推断主表（从指标表达式或列归属投票）
 - 从声明式 `joins:` 配置推断 join 步骤；路径缺失升级为确认流
 
 重要细节：
 
 - user preference 只在 recall 后做小幅 rerank
+- 可选的受限 LLM 重排（[service/reranker.py](../service/reranker.py)，`RERANKER_ENABLED=true`）只在低置信带触发：只能对已有候选重排、不得发明新值，明确胜出（relevance ≥ 85 且 margin ≥ 15）才静默采纳
 - matcher 本身仍然是主要语义解析器
 
 ### Layer 3：SQL Generation
@@ -153,18 +158,25 @@ flowchart TD
 
 - 用已解析实体组装生成 prompt：主表、指标表达式、限定列、过滤条件、
   ClickHouse 时间谓词、join 条件、window/order 意图
+- window 意图兜底：L1 截断窗口短语时（如只抽到 "in each region"，"top 3" 留在原句），
+  用完整查询文本重试解析，确定性找回 limit 与分组（explain 记录 `recovered_from_full_text`）
 - LLM 只组装结构（GROUP BY / JOIN / `LIMIT n BY` 分组排名），实体名由 prompt 固定
 - 修复循环：校验失败的错误信息回灌下一轮（最多额外 2 轮）
 
 ### Layer 4：Validation
 
-主要文件：[service/sql_validator.py](../service/sql_validator.py)（sqlglot，`dialect="clickhouse"`）
+主要文件：[service/sql_validator.py](../service/sql_validator.py)（sqlglot，`dialect="clickhouse"`）和
+[service/sql_ast_analyzer.py](../service/sql_ast_analyzer.py)
 
 职责：
 
 - 单条只读语句（仅 SELECT / WITH）
 - 所有表引用必须在 schema 白名单内
 - 默认 LIMIT 注入
+- AST 分析：列存在性（别名解析后）、join 边与 ON 键必须与声明的 `joins:` 一致、JOIN 缺 ON 报错
+- 实体保真（对抗语义漂移）：已解析的表、指标表达式、过滤谓词必须出现在 SQL 中
+- 静态成本警告（扫描量估算、事实表无条件全表扫描、join 深度），只写入 explain
+- 分析错误与校验错误一样回灌修复循环；警告不阻断
 - 确定性护栏，独立于 LLM
 
 ## Turn-Based Querying
@@ -206,15 +218,15 @@ flowchart TD
 它能支持这类多轮查询：
 
 ```text
-Q1: 近7天各地区的销售额
-Q2: 昨天
-Q3: 改成订单量
-Q4: 再按品类拆一下
-Q5: 只看VIP用户
-Q6: 每个地区前3
+Q1: Revenue by region for the last 7 days
+Q2: Yesterday
+Q3: Change it to order count
+Q4: Break it down by category
+Q5: Only gold members
+Q6: Top 3 per region
 ```
 
-而不要求用户每轮都把所有字段重说一遍。
+而不要求用户每轮都把所有字段重说一遍。（demo schema 只有英文别名，示例查询均用英文。）
 
 ## Memory 架构
 
@@ -362,7 +374,7 @@ Session 和 Task 分开持久化：
 ```json
 POST /nl2sql
 {
-  "text": "近7天各地区的销售额",
+  "text": "Revenue by region for the last 7 days",
   "project_id": 55
 }
 ```
@@ -382,7 +394,7 @@ POST /nl2sql
 ```json
 POST /nl2sql
 {
-  "text": "改成订单量",
+  "text": "Change to order count",
   "project_id": 55,
   "session_id": "abc-123"
 }
@@ -398,8 +410,8 @@ POST /nl2sql
 ### 场景 3：纯时间 Follow-Up
 
 ```text
-Q1: 近7天各地区的销售额
-Q2: 昨天
+Q1: Revenue by region for the last 7 days
+Q2: Yesterday
 ```
 
 预期行为：
@@ -416,7 +428,7 @@ Q2: 昨天
 ```json
 POST /nl2sql
 {
-  "text": "商品表的销售额",
+  "text": "Show revenue for the product table",
   "project_id": 55
 }
 ```
@@ -453,10 +465,10 @@ POST /nl2sql
 
 ```text
 Project memory:
-在 project_55 中，activation 默认指 activation_success。
+In this project, "big orders" means orders with amount greater than 1000.
 
 User query:
-昨天 activation 的 PV
+Show me big orders
 ```
 
 预期行为：
@@ -473,7 +485,7 @@ User history:
 user_a 在 project_55 中经常使用 order_count。
 
 Current query:
-销售额情况（低置信，候选 revenue/order_count 接近）。
+一个低置信的 sales 查询（候选 revenue/order_count 分数接近）。
 ```
 
 预期行为：
@@ -522,25 +534,32 @@ Turn 2: 用户回复 "1"
 - [tests/evals/nl2sql_cases.yaml](../tests/evals/nl2sql_cases.yaml)
 - [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
 
-当前覆盖包括：
-
-- basic new query
-- follow-up patch
-- follow-up + confirmation
-- project memory injection
-- restart + confirmation recovery
+当前覆盖：45 条用例、9 组（单表、join、多跳 join、时间表达式、过滤、歧义、window/TopN、follow-up、负例）。
+用例清单和 strict xfail 已知缺口见 [EVALUATION.zh-CN.md](EVALUATION.zh-CN.md)。
 
 这套 harness 更接近“golden cases”，而不是单纯 unit test。
+
+pytest harness 对 LLM 抽取和 SQL 生成做了 mock，评测的是 matcher 解析、状态合并、确认流以及传给 SQL 生成的入参，离线几秒即可跑完。
+带 `xfail` 的 case 断言的是已知局限下的*正确行为*（strict，一旦修复会强制去掉标记）。
+
+### Live LLM Eval
+
+[scripts/live_eval.py](../scripts/live_eval.py) 用真实 LLM 重放同一批 case，输出每条 case 的通过情况、SQL 静态校验结果、
+解析出的指标表达式是否出现在 SQL 中，以及延迟。它测的是 mock 版测不到的部分（抽取和 SQL 质量）。
+LLM 输出每次会有波动，所以结果只是一次采样，不是稳定的准确率；"SQL 有效"也不等于"SQL 正确"。
 
 ## Schema 与 Metadata
 
 仓库里的 [catalog/sql_schema.yaml](../catalog/sql_schema.yaml) 是 demo/development 态输入
-（表/列/指标别名 + 声明式 join + 指标口径表达式）。
+（表/列/指标别名 + 声明式 join + 指标口径表达式）。别名只有英文，demo 查询需要用英文提问。
 
 更接近生产的方向是：
 
 - 表/列/指标 metadata 从公司 metadata service（或 INFORMATION_SCHEMA）定时同步
 - 同步后调用 `load_sql_schema()` 热重建 matcher 索引
+- 当前未实现同步调度器：demo 态 schema 在 server 启动时一次性加载（`server.py` lifespan），
+  更新 YAML 需重启进程；热重建接缝已就绪（`load_sql_schema()` → 重建 `MatcherService` →
+  `set_matcher_service()` 热替换）
 - 查询执行（只读账号、超时、成本上限）与结果渲染属于下游层，不在本 Demo 范围
 
 这一点重要，因为真实环境可能会有：
@@ -548,6 +567,45 @@ Turn 2: 用户回复 "1"
 - 数万级表和列
 - 每个列多个业务别名
 - 强项目语义和业务约束
+
+## 过滤值解析
+
+像 "paid by credit card" 这样的过滤条件要解析两部分：**列**（`payments.payment_type`）和**值**（`credit_card`）。
+LLM 只负责摘录用户原话，所以抽出来的值（`credit card`）和库里存的值往往不一致。
+这一步出错会得到"能通过静态校验，但查不到数据或查错数据"的 SQL，真实 LLM eval 里就暴露过（见 [Evaluation 策略](#evaluation-策略)）。
+
+### 本项目当前做法
+
+- **列**：[orchestrator](../service/query_orchestrator.py) 只接受高置信匹配（score >= 80）的过滤列。低置信或未匹配的列不再从召回列表里取 top1 去猜，
+  而是返回 `early_exit` 并列出相近的列，让用户换个说法。（此前被捏造出的 `user_type` 会被模糊匹配成 `orders.user_id`。）
+- **值**：列可以在 [catalog/sql_schema.yaml](../catalog/sql_schema.yaml) 中声明 `enum_values`。
+  `SQLSchema.normalize_enum_value()` 用确定性规则把抽出的值映射成声明值：精确匹配，其次忽略大小写/空格/连字符
+  （`Credit-Card` -> `credit_card`），再其次 RapidFuzz >= 90（`cancelled` -> `canceled`）。完全匹配不上的值原样透传，
+  并记录在 `explain` 中，不阻断查询。
+
+### 为什么手写 enum 不能扩展
+
+`enum_values` 只适合低基数且稳定的列（`status`、`payment_type`、`vip_level`）。
+高基数或会变化的列（品牌、城市、商品名）不适用，真实数仓也没人能为每一列手写并维护取值列表。它是 demo 规模下的取舍。
+
+### 生产系统的常见做法
+
+| 做法 | 思路 | 参考 |
+|---|---|---|
+| 缓存高频取值 + 模糊匹配 | 按基数/类型筛出可搜索的文本列，缓存最高频的取值，用编辑距离匹配过滤条件，并用 LLM 生成同义词和缩写 | [SQLGenie (ACL 2025 Industry)](https://aclanthology.org/2025.acl-industry.71.pdf) |
+| 给全部取值建索引 | LSH 加语义向量，分层检索，只把相关的取值子集交给 LLM（离线建索引，在线检索） | [CHESS](https://scalingintelligence.stanford.edu/pubs/CHESSpaper.pdf)、[XiYan-SQL](https://arxiv.org/pdf/2411.08599)、[DeepEye-SQL](https://arxiv.org/pdf/2510.17586) |
+| prompt 里放样例值 | 低基数分类列放 3-5 个代表值 | [DexterSQL](https://arxiv.org/pdf/2608.11889) |
+| 语义层维护别名 | 由人维护指标、维度和取值的别名/同义词，并配黄金查询回归测试 | [Semantic Layers Make Enterprise Text-to-SQL Safer](https://datalakehousehub.com/blog/2026-05-semantic-layers-text-to-sql/)、[dbt: Semantic Layer vs. Text-to-SQL](https://docs.getdbt.com/blog/semantic-layer-vs-text-to-sql-2026) |
+
+实际往往组合使用：低基数列用样例值或缓存列表，高基数列用取值索引，业务词汇放在语义层。
+
+公开资料对运维细节说得很少（取值随时间变化如何刷新、歧义值如何和用户确认）。这些应视为待设计的问题，不能当作行业既定做法。
+
+### 本项目的演进方向
+
+把手写的 `enum_values` 换成从数仓同步的取值（每个符合条件的列取 distinct/top-K，与 metadata 同步使用同一个刷新周期），
+保留 `normalize_enum_value()` 作为确定性的第一道处理，对高基数列再加 embedding 或 LSH 取值索引。
+有歧义或匹配不上的值应走确认流，而不是原样透传。
 
 ## 演进路线
 

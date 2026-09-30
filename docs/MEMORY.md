@@ -1,6 +1,8 @@
-# Memory Architecture
+---
+title: "Memory Architecture"
+---
 
-[English](MEMORY.md) | [Chinese](MEMORY.zh-CN.md)
+[Chinese version](https://github.com/frankzh0330/query-agent/blob/master/docs/MEMORY.zh-CN.md)
 
 This document explains the memory design in `query-agent`, why the project needs more than one kind of memory, and how the current implementation maps to that model.
 
@@ -42,9 +44,9 @@ Session memory stores the short-lived state of the current conversation:
 
 ### Where It Lives
 
-- [service/session_models.py](../service/session_models.py)
-- [service/session_manager.py](../service/session_manager.py)
-- [service/task_manager.py](../service/task_manager.py)
+- [service/session_models.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_models.py)
+- [service/session_manager.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_manager.py)
+- [service/task_manager.py](https://github.com/frankzh0330/query-agent/blob/master/service/task_manager.py)
 
 ### Why It Exists
 
@@ -53,7 +55,7 @@ It solves turn-based continuity:
 ```text
 Q1: Revenue by region for the last 7 days
 Q2: Yesterday
-Q3: Change it to UV
+Q3: Change it to order count
 ```
 
 Without session memory, the agent would have to re-infer all fields every turn.
@@ -71,7 +73,7 @@ Without session memory, the agent would have to re-infer all fields every turn.
 
 Project memory stores project-scoped business knowledge:
 
-- default event mappings
+- default table/metric mappings
 - business constraints
 - domain corrections
 - dimension/property caveats
@@ -79,13 +81,13 @@ Project memory stores project-scoped business knowledge:
 
 Examples:
 
-- "In project_55, activation should map to activation_success by default"
-- "In this project, country should prefer profile.country"
-- "Some query types should exclude internal traffic by default"
+- "In this project, "big orders" means orders with amount greater than 1000"
+- "The 'transaction table' in this project maps to orders" (a real auto-learned entry)
+- "Revenue queries should exclude canceled orders by default"
 
 ### Where It Lives
 
-- [memory/long_term_memory.py](../memory/long_term_memory.py)
+- [memory/long_term_memory.py](https://github.com/frankzh0330/query-agent/blob/master/memory/long_term_memory.py)
 - runtime files under `data/memory/project_{id}/`
 
 ### Why It Exists
@@ -128,19 +130,19 @@ The current implementation also does lightweight relevance selection:
 
 User preference stores lightweight usage patterns such as:
 
-- frequent events
+- frequent tables
 - frequent metrics
-- frequent group-by dimensions
+- frequent columns (including group-by columns)
 
 Examples:
 
-- user A often checks `payment_submit`
-- user A usually prefers `uv`
-- user A often groups by `channel`
+- user A often checks `refund_rate`
+- user A usually prefers `order_count`
+- user A often groups by `orders.channel`
 
 ### Where It Lives
 
-- [memory/user_preference_store.py](../memory/user_preference_store.py)
+- [memory/user_preference_store.py](https://github.com/frankzh0330/query-agent/blob/master/memory/user_preference_store.py)
 - runtime files under `data/user_preferences/`
 
 ### Why It Exists
@@ -180,11 +182,11 @@ This prevents overfitting to the user’s history.
 Consider:
 
 ```text
-User history: often checks payment_success
-Current query: Show registration completion
+User history: often checks refund_rate
+Current query: Show the cancellation rate
 ```
 
-If preference is too strong, the system may drift toward payment-related events.
+If preference is too strong, the system may drift toward the user's habitual metric even though this turn asks for something else.
 
 That is why user preference must stay a weak signal.
 
@@ -202,7 +204,7 @@ Bad use:
 Consider this rule:
 
 ```text
-In project_55, activation should mean activation_success by default
+In this project, "big orders" means orders with amount greater than 1000
 ```
 
 This is not:
@@ -325,8 +327,8 @@ usage counters.
 Recommended split:
 
 - `UserAlias`: explicit or learned aliases such as “orders” -> `orders` table
-- `UserPattern`: aggregated top events, metrics, dimensions, regions, and query frequency
-- `UserPreferences`: stable defaults such as preferred metric, region, or time range
+- `UserPattern`: aggregated top tables, metrics, columns, and query frequency
+- `UserPreferences`: stable defaults such as preferred metric, table, or time range
 - `QueryHistory`: durable query traces for replay, evaluation, and pattern learning
 
 Recommended storage:

@@ -1,0 +1,64 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "luma",
+  "name": "Query Agent",
+  "colors": {
+    "primary": "#848c8e",
+    "light": "#11161e",
+    "dark": "#cfd0d2"
+  },
+  "logo": {
+    "light": "https://media.brand.dev/5ffd6ce4-2434-4b4b-920a-f8cacac8b48b.svg",
+    "dark": "https://media.brand.dev/5ffd6ce4-2434-4b4b-920a-f8cacac8b48b.svg"
+  },
+  "favicon": "https://media.brand.dev/2b01fe20-c04b-4a1d-a2f9-1d2789c50a7a.jpg",
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/frankzh0330/query-agent"
+    }
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get Started",
+        "pages": ["introduction", "README"]
+      },
+      {
+        "group": "Core Concepts",
+        "pages": ["ARCHITECTURE", "MEMORY"]
+      },
+      {
+        "group": "Guides",
+        "pages": ["TELEGRAM_TEST", "EVALUATION"]
+      },
+      {
+        "group": "Diagrams",
+        "pages": [
+          "diagrams/architecture",
+          "diagrams/flowchart",
+          "diagrams/sequence",
+          "diagrams/matcher-sequence"
+        ]
+      }
+    ]
+  },
+  "redirects": [
+    { "source": "/quickstart", "destination": "/introduction" },
+    { "source": "/configuration", "destination": "/introduction" },
+    { "source": "/concepts/nl2dsl-pipeline", "destination": "/ARCHITECTURE" },
+    { "source": "/concepts/turn-based-queries", "destination": "/ARCHITECTURE" },
+    { "source": "/concepts/memory-layers", "destination": "/MEMORY" },
+    { "source": "/concepts/confirmation-flow", "destination": "/ARCHITECTURE" },
+    { "source": "/guides/first-query", "destination": "/TELEGRAM_TEST" },
+    { "source": "/guides/multi-turn-sessions", "destination": "/ARCHITECTURE" },
+    { "source": "/guides/project-memory", "destination": "/MEMORY" },
+    { "source": "/guides/telegram-integration", "destination": "/TELEGRAM_TEST" },
+    { "source": "/api/nl2dsl", "destination": "/TELEGRAM_TEST" },
+    { "source": "/api/bearer-query", "destination": "/introduction" },
+    { "source": "/api/sessions", "destination": "/ARCHITECTURE" },
+    { "source": "/api/request-response", "destination": "/ARCHITECTURE" },
+    { "source": "/api/query-state", "destination": "/ARCHITECTURE" },
+    { "source": "/api/status-codes", "destination": "/ARCHITECTURE" }
+  ]
+}

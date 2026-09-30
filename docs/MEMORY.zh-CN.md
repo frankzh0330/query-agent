@@ -54,9 +54,9 @@ Session memory 存当前会话里的短期状态：
 它解决的是 turn-based 连续性：
 
 ```text
-Q1: 近7天各地区的销售额
-Q2: 昨天
-Q3: 改成订单量
+Q1: Revenue by region for the last 7 days
+Q2: Yesterday
+Q3: Change it to order count
 ```
 
 如果没有 session memory，系统每一轮都得重新推断全部字段。
@@ -82,9 +82,9 @@ Project memory 存项目级业务知识：
 
 例子：
 
-- “在 project_55 中，激活默认映射 activation_success”
-- “这个项目里 country 应优先映射 profile.country”
-- “某类查询默认排除 internal traffic”
+- “在这个项目里，"big orders" 指金额大于 1000 的订单”
+- “本项目的'交易表'对应 orders 表”（真实的自动学习记录）
+- “revenue 默认排除已取消订单”
 
 ### 在哪里
 
@@ -137,9 +137,9 @@ User preference 存轻量的使用习惯，例如：
 
 例子：
 
-- user A 经常查 `payment_submit`
-- user A 通常偏好 `uv`
-- user A 经常按 `channel` 分组
+- user A 经常查 `refund_rate`
+- user A 通常偏好 `order_count`
+- user A 经常按 `orders.channel` 分组
 
 ### 在哪里
 
@@ -183,8 +183,8 @@ User preference 存轻量的使用习惯，例如：
 看一个例子：
 
 ```text
-用户历史：经常查 payment_success
-当前 query：看注册完成
+用户历史：经常查 refund_rate
+当前 query：Show the cancellation rate
 ```
 
 如果 preference 权重过强，系统可能会被带向用户常用但本轮不相关的指标。  
@@ -204,7 +204,7 @@ User preference 存轻量的使用习惯，例如：
 看这条规则：
 
 ```text
-在 project_55 中，“激活”默认指 activation_success
+在这个项目里，"big orders" 指金额大于 1000 的订单
 ```
 
 这不是：

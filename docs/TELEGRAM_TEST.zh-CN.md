@@ -25,18 +25,21 @@ python server.py
 ## 测试流程
 
 1. **向 Telegram Bot 发送消息**，例如：
-   - `近7天各地区的销售额`
-   - `改成只看VIP用户`
-   - `每个地区前3`
+   - `Revenue by region for the last 7 days`
+   - `Only paid orders`
+   - `Top 3 per region`
+
+   demo schema 只有英文别名，请用英文提问。
 
 2. **Bot 会返回生成的 SQL 与解析意图**：
 
    ```
-   📄 已生成 ClickHouse SQL
-   表: orders
-   指标: revenue
-   分组: users.region
-   时间: last_n_days n=7
+   📄 ClickHouse SQL generated
+   Table: orders
+   Metrics: revenue
+   Group by: users.region
+   Time: last_n_days n=7
+   📊 Est. scan ~80M rows · join x1 · ✅ No warnings
 
    SELECT users.region AS region, sum(orders.amount) AS revenue
    FROM orders JOIN users ON orders.user_id = users.id
@@ -50,10 +53,10 @@ python server.py
 3. **表名或指标有歧义时，Bot 会发起确认**：
 
    ```
-   请选择表:
-     1. products (匹配度 55%)
-     2. orders (匹配度 48%)
-   回复编号或名称即可
+   Please choose a table:
+     1. products (match 55%)
+     2. orders (match 48%)
+   Reply with a number or a name.
    ```
 
    回复 `1`（或名称）即可继续；待确认任务支持重启后恢复。
@@ -77,7 +80,7 @@ curl http://localhost:8000/sessions
 ```bash
 curl -X POST http://localhost:8000/nl2sql \
   -H "Content-Type: application/json" \
-  -d '{"text": "近7天各地区的销售额", "project_id": 55}'
+  -d '{"text": "Revenue by region for the last 7 days", "project_id": 55}'
 ```
 
 ## 常见问题

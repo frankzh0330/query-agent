@@ -84,6 +84,37 @@
 
 这套 harness 更接近“golden cases”，不是单纯 unit test。
 
+## 用例清单（45 条，9 组）
+
+[tests/evals/nl2sql_cases.yaml](../tests/evals/nl2sql_cases.yaml) 按能力分组：
+
+| 组 | 数量 | 覆盖 |
+|---|---|---|
+| `s*` 单表 | 7 | 聚合、别名命中（gmv/aov）、时间默认 |
+| `j*` join | 6 | 维表列自动 join、多重 join |
+| `m*` 多跳 join | 3 | payments→orders→users 型路径（已知边界） |
+| `t*` 时间表达 | 6 | last week/month/quarter、today、非 orders 表时间列 |
+| `f*` 过滤 | 5 | 枚举值归一（credit card → credit_card）、幻觉列 |
+| `a*` 歧义 | 3 | 同名列、低置信表名 |
+| `w*` 窗口/TopN | 3 | 全局 TopK vs 分组排名（LIMIT n BY） |
+| `u*` follow-up | 9 | 时间/指标/分组/过滤/窗口 patch、确认、重启恢复、新话题不误判、记忆注入 |
+| `b*` 负例 | 3 | 未知指标/分组列、无抽取信号 |
+
+### strict xfail = 已知边界地图
+
+断言"正确行为"但当前未实现的用例带 `xfail` 字段（strict）。修复后自动翻红提醒移除标记，边界清单不会悄悄烂掉。当前 5 个：多跳 join 推断（m01-03）、未知 group_by 静默丢弃（b01）、不支持的时间表达静默回退（t05）。已关闭：b02（按类型阈值）、a01/a02（exact 别名冲突现在暴露为确认流，或有基表上下文时按 join 距离确定性消歧）。
+
+## Live Eval（真实 LLM，无 mock）
+
+[scripts/live_eval.py](../scripts/live_eval.py) 复用同一套 YAML 断言，但抽取与 SQL 生成走真实 LLM——度量 mock 测不到的抽取质量与 SQL 质量；依赖强制 mock 的用例自动跳过。
+
+```bash
+./.venv311/bin/python scripts/live_eval.py            # 全部可跑用例
+./.venv311/bin/python scripts/live_eval.py --out eval_results/run.json
+```
+
+最近一轮（exact 别名冲突处理之后）：**常规 36/36 通过、SQL 语法 34/34、指标口径保真 33/33、平均延迟 ~6.9s**；4 条依赖强制 mock 的用例跳过，5 条已知缺口用例如预期失败。LLM 输出每次有波动，这只是一次采样。
+
 ## 当前 E2E Eval 格式
 
 每条 case 使用 YAML 描述，可包含：
@@ -153,16 +184,13 @@ cases:
 
 ## 当前已覆盖场景
 
-当前 end-to-end case 已覆盖：
+完整清单见上面的用例清单。最重要的"agent 化"链路包括：
 
-- 基础新查询（显式表名 / 从指标推断表名）
-- follow-up 修改时间
-- follow-up 修改指标
-- follow-up 增加分组排名窗口（每组 Top-N）
-- join 推断（列在其他表 -> 从 schema 配置推断 join）
-- follow-up + 确认流
+- 新查询（显式表名 / 从指标推断表名）与基于 schema 配置的 join 推断
+- 时间、指标、分组、过滤、分组排名窗口的 follow-up patch
+- 确认流，包括重启后的确认恢复
+- 歧义处理（别名冲突、低置信表名），以及不猜测幻觉列
 - 项目记忆注入
-- 重启后确认恢复
 
 这意味着，最重要的“agent 化”链路现在已经有了回归保护。
 
@@ -185,16 +213,16 @@ cases:
 
 例如：
 
-- “不是这个 event，换成支付成功”
-- “还是按国家看吧”
-- “和昨天比一下”
-- “继续看 UV”
+- "Not revenue; use payment amount"（换指标）
+- "Break it down by seller region instead"（换分组）
+- "Compare with yesterday"（对比）
+- "Continue with order count"（续查）
 
 ### 2. Memory 场景
 
 例如：
 
-- project memory 改变默认 event mapping
+- project memory 改变默认指标或过滤映射
 - project memory 改变默认 region 行为
 - 多条 memory 冲突时的相关片段选择
 

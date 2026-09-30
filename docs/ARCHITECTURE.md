@@ -1,6 +1,8 @@
-# Architecture Overview
+---
+title: "Architecture Overview"
+---
 
-[English](ARCHITECTURE.md) | [Chinese](ARCHITECTURE.zh-CN.md)
+[Chinese version](https://github.com/frankzh0330/query-agent/blob/master/docs/ARCHITECTURE.zh-CN.md)
 
 This document summarizes the current architecture of `query-agent`, the responsibility of each major module, and the intended dependency direction between layers.
 
@@ -24,7 +26,8 @@ This document summarizes the current architecture of `query-agent`, the responsi
 │                     NL2SQL Pipeline                         │
 │   llm_extractions.py                                        │
 │   matcher_service.py + table/column/metric matchers         │
-│   sql_generator.py · sql_validator.py                       │
+│   reranker.py (optional)                                    │
+│   sql_generator.py · sql_validator.py · sql_ast_analyzer.py │
 ├──────────────────────────────────────────────────────────────┤
 │                     Memory Layer                            │
 │   long_term_memory.py · memory_writer.py                    │
@@ -86,7 +89,8 @@ flowchart TD
     R --> S1
     S1 --> J["Join Inference (schema config)"]
     J --> G["LLM SQL Generation<br/>(ClickHouse, grounded)"]
-    G --> V["sqlglot Validation"]
+    G --> V["sqlglot Validation<br/>+ AST Analysis"]
+    V -->|"invalid: feed error back"| G
     V --> O["ClickHouse SQL"]
     V --> ML["Async MemoryWriter"]
 ```
@@ -107,7 +111,7 @@ flowchart TD
 
 ### Layer 1: LLM Extraction
 
-Owned by [service/llm_extractions.py](../service/llm_extractions.py).
+Owned by [service/llm_extractions.py](https://github.com/frankzh0330/query-agent/blob/master/service/llm_extractions.py).
 
 Responsibilities:
 
@@ -128,45 +132,54 @@ Output:
 
 ### Layer 2: Matcher Resolution
 
-Owned by [matcher/matcher_service.py](../matcher/matcher_service.py) and concrete matchers
-([table_matcher.py](../matcher/table_matcher.py), [column_matcher.py](../matcher/column_matcher.py),
-[sql_metric_matcher.py](../matcher/sql_metric_matcher.py), [time_matcher.py](../matcher/time_matcher.py)),
-built on [matcher/base.py](../matcher/base.py) (inverted index + RapidFuzz + synonyms) over
-[matcher/schema_loader.py](../matcher/schema_loader.py) metadata.
+Owned by [matcher/matcher_service.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/matcher_service.py) and concrete matchers
+([table_matcher.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/table_matcher.py), [column_matcher.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/column_matcher.py),
+[sql_metric_matcher.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/sql_metric_matcher.py), [time_matcher.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/time_matcher.py)),
+built on [matcher/base.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/base.py) (IDF-weighted inverted index + edit-distance typo probing + RapidFuzz rerank + synonyms) over
+[matcher/schema_loader.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/schema_loader.py) metadata.
 
 Responsibilities:
 
 - resolve `table / table.column / metric_id / time_range` with scores and candidates
-- threshold policy (deterministic, no LLM): score >= 80 accept, 40-80 confirm, < 40 drop/fallback
+- threshold policy (deterministic, no LLM), calibrated per entity type: metric auto-accepts at >= 90 (a wrong metric means wrong numbers), table/column at >= 80; scores in [40, threshold) require confirmation; < 40 drops or falls back. A tie guard additionally forces confirmation when the top-2 candidate margin is < 10, even above the acceptance line
+- recall is IDF-weighted (BM25-lite) so discriminative tokens outrank generic ones (table/amount/id) on tied hit counts, and zero-hit tokens >= 4 chars get an edit-distance-1 vocab probe ('orde tablez' -> orders) at 0.75x weight
+- exact-alias collisions (same alias on multiple entities, e.g. `amount` on orders/payments, `time` on three tables) are detected at index build and surfaced at query time: two-way column collisions with a base-table context resolve deterministically by join-graph distance (nearest wins, e.g. `region` in an orders context -> users.region); 3-way generic tokens or ties escalate to the confirmation flow with all candidates — never silent first-wins
 - infer the main table when the user does not name one (metric expression or column ownership)
 - infer join steps from declarative `joins:` config; missing paths escalate to confirmation
 
 Important detail:
 
 - user preference is applied **after recall** as a small rerank signal
+- optional constrained LLM rerank ([service/reranker.py](https://github.com/frankzh0330/query-agent/blob/master/service/reranker.py), `RERANKER_ENABLED=true`) runs only in the low-confidence band; it may reorder existing candidates but never invent new values, and silently accepts only a clear winner (relevance >= 85 and margin >= 15)
 - matcher itself remains the main semantic resolver
 
 ### Layer 3: SQL Generation
 
-Owned by [service/sql_generator.py](../service/sql_generator.py).
+Owned by [service/sql_generator.py](https://github.com/frankzh0330/query-agent/blob/master/service/sql_generator.py).
 
 Responsibilities:
 
 - assemble the generation prompt from resolved entities: base table, metric expressions,
   qualified columns, filters, time predicate (ClickHouse syntax), join conditions, window/order intent
+- window-intent recovery: when L1 truncates the window fragment (e.g. extracts only "in each region", leaving "top 3" in the original sentence), the parser retries on the full query text — recovering limit and group deterministically (recorded in explain as `recovered_from_full_text`)
 - call the LLM to produce one ClickHouse SELECT; entity names are pinned by the prompt, the LLM
   assembles structure only (GROUP BY / JOIN / `LIMIT n BY` grouped ranking)
 - repair loop: failed validation feeds the error back into the next round (max 2 extra rounds)
 
 ### Layer 4: Validation
 
-Owned by [service/sql_validator.py](../service/sql_validator.py) (sqlglot, `dialect="clickhouse"`).
+Owned by [service/sql_validator.py](https://github.com/frankzh0330/query-agent/blob/master/service/sql_validator.py) (sqlglot, `dialect="clickhouse"`) and
+[service/sql_ast_analyzer.py](https://github.com/frankzh0330/query-agent/blob/master/service/sql_ast_analyzer.py).
 
 Responsibilities:
 
 - single read-only statement (SELECT / WITH only)
 - all table references must be in the schema whitelist
 - default LIMIT injection
+- AST analysis: column existence (after alias qualification), join edges and ON keys must match the declared `joins:`, no JOIN without ON
+- entity fidelity against semantic drift: resolved tables, metric expressions and filter predicates must appear in the SQL
+- static cost warnings (estimated scan rows, unfiltered full scans on fact tables, join depth), recorded in explain only
+- analysis errors feed the same repair loop as validation errors; warnings never block
 - deterministic guardrails, independent of the LLM
 
 ## Turn-Based Querying
@@ -175,13 +188,13 @@ Turn-based behavior is a first-class part of the architecture, not a prompt tric
 
 ### Core Building Blocks
 
-- [service/session_models.py](../service/session_models.py)
+- [service/session_models.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_models.py)
   - `QueryState`
   - `SessionContext`
   - `TaskContext`
-- [service/followup_resolver.py](../service/followup_resolver.py)
-- [service/query_state_merger.py](../service/query_state_merger.py)
-- [service/task_manager.py](../service/task_manager.py)
+- [service/followup_resolver.py](https://github.com/frankzh0330/query-agent/blob/master/service/followup_resolver.py)
+- [service/query_state_merger.py](https://github.com/frankzh0330/query-agent/blob/master/service/query_state_merger.py)
+- [service/task_manager.py](https://github.com/frankzh0330/query-agent/blob/master/service/task_manager.py)
 
 ### Turn Modes
 
@@ -208,11 +221,12 @@ flowchart TD
 This supports queries like:
 
 ```text
-Q1: Show PV for app_launch in Germany
+Q1: Revenue by region for the last 7 days
 Q2: Yesterday
-Q3: Change it to UV
-Q4: Break it down by channel
-Q5: What about the US?
+Q3: Change it to order count
+Q4: Break it down by category
+Q5: Only gold members
+Q6: Top 3 per region
 ```
 
 without forcing the user to restate all fields on every turn.
@@ -225,8 +239,8 @@ The project now effectively has three memory layers.
 
 Owned by:
 
-- [service/session_manager.py](../service/session_manager.py)
-- [service/session_models.py](../service/session_models.py)
+- [service/session_manager.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_manager.py)
+- [service/session_models.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_models.py)
 
 Stores:
 
@@ -243,7 +257,7 @@ Purpose:
 
 ### 2. Project Memory
 
-Owned by [memory/long_term_memory.py](../memory/long_term_memory.py).
+Owned by [memory/long_term_memory.py](https://github.com/frankzh0330/query-agent/blob/master/memory/long_term_memory.py).
 
 Stores:
 
@@ -260,11 +274,11 @@ Important detail:
 
 ### 3. User Preference Signal
 
-Owned by [memory/user_preference_store.py](../memory/user_preference_store.py).
+Owned by [memory/user_preference_store.py](https://github.com/frankzh0330/query-agent/blob/master/memory/user_preference_store.py).
 
 Stores:
 
-- user-scoped `event / metric / group_by` usage counts
+- user-scoped `table / metric / column` usage counts
 - scoped by `project_id + user_id`
 
 Purpose:
@@ -306,7 +320,7 @@ This allows:
 
 ## Async Memory Learning
 
-Owned by [memory/memory_writer.py](../memory/memory_writer.py).
+Owned by [memory/memory_writer.py](https://github.com/frankzh0330/query-agent/blob/master/memory/memory_writer.py).
 
 Responsibilities:
 
@@ -456,10 +470,10 @@ generation, and clear `pending_task_id`.
 
 ```text
 Project memory:
-In project_55, activation means activation_success by default.
+In this project, "big orders" means orders with amount greater than 1000.
 
 User query:
-Show activation PV yesterday
+Show me big orders
 ```
 
 Expected behavior:
@@ -473,17 +487,17 @@ Expected behavior:
 
 ```text
 User history:
-user_a often selects payment_submit in project_55.
+user_a often uses order_count in project_55.
 
 Current query:
-Show payment event PV.
+a low-confidence sales query where revenue and order_count score closely.
 ```
 
 Expected behavior:
 
 - matcher recall still produces the candidate set
 - user preference applies only after recall
-- preference can nudge `payment_submit` upward
+- preference can nudge `order_count` upward
 - preference must not override a stronger explicit semantic match
 
 ### Scenario 7: Restart Recovery
@@ -522,34 +536,95 @@ The project uses both regular tests and data-driven end-to-end evals.
 
 Owned by:
 
-- [tests/evals/nl2sql_cases.yaml](../tests/evals/nl2sql_cases.yaml)
-- [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
+- [tests/evals/nl2sql_cases.yaml](https://github.com/frankzh0330/query-agent/blob/master/tests/evals/nl2sql_cases.yaml)
+- [tests/test_end_to_end_evals.py](https://github.com/frankzh0330/query-agent/blob/master/tests/test_end_to_end_evals.py)
 
-Current coverage includes:
-
-- basic new query
-- follow-up patch
-- follow-up + confirmation
-- project memory injection
-- restart + confirmation recovery
+Current coverage: 45 cases in 9 groups (single table, joins, multi-hop joins, time expressions,
+filters, ambiguity, window/TopN, follow-ups, negative cases). See [EVALUATION.md](/EVALUATION) for the
+inventory and the strict-xfail known-gap map.
 
 This is intentionally closer to “golden cases” than isolated unit tests.
 
+The pytest harness mocks the LLM extraction and SQL generation, so it evaluates matcher resolution,
+state merging, the confirmation flow and the inputs handed to SQL generation, and it runs offline in seconds.
+Cases marked `xfail` assert the *correct* behavior for known gaps (strict, so a fix forces the marker off).
+
+### Live LLM Eval
+
+[scripts/live_eval.py](https://github.com/frankzh0330/query-agent/blob/master/scripts/live_eval.py) replays the same cases against the real LLM and reports
+per-case pass/fail, SQL static validity, whether the resolved metric expressions appear in the SQL, and latency.
+It measures what the mocked harness cannot (extraction and SQL quality). LLM output varies between runs, so a
+result is a sample, not a stable accuracy figure, and "SQL is valid" does not mean "SQL is correct".
+
 ## Catalog and Metadata
 
-The checked-in YAML catalog is mainly a demo/development artifact.
+The checked-in [catalog/sql_schema.yaml](https://github.com/frankzh0330/query-agent/blob/master/catalog/sql_schema.yaml) is a demo/development
+input (table/column/metric aliases + declarative joins + metric expressions). Its aliases are English only, so
+demo queries should be asked in English.
 
 The intended production direction is:
 
-- metadata fetched from HTTP source
-- synced into local catalog
-- matcher indexes rebuilt on refresh
+- table/column/metric metadata synced periodically from the company metadata service (or `INFORMATION_SCHEMA`)
+- after a sync, call `load_sql_schema()` to hot-rebuild the matcher indexes
+- no sync scheduler is implemented yet: the demo schema is loaded once at server startup (`server.py` lifespan)
+  and a YAML change needs a restart; the hot-rebuild seam is ready (`load_sql_schema()` -> rebuild `MatcherService` ->
+  `set_matcher_service()` swap)
+- query execution (read-only account, timeouts, cost limits) and result rendering belong to downstream layers and
+  are out of scope for this demo
 
 This matters because real deployments may have:
 
-- tens of thousands of events
-- multiple dimensions/properties per event
+- tens of thousands of tables and columns
+- multiple business aliases per column
 - project-specific vocabularies and constraints
+
+## Filter Value Resolution
+
+A filter such as "paid by credit card" has two parts to resolve: the **column**
+(`payments.payment_type`) and the **value** (`credit_card`). The LLM only copies the
+user's words, so the value it extracts (`credit card`) rarely equals what is stored.
+Getting this wrong produces SQL that passes static validation but returns nothing or the
+wrong rows, which the live eval surfaced (see [Evaluation Strategy](#evaluation-strategy)).
+
+### What this repository does
+
+- **Column**: [orchestrator](https://github.com/frankzh0330/query-agent/blob/master/service/query_orchestrator.py) accepts a filter column only on a
+  high-confidence match (score >= 80). Low-confidence or unmatched columns are never guessed
+  from the recall list; the request ends with `early_exit` and the closest columns, so the user
+  can rephrase. (A hallucinated `user_type` used to be fuzzy-matched to `orders.user_id`.)
+- **Value**: columns may declare `enum_values` in [catalog/sql_schema.yaml](https://github.com/frankzh0330/query-agent/blob/master/catalog/sql_schema.yaml).
+  `SQLSchema.normalize_enum_value()` maps the extracted value to a declared one
+  deterministically: exact, then case/space/hyphen-insensitive (`Credit-Card` -> `credit_card`),
+  then RapidFuzz >= 90 (`cancelled` -> `canceled`). A value that matches nothing is passed through and
+  recorded in `explain`; it does not block the query.
+
+### Why hand-written enums do not scale
+
+`enum_values` fits low-cardinality, stable columns (`status`, `payment_type`, `vip_level`).
+It does not fit high-cardinality or changing columns (brand, city, product name), and nobody can
+maintain a hand-written list for every column of a real warehouse. It is a demo-scale choice.
+
+### How production systems approach it
+
+| Approach | Idea | Reference |
+|---|---|---|
+| Cached frequent values + fuzzy match | Pick searchable text columns by cardinality/type, cache the most frequent values, match filters with edit distance, generate synonyms/abbreviations with an LLM | [SQLGenie (ACL 2025 Industry)](https://aclanthology.org/2025.acl-industry.71.pdf) |
+| Index all values | LSH plus semantic embeddings, hierarchical retrieval; give the LLM only the relevant value subset (offline index, online retrieval) | [CHESS](https://scalingintelligence.stanford.edu/pubs/CHESSpaper.pdf), [XiYan-SQL](https://arxiv.org/pdf/2411.08599), [DeepEye-SQL](https://arxiv.org/pdf/2510.17586) |
+| Sample values in the prompt | 3-5 representative values for low-cardinality categorical columns | [DexterSQL](https://arxiv.org/pdf/2608.11889) |
+| Semantic-layer aliases | Humans maintain metric, dimension and value aliases/synonyms, backed by golden-query regression tests | [Semantic Layers Make Enterprise Text-to-SQL Safer](https://datalakehousehub.com/blog/2026-05-semantic-layers-text-to-sql/), [dbt: Semantic Layer vs. Text-to-SQL](https://docs.getdbt.com/blog/semantic-layer-vs-text-to-sql-2026) |
+
+These are usually combined: low-cardinality columns get sample values or a cached list, high-cardinality
+columns get a value index, and business vocabulary lives in the semantic layer.
+
+The public material is thin on operational details (how values that change over time are refreshed, how
+ambiguous values are disambiguated with the user). Treat those as open design questions, not established practice.
+
+### Intended direction for this project
+
+Replace the hand-written `enum_values` with values synced from the warehouse (distinct/top-K per eligible column,
+refreshed on the same schedule as the metadata sync), keep `normalize_enum_value()` as the deterministic
+first pass, and add an embedding or LSH value index for high-cardinality columns. Ambiguous or unmatched values should
+go through the confirmation flow instead of being passed through.
 
 ## Evolution Roadmap
 

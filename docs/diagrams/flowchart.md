@@ -1,4 +1,6 @@
-# End-To-End Flowchart
+---
+title: "End-To-End Flowchart"
+---
 
 ```mermaid
 flowchart TD
@@ -11,7 +13,9 @@ flowchart TD
     Dup -->|Yes| DropDup(("Discard"))
     Dup -->|No| Empty{"Empty after cleaning?"}
     Empty -->|Yes| DropEmpty(("Discard"))
-    Empty -->|No| Session
+    Empty -->|No| Bus["Message Bus<br/>DirectCallBus / RedisBus"]
+    Bus --> Worker["AgentWorker"]
+    Worker --> Session
 
     Channel -->|HTTP| HTTP["FastAPI POST /nl2sql"]
     HTTP --> Session
@@ -45,7 +49,8 @@ flowchart TD
         Table --> Metric --> Column --> Time --> Infer
     end
 
-    Infer --> Ambiguous{"Needs confirmation?"}
+    Infer --> Rerank["User preference rerank<br/>+ optional LLM rerank"]
+    Rerank --> Ambiguous{"Needs confirmation?"}
     Ambiguous -->|Yes| Task["Create TaskContext<br/>Return candidates"]
     Task --> EndConfirm(("Wait for user reply"))
     Ambiguous -->|No| GenSQL
@@ -54,15 +59,17 @@ flowchart TD
         Intent["Assemble grounded intent<br/>tables / metric exprs / joins / time expr"]
         Generate["LLM generates ClickHouse SQL"]
         Validate["sqlglot validate<br/>readonly / whitelist / auto LIMIT"]
+        Analyze["AST analysis<br/>columns / joins / entity fidelity"]
         Repair["Repair loop with error feedback"]
-        Intent --> Generate --> Validate
+        Intent --> Generate --> Validate --> Analyze
         Validate -->|invalid| Repair --> Generate
+        Analyze -->|errors| Repair
     end
 
-    Validate --> Persist["Persist session state<br/>Record preferences"]
+    Analyze --> Persist["Persist session state<br/>Record preferences"]
     Persist --> Learn["Async MemoryWriter"]
     Persist --> Caller{"Caller?"}
-    Caller -->|Telegram| Format["Format SQL + intent"]
+    Caller -->|Telegram| Format["ResponseDispatcher<br/>Format SQL + intent"]
     Format --> Send["Send Telegram response"]
     Send --> EndTG(("End"))
     Caller -->|HTTP| Return["Return NL2SQLResponse"]

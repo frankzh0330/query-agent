@@ -1,8 +1,11 @@
-# Matcher Sequence
+---
+title: "Matcher Sequence"
+---
 
 ```mermaid
 sequenceDiagram
-    participant API as FastAPI /nl2sql
+    participant Server as server.py lifespan
+    participant ORC as QueryOrchestrator
     participant MS as MatcherService
     participant Matcher as Table/Column/Metric Matcher
     participant Pipeline as BaseMatcher Pipeline
@@ -12,8 +15,8 @@ sequenceDiagram
     participant Pref as UserPreferenceStore
 
     rect rgb(227, 242, 253)
-    Note over API,Schema: Initialization - build matcher indexes
-    API->>MS: MatcherService(catalog_path)
+    Note over Server,Schema: Initialization - build matcher indexes (once at startup)
+    Server->>MS: MatcherService(catalog_path)
     MS->>Schema: load tables / columns / joins / metrics
     Schema-->>MS: SQLSchema (qualified columns + aliases)
     MS->>Matcher: Build indexes (table / table.column / metric)
@@ -22,16 +25,19 @@ sequenceDiagram
     end
 
     rect rgb(232, 245, 233)
-    Note over API,Fuzz: Runtime - resolve one extracted field
-    API->>MS: resolve_with_candidates(type, extractions, default)
+    Note over ORC,Fuzz: Runtime - resolve one extracted field
+    ORC->>MS: resolve_with_candidates(type, extractions, default, base_table)
     MS->>MS: Pick first extraction text
     MS->>Matcher: match(query)
     Matcher->>Pipeline: Stage 1 exact alias lookup
-    alt Exact match
-        Pipeline-->>Matcher: score=100, method=exact_alias_match
+    alt Exact alias shared by several entities
+        Pipeline-->>MS: method=exact_alias_collision, all candidates
+        MS->>MS: resolve by join distance from base_table,<br/>or escalate to confirmation (never first-wins)
+    else Exact match
+        Pipeline-->>Matcher: score=100, method=exact
     else No exact match
         Pipeline->>Pipeline: Stage 2 tokenize + synonym expansion
-        Pipeline->>Index: Stage 3 inverted-index recall
+        Pipeline->>Index: Stage 3 IDF-weighted inverted-index recall<br/>(+ edit-distance typo probing for zero-hit tokens)
         Index-->>Pipeline: candidate document IDs
         Pipeline->>Fuzz: Stage 4 fuzzy rerank
         Fuzz-->>Pipeline: sorted candidates
@@ -42,7 +48,7 @@ sequenceDiagram
         end
     end
     Matcher-->>MS: ResolvedResult with candidates and explain
-    MS->>MS: threshold policy: >=80 accept, 40-80 confirm, <40 drop
+    MS->>MS: per-type thresholds (metric 90 / table·column 80)<br/>+ tie guard (top1-top2 margin <10 -> confirm)
     end
 
     rect rgb(255, 243, 224)
@@ -53,9 +59,9 @@ sequenceDiagram
     end
 
     rect rgb(255, 249, 196)
-    Note over MS,Pref: User preference is applied only after recall
-    MS->>Pref: rerank_candidates(project_id, user_id, field, candidates)
-    Pref-->>MS: weakly biased candidates + explain
-    MS-->>API: resolved value + resolver_explain
+    Note over ORC,Pref: User preference is applied only after recall
+    MS-->>ORC: ResolvedResult + join steps
+    ORC->>Pref: rerank_candidates(project_id, user_id, field, candidates)
+    Pref-->>ORC: weakly biased candidates + explain
     end
 ```

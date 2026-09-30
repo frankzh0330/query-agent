@@ -8,8 +8,8 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
-# 全局日志配置
-LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
+# 全局日志配置（默认 INFO；调试时 LOG_LEVEL=DEBUG python server.py）
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
@@ -58,10 +58,13 @@ async def websocket_lifespan(app: FastAPI):
     服务生命周期管理
 
     启动时:
-    1. 初始化 MatcherService（构建索引）
+    1. 初始化 MatcherService（构建索引，一次性加载 catalog/sql_schema.yaml）
     2. 创建 MessageBus + AgentWorker + ResponseDispatcher
     3. 启动 Telegram Gateway
-    4. 启动 Catalog 定时同步调度器
+    4. 启动 Session 定时清理（每 5 分钟清理 60 分钟未活跃会话）
+
+    注：Catalog 定时同步调度器为生产方向、当前未实现（README Production Notes #1）；
+    demo 态 schema 仅在启动时加载一次，更新 YAML 需重启进程。
     """
     logger.info("=== Starting Server ===")
 

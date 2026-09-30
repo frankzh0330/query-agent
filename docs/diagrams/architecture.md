@@ -1,4 +1,6 @@
-# Architecture Diagram
+---
+title: "Architecture Diagram"
+---
 
 ```mermaid
 graph TB
@@ -9,7 +11,6 @@ graph TB
 
     subgraph Gateway["Gateway Layer"]
         TelegramGateway["TelegramGateway<br/>Long Polling"]
-        GatewayManager["GatewayManager<br/>Channel Management"]
         BaseGateway["BaseGateway"]
     end
 
@@ -18,6 +19,12 @@ graph TB
         Cleaner["MessageCleaner<br/>Text Cleaning"]
         Dedup["MessageDeduplicator<br/>Deduplication"]
         StandardMessage["StandardMessage<br/>Unified Message Model"]
+    end
+
+    subgraph Runtime["Runtime Layer"]
+        Bus["Message Bus<br/>DirectCallBus / RedisBus"]
+        Worker["AgentWorker"]
+        Dispatcher["ResponseDispatcher"]
     end
 
     subgraph API["API Layer"]
@@ -31,6 +38,8 @@ graph TB
         LLM["LLM Intent Extraction<br/>SQLIntentJson"]
         SQLGen["SQL Generator<br/>Grounded ClickHouse Generation"]
         SQLVal["SQL Validator<br/>sqlglot Guardrails"]
+        ASTAnalyzer["SQL AST Analyzer<br/>Entity Fidelity + Join Checks"]
+        Reranker["LLM Reranker<br/>Optional, Low-Confidence Only"]
         SessionManager["SessionManager<br/>Session State"]
         TaskManager["TaskManager<br/>Confirmation Tasks"]
     end
@@ -64,13 +73,17 @@ graph TB
     TelegramUser --> TelegramAPI
     TelegramAPI --> TelegramGateway
     HttpClient --> FastAPI
-    GatewayManager --> TelegramGateway
     TelegramGateway -.-> BaseGateway
     TelegramGateway --> TelegramAdapter
     TelegramAdapter --> Cleaner
     TelegramAdapter --> Dedup
     TelegramAdapter --> StandardMessage
-    StandardMessage --> Orchestrator
+    StandardMessage --> Bus
+    Bus --> Worker
+    Worker --> Orchestrator
+    Worker --> Bus
+    Bus --> Dispatcher
+    Dispatcher --> TelegramGateway
     FastAPI --> Orchestrator
 
     Orchestrator --> SessionManager
@@ -80,6 +93,8 @@ graph TB
     Orchestrator --> SQLGen
     Orchestrator --> MemoryWriter
     Orchestrator --> UserPreference
+    Orchestrator --> Reranker
+    Reranker --> LLMBackend
 
     SessionManager --> LongTermMemory
     LongTermMemory --> Storage
@@ -87,6 +102,7 @@ graph TB
     UserPreference --> Storage
 
     SQLGen --> SQLVal
+    SQLGen --> ASTAnalyzer
     SQLGen --> LLMBackend
     LLM --> LLMBackend
 

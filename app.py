@@ -100,6 +100,26 @@ async def _send_telegram_notification(chat_id: str, message: str) -> None:
 # HTTP 端点
 # ====================
 
+# 浏览器访问任意页面时会自动请求 /favicon.ico；内联 SVG 免 404
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+    '<text y="0.9em" font-size="90">📊</text></svg>'
+)
+
+
+@app.get("/", include_in_schema=False)
+def root():
+    """服务信息 / 健康检查（同时避免浏览器直接访问根路径时 404）"""
+    return {"service": app.title, "status": "ok", "docs": "/docs", "debug": "/sessions"}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    from fastapi.responses import Response
+
+    return Response(content=_FAVICON_SVG, media_type="image/svg+xml")
+
+
 @app.post("/nl2sql", response_model=NL2SQLResponse)
 @app.post("/nl2dsl", response_model=NL2SQLResponse, include_in_schema=False)
 async def nl2sql(req: NL2SQLRequest) -> NL2SQLResponse:

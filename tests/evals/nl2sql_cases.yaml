@@ -398,7 +398,7 @@ cases:
 
   # ---------------------------------------------------------------- A: ambiguity
   - name: a01_ambiguous_amount_column
-    xfail: "same-named columns resolve first-wins at score 100; ambiguity is not surfaced"
+    # FIXED: exact alias collisions now surface as confirmation (no base-table context here)
     steps:
       - text: Show the amount of recent records
         extraction:
@@ -408,7 +408,7 @@ cases:
           status: needs_confirmation
 
   - name: a02_ambiguous_time_column
-    xfail: "same-named columns resolve first-wins at score 100; ambiguity is not surfaced"
+    # FIXED: 3-way generic time tokens always confirm (distance policy only resolves 2-way collisions)
     steps:
       - text: Number of orders by time
         extraction:
@@ -661,7 +661,7 @@ cases:
           status_not: success
 
   - name: b02_unknown_metric
-    xfail: "fuzzy matching accepts 'customer lifetime value' as avg_order_value (85.5 >= 80 auto-accept threshold): wrong answer, no confirmation"
+    # FIXED: metric auto-accept raised to 90 (per-type thresholds), 85.5 now lands in the confirmation band
     steps:
       - text: What is the customer lifetime value?
         extraction:

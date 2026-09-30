@@ -41,8 +41,8 @@ Gateway
 
 ## Highlights
 
-- **Deterministic entity resolution**: table/column/metric names are resolved by an inverted index + RapidFuzz against the schema catalog (scored, with candidates) — the LLM never invents entity names
-- **Confirmation flow as guardrail**: low-confidence entities (score 40–80) trigger explicit user confirmation instead of silent guessing; missing join paths escalate too
+- **Deterministic entity resolution**: table/column/metric names are resolved by IDF-weighted inverted-index recall (discriminative tokens dominate generic ones) with edit-distance typo probing, then RapidFuzz rerank against the schema catalog (scored, with candidates) — the LLM never invents entity names
+- **Confirmation flow as guardrail**: low-confidence entities trigger explicit user confirmation instead of silent guessing — thresholds are calibrated per entity type (metrics are stricter: auto-accept at 90, since a wrong metric means wrong numbers), and a deterministic tie guard sends top candidates that are within 10 points of each other to confirmation even above the acceptance line; missing join paths escalate too
 - **Schema-configured joins**: join relationships come from metadata, not LLM invention
 - **Turn-based Q&A**: `last_query_state` + follow-up detection + field-level patch merge (a state machine, not chat replay)
 - **Grounded SQL generation**: the generation prompt pins resolved table/column/metric names, join conditions, and time predicates; the LLM assembles query structure only
@@ -54,17 +54,17 @@ Gateway
 ## Example Session
 
 ```text
-Q1: 近7天各地区的销售额
+Q1: Revenue by region for the last 7 days
 -> SELECT users.region AS region, sum(orders.amount) AS revenue
    FROM orders JOIN users ON orders.user_id = users.id
    WHERE orders.created_at >= now() - INTERVAL 7 DAY
    GROUP BY users.region ORDER BY revenue DESC LIMIT 100
 
-Q2: 改成只看VIP用户，每个地区前3
--> patch: filters += [users.vip_level = 'vip'], window = {users.region, top 3}
--> SELECT users.region, sum(orders.amount) AS revenue
+Q2: only gold members, top 3 per region
+-> patch: filters += [users.vip_level = 'gold'], window = {users.region, top 3}
+-> SELECT users.region AS region, sum(orders.amount) AS revenue
    FROM orders JOIN users ON orders.user_id = users.id
-   WHERE users.vip_level = 'vip' AND orders.created_at >= now() - INTERVAL 7 DAY
+   WHERE users.vip_level = 'gold' AND orders.created_at >= now() - INTERVAL 7 DAY
    GROUP BY users.region ORDER BY revenue DESC LIMIT 3 BY users.region
 ```
 
@@ -75,11 +75,11 @@ Q2 inherits metric / time / grouping from Q1 — only the deltas are extracted a
 ### 1. Layered Generation
 
 - **Layer 1 (LLM extraction)** only splits the question into intent fragments — it never names tables or columns.
-- **Layer 2 (matchers)** resolves fragments to canonical `table` / `table.column` / `metric_id` names with scores: score ≥ 80 auto-accepts, 40–80 requires confirmation, < 40 drops or falls back. The main table is inferred when the user does not name one (from the metric expression or column ownership votes).
+- **Layer 2 (matchers)** resolves fragments to canonical `table` / `table.column` / `metric_id` names with scores: auto-accept thresholds are calibrated per type (metric 90, table/column 80), scores in the confirmation band (40 up to the threshold) require user confirmation, and a top-1/top-2 margin under 10 points forces confirmation even above the threshold; < 40 drops or falls back. Recall is IDF-weighted (BM25-lite) with edit-distance-1 typo probing for zero-hit tokens. Same-alias collisions across entities (e.g. `amount` on two tables) are never silently first-wins: they resolve by join distance when a base table is known, or surface as confirmation. The main table is inferred when the user does not name one (from the metric's declared table or column ownership votes).
 - **Layer 3 (SQL generation)** is an LLM call *grounded* on resolved entities. The prompt pins table names, column names, metric expressions, join conditions, and the time predicate; the LLM assembles structure (GROUP BY / JOIN / window ranking via `LIMIT n BY`).
 - **Validation** (sqlglot, `dialect="clickhouse"`) enforces read-only single statements, a table whitelist, and default LIMIT; failed generations are repaired with error feedback.
 - **AST post-analysis** (`service/sql_ast_analyzer.py`) then runs on the validated SQL: column-existence checks (with alias resolution via sqlglot qualify), entity-fidelity assertions (resolved tables / metric expressions / filter predicates must survive into the SQL — catching semantic drift), join-edge and join-key consistency against the declared `joins:` config, and static cost analysis (scan estimates from `est_rows`, full-scan-on-fact-table detection, join-chain depth). Analysis errors feed the same repair loop; warnings and cost metrics are reported in `explain.resolver_explain.sql_generation.ast_analysis`.
-- **Cross-encoder reranking** (`service/reranker.py`, `RERANKER_ENABLED=true`) is a constrained LLM final selection step for ambiguous matches: when the matcher lands in the 40-80 confirmation band — or top candidates are tied — the LLM rescores the existing candidates (it can only pick from them, never invent values). A clear winner (relevance ≥ 85 with margin ≥ 15) is silently accepted, turning a would-be confirmation interrupt into a direct answer; otherwise the confirmation flow proceeds with better-ordered candidates. Production can swap in a local cross-encoder model (e.g. bge-reranker-v2-m3) behind the same interface.
+- **Cross-encoder reranking** (`service/reranker.py`, `RERANKER_ENABLED=true`) is a constrained LLM final selection step for ambiguous matches: when the matcher lands in the confirmation band — or top candidates are tied — the LLM rescores the existing candidates (it can only pick from them, never invent values). A clear winner (relevance ≥ 85 with margin ≥ 15) is silently accepted, turning a would-be confirmation interrupt into a direct answer; otherwise the confirmation flow proceeds with better-ordered candidates. Production can swap in a local cross-encoder model (e.g. bge-reranker-v2-m3) behind the same interface.
 
 ### 2. Turn-Based Querying
 
@@ -158,7 +158,7 @@ MESSAGE_BUS_BACKEND=redis docker-compose up --build
 
 ```bash
 curl -X POST localhost:8000/nl2sql -H 'Content-Type: application/json' -d '{
-  "text": "近7天各地区的销售额",
+  "text": "Revenue by region for the last 7 days",
   "project_id": 55
 }'
 ```
@@ -226,7 +226,7 @@ query-agent/
 │   ├── followup_resolver.py   # rule-based turn detection
 │   └── query_state_merger.py  # field-level patch merge
 ├── matcher/
-│   ├── base.py                # inverted index + RapidFuzz + synonyms (core)
+│   ├── base.py                # IDF-weighted inverted index + typo probing + RapidFuzz (core)
 │   ├── schema_loader.py       # sql_schema.yaml -> SQLSchema
 │   ├── table_matcher.py       # table name resolution
 │   ├── column_matcher.py      # column resolution (doc = "table.column")
@@ -241,11 +241,11 @@ query-agent/
 
 ## Schema Metadata & Production Notes
 
-Table/column/metric metadata lives in [catalog/sql_schema.yaml](catalog/sql_schema.yaml) — a local demo sample (an `orders / users / products` e-commerce schema with declarative joins and metric expressions such as `revenue = sum(orders.amount)`).
+Table/column/metric metadata lives in [catalog/sql_schema.yaml](catalog/sql_schema.yaml) — a local demo sample (a six-table e-commerce schema — `orders / users / products / payments / reviews / sellers` — with declarative joins and metric expressions such as `revenue = sum(orders.amount)`). Aliases are English only, so ask demo queries in English.
 
 This demo deliberately stops at **NL → validated ClickHouse SQL**. The following production extensions are documented as the intended direction and are not implemented here:
 
-1. **Metadata sourcing** — `sql_schema.yaml` is the development/demo input. In production, table/column/metric metadata should be synced from the company metadata service (or `INFORMATION_SCHEMA`) on a schedule, then fed into `load_sql_schema()` to hot-rebuild matcher indexes.
+1. **Metadata sourcing** — `sql_schema.yaml` is the development/demo input. In production, table/column/metric metadata should be synced from the company metadata service (or `INFORMATION_SCHEMA`) on a schedule, then fed into `load_sql_schema()` to hot-rebuild matcher indexes. In this demo the YAML is loaded exactly once at server startup (`server.py` lifespan → `MatcherService.__init__`) and no sync scheduler exists; the planned scheduler is periodic pull → `load_sql_schema()` → rebuild `MatcherService` → `set_matcher_service()` hot swap (the swap seam is already in place).
 2. **Query execution** — running the SQL against a real ClickHouse (read-only account, statement timeout, row/cost caps, result caching) is a downstream step; the current API returns SQL only.
 3. **Result rendering** — chart/table rendering of query results belongs to the presentation layer.
 4. **Governance hardening** — row-level security via user-scoped predicates, per-user rate limits, PII masking, and full audit logging are natural next steps on top of the existing validator.
