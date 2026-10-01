@@ -130,13 +130,15 @@ flowchart TD
 主要文件：[matcher/matcher_service.py](../matcher/matcher_service.py) 及具体 matcher
 （[table_matcher.py](../matcher/table_matcher.py)、[column_matcher.py](../matcher/column_matcher.py)、
 [sql_metric_matcher.py](../matcher/sql_metric_matcher.py)、[time_matcher.py](../matcher/time_matcher.py)），
-全部构建在 [matcher/base.py](../matcher/base.py)（倒排索引 + RapidFuzz + 同义词）之上，
+全部构建在 [matcher/base.py](../matcher/base.py)（IDF 加权倒排索引 + edit-distance typo 探测 + RapidFuzz 重排 + 同义词）之上，
 元数据来自 [matcher/schema_loader.py](../matcher/schema_loader.py)。
 
 职责：
 
 - 解析 `table / table.column / metric_id / time_range`，带分数与候选
-- 阈值策略（确定性，不依赖 LLM）：≥ 80 直接用，40-80 触发确认，< 40 丢弃/回退
+- 阈值策略（确定性，不依赖 LLM），按实体类型校准：metric ≥ 90 直接用（指标错则数字全错），table/column ≥ 80；确认带内触发用户确认，< 40 丢弃/回退；并列守卫在 top1/top2 分差 <10 时即使过线也进确认
+- 召回为 IDF 加权（BM25-lite）：命中数打平时判别性 token 胜过泛化 token（table/amount/id）；零命中且 ≥4 字符的 token 做 edit-distance-1 词表探测（'orde tablez' -> orders），权重 0.75 折
+- exact 别名冲突（同一别名挂多个实体，如 amount 在 orders/payments、time 在三张表）建索引时检测、查询时暴露：两路列冲突且有基表上下文时按 join 图距离确定性消歧（orders 语境下 region -> users.region）；3 路超泛化词或距离并列升级确认流并给出全部候选——绝不静默 first-wins
 - 用户不提表名时推断主表（从指标表达式或列归属投票）
 - 从声明式 `joins:` 配置推断 join 步骤；路径缺失升级为确认流
 
@@ -153,6 +155,8 @@ flowchart TD
 
 - 用已解析实体组装生成 prompt：主表、指标表达式、限定列、过滤条件、
   ClickHouse 时间谓词、join 条件、window/order 意图
+- window 意图兜底：L1 截断窗口短语时（如只抽到 "in each region"，"top 3" 留在原句），
+  用完整查询文本重试解析，确定性找回 limit 与分组（explain 记录 `recovered_from_full_text`）
 - LLM 只组装结构（GROUP BY / JOIN / `LIMIT n BY` 分组排名），实体名由 prompt 固定
 - 修复循环：校验失败的错误信息回灌下一轮（最多额外 2 轮）
 

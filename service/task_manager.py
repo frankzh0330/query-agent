@@ -123,6 +123,12 @@ class TaskManager:
                     task.partial_query_state.tables.append(value)
             elif field == "column":
                 task.partial_query_state.columns.append(value)
+            elif field == "group_by_column":
+                if value not in (task.partial_query_state.group_by or []):
+                    task.partial_query_state.group_by = [*(task.partial_query_state.group_by or []), value]
+            elif field == "detail_column":
+                if value not in (task.partial_query_state.detail_columns or []):
+                    task.partial_query_state.detail_columns = [*(task.partial_query_state.detail_columns or []), value]
 
         # 3. 检查是否所有需要确认的字段都已确认
         all_confirmed = all(

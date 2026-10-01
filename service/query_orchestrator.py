@@ -172,15 +172,25 @@ class QueryOrchestrator:
         n_days, time_explain = service.resolve_time(extraction_json)
         time_range = _time_range_from(n_days, time_explain)
 
+        # 主表先行推断（为列冲突的 join 距离消歧提供基表上下文）
+        base_hint, _ = service.infer_main_table(
+            [table_result.value] if table_result.value else [],
+            [metric_result.value] if metric_result.value else [],
+            [],
+        )
+
         # 列解析（group_by / detail / filter column / window group）
         column_explain: Dict[str, Any] = {}
-        group_by_cols, _ = self._resolve_texts_to_columns(
+        group_by_cols, group_entries = self._resolve_texts_to_columns(
             service, [e.text for e in extraction_json.group_by_extractions], column_explain,
+            base_table=base_hint,
         )
-        detail_cols, _ = self._resolve_texts_to_columns(
+        detail_cols, detail_entries = self._resolve_texts_to_columns(
             service, [e.text for e in extraction_json.column_extractions], column_explain,
+            base_table=base_hint,
         )
-        filters = self._resolve_filters(service, extraction_json.filter_extractions, column_explain)
+        filters = self._resolve_filters(
+            service, extraction_json.filter_extractions, column_explain, base_table=base_hint)
         if column_explain.get("filters_unresolved"):
             return self._unresolved_filters_response(
                 req.text, extraction_json, ctx, column_explain["filters_unresolved"], {"columns": column_explain},
@@ -192,8 +202,15 @@ class QueryOrchestrator:
         if extraction_json.window_extractions:
             w_text = extraction_json.window_extractions[0].text
             w = parse_window_text(w_text)
+            if not w:
+                # L1 可能把窗口短语截断（如只抽到 "in each region"，"top 3" 留在原句）——
+                # 用完整查询文本兜底解析，确定性找回 limit 和分组
+                w = parse_window_text(req.text)
+                if w:
+                    column_explain["window"] = {"recovered_from_full_text": True, "fragment": w_text}
             if w:
-                w_cols, _ = self._resolve_texts_to_columns(service, [w["group_text"]], column_explain)
+                w_cols, _ = self._resolve_texts_to_columns(
+                    service, [w["group_text"]], column_explain, base_table=base_hint)
                 if w_cols:
                     window = {"group_by": w_cols[0], "limit": w["limit"]}
                 else:
@@ -233,6 +250,13 @@ class QueryOrchestrator:
             pending_fields["tables"] = table_result.candidates
         if metric_result.needs_confirmation:
             pending_fields["metrics"] = metric_result.candidates
+        # 同名列 exact 冲突（>=3 路或无基表可消歧）→ 升级确认
+        group_collision = _first_collision(group_entries)
+        if group_collision:
+            pending_fields["group_by_column"] = group_collision
+        detail_collision = _first_collision(detail_entries)
+        if detail_collision:
+            pending_fields["detail_column"] = detail_collision
 
         if pending_fields:
             return await self._create_confirmation_task(
@@ -319,6 +343,7 @@ class QueryOrchestrator:
         patch_result = await self._build_followup_patch(
             req.text, extraction_json, decision, service,
             project_id=req.project_id, user_id=ctx.user_id,
+            base_table=(prev_qs.tables or [None])[0],
         )
 
         if patch_result.unresolved_filters:
@@ -410,6 +435,19 @@ class QueryOrchestrator:
                 extra_table = value
                 if extra_table not in qs.tables:
                     qs.tables.append(extra_table)
+            elif field == "group_by_column":
+                if value not in (qs.group_by or []):
+                    qs.group_by = [*(qs.group_by or []), value]
+            elif field == "detail_column":
+                if value not in (qs.detail_columns or []):
+                    qs.detail_columns = [*(qs.detail_columns or []), value]
+        # 确认补齐的列可能带来新表（如选择了 payments.amount）→ 无基表时按列归属推断
+        if not qs.tables:
+            inferred_base, _ = service.infer_main_table(
+                [], qs.metrics or [], (qs.group_by or []) + (qs.detail_columns or []),
+            )
+            if inferred_base:
+                qs.tables = [inferred_base]
         _mark_confirmation_state(qs, task.user_selection)
 
         sql, gen_explain, join_error = await self._generate_sql_from_state(task.raw_query, qs, service)
@@ -495,7 +533,10 @@ class QueryOrchestrator:
         )
         self.session.update_pending_task(ctx.session_id, task.task_id)
 
-        field_display = {"tables": "table", "metrics": "metric"}.get(field_name, field_name)
+        field_display = {
+            "tables": "table", "metrics": "metric",
+            "group_by_column": "group-by column", "detail_column": "column",
+        }.get(field_name, field_name)
         lines = [f"Please choose a {field_display}:"]
         lines += [f"  {i}. {c['value']} (match {c['score']:.0f}%)" for i, c in enumerate(resolved_result.candidates[:5], 1)]
         lines.append("Reply with a number or a name.")
@@ -673,20 +714,29 @@ class QueryOrchestrator:
 
     # ==================== 列 / 过滤解析 ====================
 
-    def _resolve_texts_to_columns(self, service, texts: list[str], explain_sink: dict) -> tuple[list[str], list[dict]]:
-        """自然语言片段 → 限定列名列表（歧义容忍：40-80 取 top1，<40 丢弃）"""
+    def _resolve_texts_to_columns(
+        self, service, texts: list[str], explain_sink: dict, base_table: Optional[str] = None,
+    ) -> tuple[list[str], list[dict]]:
+        """自然语言片段 → 限定列名列表
+
+        - exact 冲突：两路 + 基表上下文时由 service 按 join 距离确定性消歧；
+          否则保留冲突候选（entry["collision_candidates"]），由调用方升级确认流
+        - 无匹配但有召回候选 → 取 top1（列歧义容忍，避免频繁打断用户）
+        """
         resolved: list[str] = []
         entries: list[dict] = []
         for text in texts:
             if not text or not text.strip():
                 continue
-            r = service.resolve_with_candidates(MatcherType.COLUMN, [Extraction(text=text)])
+            r = service.resolve_with_candidates(
+                MatcherType.COLUMN, [Extraction(text=text)], base_table=base_table)
             entry = {"text": text, "method": r.method, "score": r.score}
-            if r.value:
+            if r.method == "exact_alias_collision":
+                entry["collision_candidates"] = r.candidates
+            elif r.value:
                 entry["column"] = r.value
                 resolved.append(r.value)
             elif r.candidates:
-                # 无匹配但有召回候选 → 取 top1（列歧义容忍，避免频繁打断用户）
                 top = r.candidates[0]["value"]
                 entry.update({"column": top, "note": "recall_top1"})
                 resolved.append(top)
@@ -697,12 +747,16 @@ class QueryOrchestrator:
             explain_sink["columns"] = entries
         return resolved, entries
 
-    def _resolve_filters(self, service, filter_extractions, explain_sink: dict) -> list[dict]:
+    def _resolve_filters(
+        self, service, filter_extractions, explain_sink: dict, base_table: Optional[str] = None,
+    ) -> list[dict]:
         """filter_extractions → 结构化 filters
 
-        - column 只接受高置信匹配（exact/fuzzy，score>=80）。低置信/无匹配不再取 recall top1
+        - column 只接受高置信匹配（exact/fuzzy/冲突距离消歧）。低置信或无匹配不再取 recall top1
           静默猜列（LLM 可能编造列，如 "user_type" 会被模糊匹配成 orders.user_id），
           而是记入 explain_sink["filters_unresolved"]，由调用方向用户澄清。
+        - 同名列冲突：有基表上下文时按 join 距离确定性消歧（base=orders 下 "amount" ->
+          orders.amount）；无法消歧则进 unresolved 澄清路径。
         - value 按列声明的 enum_values 规范化（"credit card" -> "credit_card"）。
         """
         filters: list[dict] = []
@@ -710,8 +764,10 @@ class QueryOrchestrator:
         unresolved: list[dict] = []
         for fe in filter_extractions:
             col_text = fe.column or fe.text
-            r = service.resolve_with_candidates(MatcherType.COLUMN, [Extraction(text=col_text)])
-            confident = bool(r.value) and not r.needs_confirmation and r.method in ("exact", "fuzzy")
+            r = service.resolve_with_candidates(
+                MatcherType.COLUMN, [Extraction(text=col_text)], base_table=base_table)
+            confident = bool(r.value) and not r.needs_confirmation and r.method in (
+                "exact", "fuzzy", "exact_collision_distance_resolved")
             qualified = r.value if confident else None
             entry = {"text": fe.text, "column_text": col_text, "column": qualified,
                      "op": fe.op, "value": fe.value}
@@ -756,7 +812,7 @@ class QueryOrchestrator:
 
     async def _build_followup_patch(
         self, req_text, extraction_json, decision, service,
-        *, project_id, user_id,
+        *, project_id, user_id, base_table: Optional[str] = None,
     ) -> FollowupPatchResult:
         """构建 follow-up 补丁，返回结果对象（不再用异常控制流）"""
         patch: dict[str, Any] = {}
@@ -789,20 +845,23 @@ class QueryOrchestrator:
         # GroupBy（列解析）
         if extraction_json.group_by_extractions:
             cols, _ = self._resolve_texts_to_columns(
-                service, [e.text for e in extraction_json.group_by_extractions], column_explain)
+                service, [e.text for e in extraction_json.group_by_extractions], column_explain,
+                base_table=base_table)
             if cols:
                 patch["group_by"] = cols
 
         # 明细列
         if extraction_json.column_extractions:
             cols, _ = self._resolve_texts_to_columns(
-                service, [e.text for e in extraction_json.column_extractions], column_explain)
+                service, [e.text for e in extraction_json.column_extractions], column_explain,
+                base_table=base_table)
             if cols:
                 patch["detail_columns"] = cols
 
         # 过滤
         if extraction_json.filter_extractions:
-            filters = self._resolve_filters(service, extraction_json.filter_extractions, column_explain)
+            filters = self._resolve_filters(
+            service, extraction_json.filter_extractions, column_explain, base_table=base_table)
             if filters:
                 patch["filters"] = filters
 
@@ -818,9 +877,10 @@ class QueryOrchestrator:
         # Window（含方向词时降级为全局 TopN）
         if extraction_json.window_extractions:
             w_text = extraction_json.window_extractions[0].text
-            w = parse_window_text(w_text)
+            w = parse_window_text(w_text) or parse_window_text(req_text)
             if w:
-                w_cols, _ = self._resolve_texts_to_columns(service, [w["group_text"]], column_explain)
+                w_cols, _ = self._resolve_texts_to_columns(
+                    service, [w["group_text"]], column_explain, base_table=base_table)
                 if w_cols:
                     patch["window"] = {"group_by": w_cols[0], "limit": w["limit"]}
             else:
@@ -942,7 +1002,10 @@ class QueryOrchestrator:
 
     def _format_candidates_message(self, pending_fields: dict) -> str:
         """格式化候选提示消息"""
-        field_display_map = {"tables": "table", "metrics": "metric", "join": "bridging table"}
+        field_display_map = {
+            "tables": "table", "metrics": "metric", "join": "bridging table",
+            "group_by_column": "group-by column", "detail_column": "column",
+        }
         lines = []
         for field_name, cands in pending_fields.items():
             lines.append(f"Please choose a {field_display_map.get(field_name, field_name)}:")
@@ -1012,6 +1075,14 @@ def _match_user_input_to_candidates(user_input: str, candidates: list[dict]) -> 
     for c in candidates:
         if text_lower in c["value"].lower() or c["value"].lower() in text_lower:
             return c["value"]
+    return None
+
+
+def _first_collision(entries: list[dict]) -> Optional[list[dict]]:
+    """取第一个 exact 冲突的候选列表（用于升级确认流）"""
+    for e in entries:
+        if e.get("collision_candidates"):
+            return e["collision_candidates"]
     return None
 
 

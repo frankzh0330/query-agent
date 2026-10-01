@@ -1,6 +1,8 @@
-# Architecture Overview
+---
+title: "Architecture Overview"
+---
 
-[English](ARCHITECTURE.md) | [Chinese](ARCHITECTURE.zh-CN.md)
+[Chinese version](https://github.com/frankzh0330/query-agent/blob/master/docs/ARCHITECTURE.zh-CN.md)
 
 This document summarizes the current architecture of `query-agent`, the responsibility of each major module, and the intended dependency direction between layers.
 
@@ -107,7 +109,7 @@ flowchart TD
 
 ### Layer 1: LLM Extraction
 
-Owned by [service/llm_extractions.py](../service/llm_extractions.py).
+Owned by [service/llm_extractions.py](https://github.com/frankzh0330/query-agent/blob/master/service/llm_extractions.py).
 
 Responsibilities:
 
@@ -128,16 +130,18 @@ Output:
 
 ### Layer 2: Matcher Resolution
 
-Owned by [matcher/matcher_service.py](../matcher/matcher_service.py) and concrete matchers
-([table_matcher.py](../matcher/table_matcher.py), [column_matcher.py](../matcher/column_matcher.py),
-[sql_metric_matcher.py](../matcher/sql_metric_matcher.py), [time_matcher.py](../matcher/time_matcher.py)),
-built on [matcher/base.py](../matcher/base.py) (inverted index + RapidFuzz + synonyms) over
-[matcher/schema_loader.py](../matcher/schema_loader.py) metadata.
+Owned by [matcher/matcher_service.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/matcher_service.py) and concrete matchers
+([table_matcher.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/table_matcher.py), [column_matcher.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/column_matcher.py),
+[sql_metric_matcher.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/sql_metric_matcher.py), [time_matcher.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/time_matcher.py)),
+built on [matcher/base.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/base.py) (IDF-weighted inverted index + edit-distance typo probing + RapidFuzz rerank + synonyms) over
+[matcher/schema_loader.py](https://github.com/frankzh0330/query-agent/blob/master/matcher/schema_loader.py) metadata.
 
 Responsibilities:
 
 - resolve `table / table.column / metric_id / time_range` with scores and candidates
-- threshold policy (deterministic, no LLM): score >= 80 accept, 40-80 confirm, < 40 drop/fallback
+- threshold policy (deterministic, no LLM), calibrated per entity type: metric auto-accepts at >= 90 (a wrong metric means wrong numbers), table/column at >= 80; scores in [40, threshold) require confirmation; < 40 drops or falls back. A tie guard additionally forces confirmation when the top-2 candidate margin is < 10, even above the acceptance line
+- recall is IDF-weighted (BM25-lite) so discriminative tokens outrank generic ones (table/amount/id) on tied hit counts, and zero-hit tokens >= 4 chars get an edit-distance-1 vocab probe ('orde tablez' -> orders) at 0.75x weight
+- exact-alias collisions (same alias on multiple entities, e.g. `amount` on orders/payments, `time` on three tables) are detected at index build and surfaced at query time: two-way column collisions with a base-table context resolve deterministically by join-graph distance (nearest wins, e.g. `region` in an orders context -> users.region); 3-way generic tokens or ties escalate to the confirmation flow with all candidates — never silent first-wins
 - infer the main table when the user does not name one (metric expression or column ownership)
 - infer join steps from declarative `joins:` config; missing paths escalate to confirmation
 
@@ -148,19 +152,20 @@ Important detail:
 
 ### Layer 3: SQL Generation
 
-Owned by [service/sql_generator.py](../service/sql_generator.py).
+Owned by [service/sql_generator.py](https://github.com/frankzh0330/query-agent/blob/master/service/sql_generator.py).
 
 Responsibilities:
 
 - assemble the generation prompt from resolved entities: base table, metric expressions,
   qualified columns, filters, time predicate (ClickHouse syntax), join conditions, window/order intent
+- window-intent recovery: when L1 truncates the window fragment (e.g. extracts only "in each region", leaving "top 3" in the original sentence), the parser retries on the full query text — recovering limit and group deterministically (recorded in explain as `recovered_from_full_text`)
 - call the LLM to produce one ClickHouse SELECT; entity names are pinned by the prompt, the LLM
   assembles structure only (GROUP BY / JOIN / `LIMIT n BY` grouped ranking)
 - repair loop: failed validation feeds the error back into the next round (max 2 extra rounds)
 
 ### Layer 4: Validation
 
-Owned by [service/sql_validator.py](../service/sql_validator.py) (sqlglot, `dialect="clickhouse"`).
+Owned by [service/sql_validator.py](https://github.com/frankzh0330/query-agent/blob/master/service/sql_validator.py) (sqlglot, `dialect="clickhouse"`).
 
 Responsibilities:
 
@@ -175,13 +180,13 @@ Turn-based behavior is a first-class part of the architecture, not a prompt tric
 
 ### Core Building Blocks
 
-- [service/session_models.py](../service/session_models.py)
+- [service/session_models.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_models.py)
   - `QueryState`
   - `SessionContext`
   - `TaskContext`
-- [service/followup_resolver.py](../service/followup_resolver.py)
-- [service/query_state_merger.py](../service/query_state_merger.py)
-- [service/task_manager.py](../service/task_manager.py)
+- [service/followup_resolver.py](https://github.com/frankzh0330/query-agent/blob/master/service/followup_resolver.py)
+- [service/query_state_merger.py](https://github.com/frankzh0330/query-agent/blob/master/service/query_state_merger.py)
+- [service/task_manager.py](https://github.com/frankzh0330/query-agent/blob/master/service/task_manager.py)
 
 ### Turn Modes
 
@@ -225,8 +230,8 @@ The project now effectively has three memory layers.
 
 Owned by:
 
-- [service/session_manager.py](../service/session_manager.py)
-- [service/session_models.py](../service/session_models.py)
+- [service/session_manager.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_manager.py)
+- [service/session_models.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_models.py)
 
 Stores:
 
@@ -243,7 +248,7 @@ Purpose:
 
 ### 2. Project Memory
 
-Owned by [memory/long_term_memory.py](../memory/long_term_memory.py).
+Owned by [memory/long_term_memory.py](https://github.com/frankzh0330/query-agent/blob/master/memory/long_term_memory.py).
 
 Stores:
 
@@ -260,7 +265,7 @@ Important detail:
 
 ### 3. User Preference Signal
 
-Owned by [memory/user_preference_store.py](../memory/user_preference_store.py).
+Owned by [memory/user_preference_store.py](https://github.com/frankzh0330/query-agent/blob/master/memory/user_preference_store.py).
 
 Stores:
 
@@ -306,7 +311,7 @@ This allows:
 
 ## Async Memory Learning
 
-Owned by [memory/memory_writer.py](../memory/memory_writer.py).
+Owned by [memory/memory_writer.py](https://github.com/frankzh0330/query-agent/blob/master/memory/memory_writer.py).
 
 Responsibilities:
 
@@ -522,8 +527,8 @@ The project uses both regular tests and data-driven end-to-end evals.
 
 Owned by:
 
-- [tests/evals/nl2sql_cases.yaml](../tests/evals/nl2sql_cases.yaml)
-- [tests/test_end_to_end_evals.py](../tests/test_end_to_end_evals.py)
+- [tests/evals/nl2sql_cases.yaml](https://github.com/frankzh0330/query-agent/blob/master/tests/evals/nl2sql_cases.yaml)
+- [tests/test_end_to_end_evals.py](https://github.com/frankzh0330/query-agent/blob/master/tests/test_end_to_end_evals.py)
 
 Current coverage includes:
 
@@ -541,7 +546,7 @@ Cases marked `xfail` assert the *correct* behavior for known gaps (strict, so a 
 
 ### Live LLM Eval
 
-[scripts/live_eval.py](../scripts/live_eval.py) replays the same cases against the real LLM and reports
+[scripts/live_eval.py](https://github.com/frankzh0330/query-agent/blob/master/scripts/live_eval.py) replays the same cases against the real LLM and reports
 per-case pass/fail, SQL static validity, whether the resolved metric expressions appear in the SQL, and latency.
 It measures what the mocked harness cannot (extraction and SQL quality). LLM output varies between runs, so a
 result is a sample, not a stable accuracy figure, and "SQL is valid" does not mean "SQL is correct".
@@ -572,11 +577,11 @@ wrong rows, which the live eval surfaced (see [Evaluation Strategy](#evaluation-
 
 ### What this repository does
 
-- **Column**: [orchestrator](../service/query_orchestrator.py) accepts a filter column only on a
+- **Column**: [orchestrator](https://github.com/frankzh0330/query-agent/blob/master/service/query_orchestrator.py) accepts a filter column only on a
   high-confidence match (score >= 80). Low-confidence or unmatched columns are never guessed
   from the recall list; the request ends with `early_exit` and the closest columns, so the user
   can rephrase. (A hallucinated `user_type` used to be fuzzy-matched to `orders.user_id`.)
-- **Value**: columns may declare `enum_values` in [catalog/sql_schema.yaml](../catalog/sql_schema.yaml).
+- **Value**: columns may declare `enum_values` in [catalog/sql_schema.yaml](https://github.com/frankzh0330/query-agent/blob/master/catalog/sql_schema.yaml).
   `SQLSchema.normalize_enum_value()` maps the extracted value to a declared one
   deterministically: exact, then case/space/hyphen-insensitive (`Credit-Card` -> `credit_card`),
   then RapidFuzz >= 90 (`cancelled` -> `canceled`). A value that matches nothing is passed through and

@@ -203,7 +203,10 @@ class TelegramGateway(BaseGateway):
 
         lines = []
         for field_name, cands in candidates.items():
-            field_display = {"tables": "table", "metrics": "metric", "join": "bridging table"}.get(field_name, field_name)
+            field_display = {
+                "tables": "table", "metrics": "metric", "join": "bridging table",
+                "group_by_column": "group-by column", "detail_column": "column",
+            }.get(field_name, field_name)
             lines.append(f"Please choose a {field_display}:")
             for i, c in enumerate(cands[:5], 1):
                 lines.append(f"  {i}. {c['value']} (match {c['score']:.0f}%)")

@@ -1,6 +1,8 @@
-# Telegram Testing Guide
+---
+title: "Telegram Testing Guide"
+---
 
-[English](TELEGRAM_TEST.md) | [Chinese](TELEGRAM_TEST.zh-CN.md)
+[Chinese version](https://github.com/frankzh0330/query-agent/blob/master/docs/TELEGRAM_TEST.zh-CN.md)
 
 ## Start The Service
 

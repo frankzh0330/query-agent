@@ -1,6 +1,8 @@
-# Memory Architecture
+---
+title: "Memory Architecture"
+---
 
-[English](MEMORY.md) | [Chinese](MEMORY.zh-CN.md)
+[Chinese version](https://github.com/frankzh0330/query-agent/blob/master/docs/MEMORY.zh-CN.md)
 
 This document explains the memory design in `query-agent`, why the project needs more than one kind of memory, and how the current implementation maps to that model.
 
@@ -42,9 +44,9 @@ Session memory stores the short-lived state of the current conversation:
 
 ### Where It Lives
 
-- [service/session_models.py](../service/session_models.py)
-- [service/session_manager.py](../service/session_manager.py)
-- [service/task_manager.py](../service/task_manager.py)
+- [service/session_models.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_models.py)
+- [service/session_manager.py](https://github.com/frankzh0330/query-agent/blob/master/service/session_manager.py)
+- [service/task_manager.py](https://github.com/frankzh0330/query-agent/blob/master/service/task_manager.py)
 
 ### Why It Exists
 
@@ -85,7 +87,7 @@ Examples:
 
 ### Where It Lives
 
-- [memory/long_term_memory.py](../memory/long_term_memory.py)
+- [memory/long_term_memory.py](https://github.com/frankzh0330/query-agent/blob/master/memory/long_term_memory.py)
 - runtime files under `data/memory/project_{id}/`
 
 ### Why It Exists
@@ -140,7 +142,7 @@ Examples:
 
 ### Where It Lives
 
-- [memory/user_preference_store.py](../memory/user_preference_store.py)
+- [memory/user_preference_store.py](https://github.com/frankzh0330/query-agent/blob/master/memory/user_preference_store.py)
 - runtime files under `data/user_preferences/`
 
 ### Why It Exists
