@@ -155,7 +155,7 @@ But this is not the same as true project/business semantics.
 
 User preference is intentionally implemented as:
 
-- post-recall rerank signal
+- post-recall, pre-decision candidate bias (bounded, +6 max)
 
 not as:
 

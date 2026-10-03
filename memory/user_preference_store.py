@@ -1,4 +1,4 @@
-"""User-scoped preference signals for post-recall reranking."""
+"""User-scoped preference signals: a bounded candidate bias applied after recall, before the accept/confirm decision."""
 from __future__ import annotations
 
 import json

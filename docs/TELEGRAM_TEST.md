@@ -78,7 +78,7 @@ http://localhost:8000/docs
 curl http://localhost:8000/sessions
 ```
 
-### Test The NL2SQL API Directly
+### Test The Text2SQL API Directly
 
 ```bash
 curl -X POST http://localhost:8000/nl2sql \
